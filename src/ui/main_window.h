@@ -20,6 +20,9 @@ class WatcherBridge;
 class JobTableModel;
 class JobDetailPanel;
 class LifecycleTimeline;
+class StatisticsPanel;
+class UserTaskModel;
+class UserTaskPanel;
 
 class MainWindow : public QMainWindow
 {
@@ -45,6 +48,7 @@ class MainWindow : public QMainWindow
   void refreshEmptyState();
   void refreshSelectedJob();
   void selectFirstVisibleRow();
+  void refreshTaskPanels();
 
   WatcherBridge* bridge_ = nullptr;
 
@@ -69,6 +73,10 @@ class MainWindow : public QMainWindow
   QSortFilterProxyModel* jobProxy_ = nullptr;
   JobDetailPanel* detailPanel_ = nullptr;
   LifecycleTimeline* timeline_ = nullptr;
+
+  StatisticsPanel* statisticsPanel_ = nullptr;
+  UserTaskModel* userTaskModel_ = nullptr;
+  UserTaskPanel* userTaskPanel_ = nullptr;
 
   QString lastOutputDir_;
 };

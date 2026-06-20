@@ -5,6 +5,9 @@ set(UI_SOURCES
   job_detail_panel.cpp
   lifecycle_timeline.cpp
   watcher_bridge.cpp
+  statistics_panel.cpp
+  user_task_model.cpp
+  user_task_panel.cpp
 )
 
 add_executable(wpce_ui WIN32 ${UI_SOURCES})

@@ -2,6 +2,9 @@
 #include "ui/job_detail_panel.h"
 #include "ui/job_table_model.h"
 #include "ui/lifecycle_timeline.h"
+#include "ui/statistics_panel.h"
+#include "ui/user_task_model.h"
+#include "ui/user_task_panel.h"
 #include "ui/watcher_bridge.h"
 
 #include <QAbstractItemView>
@@ -177,6 +180,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
   bridge_ = new WatcherBridge(this);
   tableModel_ = new JobTableModel(this);
+  userTaskModel_ = new UserTaskModel(this);
   jobProxy_ = new JobFilterProxyModel(this);
   jobProxy_->setSourceModel(tableModel_);
 
@@ -309,6 +313,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColProgress, QHeaderView::ResizeToContents);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColTotalPages, QHeaderView::ResizeToContents);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColCopies, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPrice, QHeaderView::ResizeToContents);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColSubmitTime, QHeaderView::ResizeToContents);
   tableView_->sortByColumn(JobTableModel::ColSubmitTime, Qt::DescendingOrder);
 
@@ -340,7 +345,31 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   splitter->setStretchFactor(0, 3);
   splitter->setStretchFactor(1, 2);
   splitter->setSizes(QList<int>{760, 420});
-  root->addWidget(splitter, 1);
+
+  // ── Bottom panel: statistics + user task management ──────────────────
+
+  statisticsPanel_ = new StatisticsPanel();
+  userTaskPanel_ = new UserTaskPanel(userTaskModel_);
+
+  auto* bottomPanel = new QFrame();
+  bottomPanel->setObjectName(QStringLiteral("BottomPanel"));
+  auto* bottomLayout = new QVBoxLayout(bottomPanel);
+  bottomLayout->setContentsMargins(0, 0, 0, 0);
+  bottomLayout->setSpacing(12);
+  bottomLayout->addWidget(statisticsPanel_);
+  bottomLayout->addWidget(userTaskPanel_, 1);
+
+  // ── Wrap top and bottom in a vertical splitter ──────────────────────
+
+  auto* verticalSplitter = new QSplitter(Qt::Vertical);
+  verticalSplitter->setObjectName(QStringLiteral("VerticalSplitter"));
+  verticalSplitter->setChildrenCollapsible(false);
+  verticalSplitter->addWidget(splitter);
+  verticalSplitter->addWidget(bottomPanel);
+  verticalSplitter->setStretchFactor(0, 3);   // top = 75%
+  verticalSplitter->setStretchFactor(1, 1);   // bottom = 25%
+  verticalSplitter->setSizes(QList<int>{520, 180});
+  root->addWidget(verticalSplitter, 1);
 
   statusBar()->showMessage(QStringLiteral("就绪"));
 
@@ -424,10 +453,16 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
           tableModel_, &JobTableModel::onJobSnapshot);
   connect(bridge_, &WatcherBridge::jobSnapshotReceived,
           this, &MainWindow::onJobCountChanged);
+  connect(bridge_, &WatcherBridge::jobSnapshotReceived,
+          userTaskModel_, &UserTaskModel::onJobSnapshot);
   connect(bridge_, &WatcherBridge::metadataReceived,
           tableModel_, &JobTableModel::onMetadata);
+  connect(bridge_, &WatcherBridge::metadataReceived,
+          userTaskModel_, &UserTaskModel::onMetadata);
   connect(bridge_, &WatcherBridge::lifecycleEventReceived,
           tableModel_, &JobTableModel::onLifecycleEvent);
+  connect(bridge_, &WatcherBridge::lifecycleEventReceived,
+          userTaskModel_, &UserTaskModel::onLifecycleEvent);
   connect(bridge_, &WatcherBridge::watcherError, this,
           [this](const QString& error)
           {
@@ -443,6 +478,23 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
             updateButtonStates();
             updatePrinterLabel();
           });
+
+  // ── User task / statistics wiring ───────────────────────────────────
+
+  connect(userTaskModel_, &QAbstractItemModel::dataChanged,
+          this, &MainWindow::refreshTaskPanels);
+  connect(userTaskModel_, &QAbstractItemModel::rowsInserted,
+          this, &MainWindow::refreshTaskPanels);
+  connect(userTaskModel_, &QAbstractItemModel::modelReset,
+          this, &MainWindow::refreshTaskPanels);
+  connect(tableModel_, &QAbstractItemModel::dataChanged,
+          this, &MainWindow::refreshTaskPanels);
+  connect(tableModel_, &QAbstractItemModel::rowsInserted,
+          this, &MainWindow::refreshTaskPanels);
+  connect(userTaskPanel_, &UserTaskPanel::taskCompleted,
+          this, &MainWindow::refreshTaskPanels);
+
+  // ── Initialise ──────────────────────────────────────────────────────
 
   updateButtonStates();
   updatePrinterLabel();
@@ -465,8 +517,10 @@ void MainWindow::onStartClicked()
   }
 
   tableModel_->clear();
+  userTaskModel_->clear();
   detailPanel_->clear();
   timeline_->clear();
+  refreshTaskPanels();
 
   const QString documentsPath =
     QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
@@ -624,6 +678,11 @@ void MainWindow::selectFirstVisibleRow()
   const QModelIndex index = jobProxy_->index(0, 0);
   tableView_->selectionModel()->setCurrentIndex(
     index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+}
+
+void MainWindow::refreshTaskPanels()
+{
+  statisticsPanel_->refresh(userTaskModel_);
 }
 
 }  // namespace wpce::ui

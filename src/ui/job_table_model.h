@@ -24,6 +24,7 @@ struct JobRowData
   core::JobLifecyclePhase phase{core::JobLifecyclePhase::Unknown};
   int totalPages{0};
   int pagesPrinted{0};
+  double price{0.0};
   std::vector<core::JobLifecycleEvent> lifecycleEvents;
 };
 
@@ -41,6 +42,7 @@ class JobTableModel : public QAbstractTableModel
     ColProgress,
     ColTotalPages,
     ColCopies,
+    ColPrice,
     ColSubmitTime,
     ColumnCount
   };

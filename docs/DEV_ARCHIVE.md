@@ -1,5 +1,69 @@
 # WPCE Development Archive
 
+## 2026-06-20: Qt6 GUI Enhancement — Pricing, Statistics, and User-Task Management
+
+### Context
+
+- The Qt6 GUI had real-time job monitoring but lacked pricing, statistics, and user-task binding.
+- User required: print pricing (¥0.15/single-sided page, ¥0.25/double-sided sheet), statistics dashboard, date-managed task list, multi-job per user binding, cumulative pricing, and a "Complete" button to finalize billing.
+
+### Changes
+
+**New Files:**
+
+| File | Purpose |
+|---|---|
+| `src/ui/pricing_config.h` | PricingConfig struct + `calculate_job_cost()` free function |
+| `src/ui/statistics_panel.h/.cpp` | 4-card dashboard (今日作业/今日营收/活跃用户/完成进度) |
+| `src/ui/user_task_model.h/.cpp` | UserTask struct + QAbstractTableModel (6 columns) |
+| `src/ui/user_task_panel.h/.cpp` | Task list QTableView + "完成结算" button |
+
+**Pricing Logic (`pricing_config.h`):**
+- Single-sided (simplex/not_reported): `total_pages × 0.15`
+- Double-sided (vertical/horizontal/duplex): `ceil(total_pages / 2) × 0.25`
+- Zero pages or unparseable → 0.00
+
+**User Task Binding (`user_task_model.h/.cpp`):**
+- `UserTask`: userId, date, jobIds[], jobCosts{} (per-job pages+price), totalPages, totalPrice, completed flag
+- `UserTaskModel`: QMap<QString,int> activeTaskIndex_ for O(1) user lookup; QMap<uint32_t,int> jobToTaskRow_ for O(1) job→task mapping
+- `onJobSnapshot()`: auto-creates UserTask on first job per user; binds subsequent jobs to same user's active task
+- `onMetadata()`: updates per-job cost entry, recomputes totals — no double-counting
+- `completeUserTask()`: marks task completed, removes from active map; next job creates new task
+
+**Modified Files:**
+
+| File | Changes |
+|---|---|
+| `src/ui/job_table_model.h` | +`ColPrice` column (9th), +`price_` field in JobRowData |
+| `src/ui/job_table_model.cpp` | +ColPrice data/header/alignment/sort, price computed in onMetadata() |
+| `src/ui/main_window.h` | +StatisticsPanel*, +UserTaskModel*, +UserTaskPanel*, +refreshTaskPanels() |
+| `src/ui/main_window.cpp` | +vertical QSplitter (top=3, bottom=1), +bottom panel (stats+task), +signal wiring to UserTaskModel, +clear on start |
+| `src/ui/CMakeLists.txt` | +3 new .cpp files |
+
+### UI Layout (Post-Enhancement)
+
+```
+MainWindow
+├── Metrics cards (existing)
+├── QSplitter (vertical, 75/25)
+│   ├── TOP: QSplitter (horizontal, table | side pane) — existing
+│   └── BOTTOM: BottomPanel QFrame
+│       ├── StatisticsPanel (4 metric cards)
+│       └── UserTaskPanel (header "用户任务管理" + table + "完成结算" button)
+```
+
+### Verification
+
+- `cmake --build build/vs2026-x64-qt --config Debug --target wpce_ui`: 0 errors, 0 warnings
+- CTest: 16/16 pass
+- Pricing logic verified: simplex(5p)=¥0.75, duplex(5p→3s)=¥0.75, simplex(1p)=¥0.15, duplex(10p→5s)=¥1.25
+
+### Known Limitations
+
+- Generic/Text Only driver (WPCE Sim Printer) doesn't report DEVMODE fields → metadata shows "not_reported", prices computed as simplex
+- Real printer drivers that populate DEVMODE will produce accurate duplex pricing
+- User tasks are in-memory only — no persistence across UI restarts
+
 ## 2026-06-20: Scenario Testing Campaign — 7 Scenarios + Edge Cases + Phase Dwell Fix
 
 ### Context

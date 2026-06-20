@@ -1,4 +1,5 @@
 #include "ui/job_table_model.h"
+#include "ui/pricing_config.h"
 
 #include <QBrush>
 #include <QColor>
@@ -104,6 +105,8 @@ QVariant sortValueForColumn(const JobRowData& data, const int column)
       return data.totalPages;
     case JobTableModel::ColCopies:
       return reportedValueOrDash(data.metadata.copies);
+    case JobTableModel::ColPrice:
+      return data.price;
     case JobTableModel::ColSubmitTime:
       return QString::fromStdString(data.job.submit_time_utc);
     default:
@@ -190,6 +193,8 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
       case ColTotalPages:
       case ColCopies:
         return Qt::AlignCenter;
+      case ColPrice:
+        return static_cast<int>(Qt::AlignRight | Qt::AlignVCenter);
       default:
         return Qt::AlignVCenter;
     }
@@ -257,6 +262,13 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
     case ColCopies:
       return reportedValueOrDash(data.metadata.copies);
 
+    case ColPrice:
+      if (data.price > 0.0)
+      {
+        return QString::number(data.price, 'f', 2);
+      }
+      return QStringLiteral("-");
+
     case ColSubmitTime:
       return QString::fromStdString(data.job.submit_time_utc);
 
@@ -290,6 +302,8 @@ QVariant JobTableModel::headerData(const int section,
       return QStringLiteral("页数");
     case ColCopies:
       return QStringLiteral("份数");
+    case ColPrice:
+      return QStringLiteral("费用 (¥)");
     case ColSubmitTime:
       return QStringLiteral("提交时间");
     default:
@@ -403,6 +417,8 @@ void JobTableModel::onMetadata(core::MetadataSnapshot metadata)
     {
       row.pagesPrinted = 0;
     }
+
+    row.price = calculate_job_cost(row.metadata, PricingConfig{});
 
     const int modelRow = jobOrder_.indexOf(row.metadata.job_id);
     if (modelRow >= 0)
