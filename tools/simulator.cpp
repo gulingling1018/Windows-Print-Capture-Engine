@@ -28,6 +28,7 @@
 #include <chrono>
 #include <cstdint>
 #include <iostream>
+#include <memory>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -439,7 +440,9 @@ int run_stall(const ScenarioConfig& config)
   std::cout << "\n=== Scenario: Stall Detection ===\n";
   std::cout << "Creating hanging jobs (no EndDocPrinter) — watcher should detect stall.\n";
 
-  PrinterHandle printer(config.target_printer);
+  // Each hanging job needs its own printer handle because StartDocPrinterW
+  // leaves the handle tied to the open document until EndDocPrinter is called.
+  std::vector<std::unique_ptr<PrinterHandle>> handles;
   std::vector<DWORD> jobIds;
 
   for (std::uint32_t i = 0; i < config.job_count; ++i)
@@ -448,21 +451,32 @@ int run_stall(const ScenarioConfig& config)
     docName << "stall-test-" << (i + 1) << ".txt";
     std::string data = "WPCE Stall Test " + std::to_string(i + 1) + "\n";
 
-    DWORD id = submit_hanging_job(printer.get(), docName.str(), data);
-    if (id != 0)
-    {
-      jobIds.push_back(id);
-      std::cout << "  [" << id << "] hanging in spooling: " << docName.str() << '\n';
+    // Open a fresh handle per hanging job.
+    try {
+      auto ph = std::make_unique<PrinterHandle>(config.target_printer);
+      DWORD id = submit_hanging_job(ph->get(), docName.str(), data);
+      if (id != 0)
+      {
+        handles.push_back(std::move(ph));
+        jobIds.push_back(id);
+        std::cout << "  [" << id << "] hanging in spooling: " << docName.str() << '\n';
+      }
+    } catch (const std::exception& e) {
+      std::cerr << "  ! Failed to open printer for hanging job: " << e.what() << '\n';
     }
   }
 
-  // Pause to prevent the spooler from completing them.
+  // Pause all jobs to prevent spooler auto-completion.
+  // Use a fresh handle for pausing (no open documents).
+  PrinterHandle pausePrinter(config.target_printer);
   for (DWORD id : jobIds)
   {
-    pause_job(printer.get(), id);
+    pause_job(pausePrinter.get(), id);
   }
 
-  std::cout << "Jobs paused. Watcher with --stall-timeout should detect stalled.\n";
+  std::cout << "Jobs paused (" << jobIds.size() << "). Watcher with --stall-timeout should detect stalled.\n";
+  // Handles go out of scope here — the jobs stay in the spooler because
+  // they were paused before the handles close.
   return 0;
 }
 

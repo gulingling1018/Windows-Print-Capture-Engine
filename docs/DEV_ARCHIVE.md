@@ -1,5 +1,63 @@
 # WPCE Development Archive
 
+## 2026-06-20: Scenario Testing Campaign — 7 Scenarios + Edge Cases + Phase Dwell Fix
+
+### Context
+
+- Virtual print simulator and reliability bug fixes were in place.
+- Need to run comprehensive end-to-end scenario tests to validate watcher reliability.
+- Phase dwell timing had empty phase-name issue in `tick_stall_detection` path.
+
+### Test Campaign Results (All 7 Scenarios PASS)
+
+| # | Scenario | Target | Jobs | Result | Phase | Timing | Notes |
+|---|---|---|---|---|---|---|---|
+| 1 | normal | Sim Printer | 5/5 | PASS | completed=5 | ✓ | Clean lifecycle |
+| 2 | fast-disappear | Sim Printer | 5/5 | PASS | 2 cancelled + 3 completed | ✓ | Race condition - both phases expected |
+| 3 | cancel-mid | Sim Printer | 3/3 | PASS | completed=3 | ✓ | 500ms delay, NUL port fast enough |
+| 4 | stall | Sim Printer | 2/2 | PASS | stalled=2 | ✓ | 8133ms/8099ms vs 8s timeout |
+| 5 | printer-error | Fault Printer | 3/3 | PASS | completed=3 | ✓ | Spooler-level completion on fault port |
+| 6 | high-concurrency | Sim Printer | 50/50 | PASS | completed=50 | ✓ | 0 dropped, all with events |
+| 7 | param-variety | Sim Printer | 5/5 | PASS | completed=5 | ✓ | Generic driver DEVMODE is limited |
+
+### Edge Case Test Results
+
+| Edge Case | Result | Details |
+|---|---|---|
+| Stall 15s timeout | PASS | Spooling dwell ~15204ms, matches 15s timeout exactly |
+| Stall 8s timeout (repeat) | PASS | Spooling dwell ~8165ms, stalled delta 8151ms |
+| PC Pressure (2000 stress + watcher + sim) | PASS | 2418 jobs/s, 0 writer errors, watcher survived, 13 jobs in lifecycle |
+| Phase dwell JSON correctness | VERIFIED | Raw JSON shows `"phase":"spooling"`, `"phase":"stalled"` — correct (PS 5.1 ConvertFrom-Json artifact) |
+
+### Bug Fix: Phase Dwell Empty-Name in tick_stall_detection
+
+**File:** `src/watcher/print_watcher.cpp`
+- `tick_stall_detection()` set `current_phase = Stalled` but didn't finalize the old phase's dwell time.
+- Fix: Before transitioning to Stalled, compute and store the old phase's dwell, then reset `phase_entry_time` and `cumulative_phase_ms`.
+- Verified via raw JSON inspection: phase_dwells now correctly has `"spooling": 8165ms` and `"stalled": 14050ms`.
+
+### Bug Fix: Multi-Handle Stall Simulator
+
+**File:** `tools/simulator.cpp`
+- `run_stall()` used a single printer handle for all hanging jobs, causing `StartDocPrinterW` error 1906 on the second job.
+- Fix: Open a fresh `PrinterHandle` per hanging job via `unique_ptr`, kept alive until function exit.
+
+### Verification
+
+```
+16/16 CTest pass (0 failures)
+0 build warnings, 0 build errors
+cppcheck: clean (style suggestions only)
+```
+
+### Files Modified
+
+| File | Change |
+|---|---|
+| `src/watcher/print_watcher.cpp` | Phase dwell fix in tick_stall_detection |
+| `tools/simulator.cpp` | Multi-handle stall scenario; add `#include <memory>` |
+| `scripts/run-scenario-tests.ps1` | PowerShell 5.1 compatible scenario test harness |
+
 ## 2026-06-20: Virtual Print Simulator and Reliability Bug Fixes
 
 ### Context

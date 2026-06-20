@@ -1348,7 +1348,32 @@ void PrintWatcher::tick_stall_detection()
 
       state.summary.events.push_back(event);
       state.summary.final_phase = core::JobLifecyclePhase::Stalled;
+
+      // Finalize the old phase's dwell time before transitioning.
+      const auto old_phase_name = std::string(core::to_string(state.current_phase));
+      const auto old_dwell = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - state.phase_entry_time).count() + state.cumulative_phase_ms;
+      bool found_existing = false;
+      for (auto& entry : state.summary.phase_dwells)
+      {
+        if (entry.phase_name == old_phase_name)
+        {
+          entry.duration_ms = old_dwell;
+          found_existing = true;
+          break;
+        }
+      }
+      if (!found_existing && !old_phase_name.empty())
+      {
+        state.summary.phase_dwells.push_back(core::PhaseDwellEntry{
+          .phase_name = old_phase_name,
+          .duration_ms = old_dwell,
+        });
+      }
+
       state.current_phase = core::JobLifecyclePhase::Stalled;
+      state.phase_entry_time = now;      // start timing the stalled phase
+      state.cumulative_phase_ms = 0;
       state.last_event_time = now;
       state.next_sequence++;
 
