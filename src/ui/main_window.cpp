@@ -306,15 +306,25 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   tableView_->verticalHeader()->setDefaultSectionSize(42);
   tableView_->horizontalHeader()->setHighlightSections(false);
   tableView_->horizontalHeader()->setStretchLastSection(false);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColJobId, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionsClickable(true);
+  tableView_->horizontalHeader()->setSectionsMovable(false);
+
+  // All columns Interactive so user can drag-resize.
+  // ColDocument uses Stretch to absorb remaining space.
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColJobId, QHeaderView::Interactive);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColDocument, QHeaderView::Stretch);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColUser, QHeaderView::ResizeToContents);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPhase, QHeaderView::ResizeToContents);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColProgress, QHeaderView::ResizeToContents);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColTotalPages, QHeaderView::ResizeToContents);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColCopies, QHeaderView::ResizeToContents);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPrice, QHeaderView::ResizeToContents);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColSubmitTime, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColUser, QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPhase, QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColProgress, QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColTotalPages, QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColCopies, QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPrice, QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColSubmitTime, QHeaderView::Interactive);
+
+  // Snap to content on first load, then user overrides by dragging.
+  tableView_->resizeColumnsToContents();
+  tableView_->horizontalHeader()->setMinimumSectionSize(40);
+
   tableView_->sortByColumn(JobTableModel::ColSubmitTime, Qt::DescendingOrder);
 
   emptyStateLabel_ = new QLabel(QStringLiteral("暂无打印作业"));
@@ -329,19 +339,21 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   detailPanel_ = new JobDetailPanel();
   timeline_ = new LifecycleTimeline();
 
-  auto* sidePane = new QWidget();
-  sidePane->setObjectName(QStringLiteral("SidePane"));
-  auto* sideLayout = new QVBoxLayout(sidePane);
-  sideLayout->setContentsMargins(0, 0, 0, 0);
-  sideLayout->setSpacing(12);
-  sideLayout->addWidget(detailPanel_, 3);
-  sideLayout->addWidget(timeline_, 2);
+  // Vertical splitter: user can drag to resize detail vs timeline heights.
+  auto* sideSplitter = new QSplitter(Qt::Vertical);
+  sideSplitter->setObjectName(QStringLiteral("SideSplitter"));
+  sideSplitter->setChildrenCollapsible(false);
+  sideSplitter->addWidget(detailPanel_);
+  sideSplitter->addWidget(timeline_);
+  sideSplitter->setStretchFactor(0, 3);
+  sideSplitter->setStretchFactor(1, 2);
+  sideSplitter->setSizes(QList<int>{300, 200});
 
   auto* splitter = new QSplitter(Qt::Horizontal);
   splitter->setObjectName(QStringLiteral("WorkspaceSplitter"));
   splitter->setChildrenCollapsible(false);
   splitter->addWidget(tablePanel);
-  splitter->addWidget(sidePane);
+  splitter->addWidget(sideSplitter);
   splitter->setStretchFactor(0, 3);
   splitter->setStretchFactor(1, 2);
   splitter->setSizes(QList<int>{760, 420});

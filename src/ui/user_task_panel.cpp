@@ -57,7 +57,10 @@ UserTaskPanel::UserTaskPanel(UserTaskModel* model, QWidget* parent)
   tableView_->verticalHeader()->setDefaultSectionSize(36);
   tableView_->horizontalHeader()->setHighlightSections(false);
   tableView_->horizontalHeader()->setStretchLastSection(true);
-  tableView_->horizontalHeader()->setSectionResizeMode(QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionsClickable(true);
+  tableView_->horizontalHeader()->setSectionResizeMode(QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setMinimumSectionSize(50);
+  tableView_->resizeColumnsToContents();
   layout->addWidget(tableView_, 1);
 
   // Wire selection → button enable.
