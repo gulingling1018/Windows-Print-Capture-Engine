@@ -67,6 +67,9 @@ class AsyncPageArtifactWriter
   [[nodiscard]] bool running() const noexcept;
   [[nodiscard]] std::string last_error() const;
 
+  /// Current depth of the internal work queue.
+  [[nodiscard]] std::size_t queue_depth() const noexcept;
+
  private:
   void run();
   void set_last_error(std::string error);

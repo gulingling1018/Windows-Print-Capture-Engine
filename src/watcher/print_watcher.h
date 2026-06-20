@@ -1,6 +1,7 @@
 #pragma once
 
 #include "core/data_contracts.h"
+#include "core/perf_monitor.h"
 
 #include <atomic>
 #include <chrono>
@@ -75,6 +76,10 @@ class PrintWatcher
   /// Thread-safe copy of the current per-job lifecycle summaries.
   [[nodiscard]] std::vector<core::JobLifecycleSummary> lifecycle_summaries() const;
 
+  /// Access the performance monitor for sampling.
+  [[nodiscard]] const core::PerfMonitor& perf_monitor() const noexcept { return perf_monitor_; }
+  [[nodiscard]] core::PerfMonitor& perf_monitor() noexcept { return perf_monitor_; }
+
  private:
   void run();
   void set_last_error(std::string error);
@@ -96,10 +101,19 @@ class PrintWatcher
     std::uint32_t status_flags{0};
     int next_sequence{0};
     std::chrono::steady_clock::time_point last_progress_time;
+
+    // Phase timing (all steady_clock).
+    std::chrono::steady_clock::time_point first_event_time;    // When first event was emitted
+    std::chrono::steady_clock::time_point phase_entry_time;   // When current phase started
+    std::chrono::steady_clock::time_point last_event_time;     // When last event was emitted
+    std::int64_t cumulative_phase_ms{0};                       // Accumulated ms in current phase
+
     core::JobLifecycleSummary summary;
   };
   mutable std::mutex summaries_mutex_;
   std::unordered_map<std::uint32_t, InternalJobState> job_states_;
+
+  core::PerfMonitor perf_monitor_;
 
   mutable std::mutex lifecycle_mutex_;
   mutable std::mutex error_mutex_;

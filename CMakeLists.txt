@@ -26,6 +26,7 @@ configure_file(
 )
 
 add_subdirectory(src)
+add_subdirectory(tools)
 
 if(WPCE_BUILD_TESTS)
   include(CTest)

@@ -102,6 +102,19 @@ struct JobLifecycleEvent
   std::string detail;                 // Human-readable description
   std::int32_t pages_printed{0};
   std::int32_t total_pages{0};
+
+  /// Milliseconds since the previous lifecycle event (0 for first event).
+  std::int64_t delta_ms_since_prev{0};
+
+  /// Cumulative milliseconds spent in the current phase so far.
+  std::int64_t cumulative_phase_ms{0};
+};
+
+/// Dwell time for a completed lifecycle phase.
+struct PhaseDwellEntry
+{
+  std::string phase_name;    // e.g. "spooling", "printing"
+  std::int64_t duration_ms;  // -1 for terminal (not a duration)
 };
 
 /// Full lifecycle summary for one print job.
@@ -118,6 +131,12 @@ struct JobLifecycleSummary
   std::int32_t progress_percent{0};   // pages_printed * 100 / total_pages, or -1
   std::string last_status;
   std::string source{"winspool"};
+
+  /// Accumulated dwell time per phase.
+  std::vector<PhaseDwellEntry> phase_dwells;
+
+  /// Total observed lifecycle wall-clock duration in milliseconds.
+  std::int64_t total_duration_ms{0};
 };
 
 }  // namespace wpce::core

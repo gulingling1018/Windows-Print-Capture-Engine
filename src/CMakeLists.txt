@@ -2,6 +2,8 @@ add_library(wpce_core
   collector/metadata_collector.cpp
   common/build_info.cpp
   core/data_contracts.cpp
+  core/perf_monitor.cpp
+  storage/file_utils.cpp
   storage/job_snapshot_writer.cpp
   storage/json_serializer.cpp
   storage/page_artifact_writer.cpp

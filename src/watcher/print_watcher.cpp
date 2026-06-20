@@ -810,7 +810,47 @@ std::vector<core::JobLifecycleSummary> PrintWatcher::lifecycle_summaries() const
   result.reserve(job_states_.size());
   for (const auto& [id, state] : job_states_)
   {
-    result.push_back(state.summary);
+    auto summary = state.summary;
+
+    // Compute total duration from first to last event.
+    if (state.first_event_time.time_since_epoch().count() > 0)
+    {
+      const auto end = state.last_event_time.time_since_epoch().count() > 0
+                         ? state.last_event_time
+                         : state.first_event_time;
+      summary.total_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        end - state.first_event_time).count();
+    }
+
+    // Ensure phase_dwells is up-to-date: add current phase dwell if still active.
+    if (state.phase_entry_time.time_since_epoch().count() > 0 &&
+        !is_terminal_phase(state.current_phase))
+    {
+      const auto now = std::chrono::steady_clock::now();
+      const auto current_dwell = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - state.phase_entry_time).count() + state.cumulative_phase_ms;
+      // Only add if not already present.
+      const std::string phase_name{core::to_string(state.current_phase)};
+      bool found = false;
+      for (auto& dwell : summary.phase_dwells)
+      {
+        if (dwell.phase_name == phase_name)
+        {
+          dwell.duration_ms = current_dwell;
+          found = true;
+          break;
+        }
+      }
+      if (!found)
+      {
+        summary.phase_dwells.push_back(core::PhaseDwellEntry{
+          .phase_name = phase_name,
+          .duration_ms = current_dwell,
+        });
+      }
+    }
+
+    result.push_back(std::move(summary));
   }
 
   std::sort(result.begin(), result.end(), [](const core::JobLifecycleSummary& left, const core::JobLifecycleSummary& right) {
@@ -857,7 +897,7 @@ void PrintWatcher::run()
       return;  // Don't emit Unknown as the very first event.
     }
 
-    const core::JobLifecycleEvent event = make_lifecycle_event(
+    core::JobLifecycleEvent event = make_lifecycle_event(
       state.summary.job_id,
       state.next_sequence,
       phase,
@@ -865,7 +905,49 @@ void PrintWatcher::run()
       pages_printed,
       total_pages);
 
+    // ── Phase timing ──────────────────────────────────────────────────
+    const auto now = std::chrono::steady_clock::now();
+
+    // First event tracking.
+    if (state.first_event_time.time_since_epoch().count() == 0)
+    {
+      state.first_event_time = now;
+    }
+
+    // Delta since previous event.
+    if (state.last_event_time.time_since_epoch().count() > 0)
+    {
+      event.delta_ms_since_prev = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - state.last_event_time).count();
+    }
+
+    // Phase transition detection.
+    if (phase != state.current_phase && state.current_phase != core::JobLifecyclePhase::Unknown)
+    {
+      // Finalize dwell time for the old phase.
+      const auto old_phase_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - state.phase_entry_time).count();
+      const auto total_old_ms = state.cumulative_phase_ms + old_phase_ms;
+      state.summary.phase_dwells.push_back(core::PhaseDwellEntry{
+        .phase_name = std::string(core::to_string(state.current_phase)),
+        .duration_ms = total_old_ms,
+      });
+      // Reset for new phase.
+      state.phase_entry_time = now;
+      state.cumulative_phase_ms = 0;
+    }
+    else if (state.phase_entry_time.time_since_epoch().count() == 0)
+    {
+      // First event for this job — start timing.
+      state.phase_entry_time = now;
+    }
+
+    event.cumulative_phase_ms = state.cumulative_phase_ms +
+      std::chrono::duration_cast<std::chrono::milliseconds>(
+        now - state.phase_entry_time).count();
+
     state.current_phase = phase;
+    state.last_event_time = now;
     state.summary.events.push_back(event);
     if (!state.summary.events.empty())
     {
@@ -1068,6 +1150,9 @@ void PrintWatcher::run()
         throw std::runtime_error(format_win32_error("WaitForSingleObject", GetLastError()));
       }
 
+      perf_monitor_.set_last_notification_time(std::chrono::steady_clock::now());
+      const auto processing_start = std::chrono::steady_clock::now();
+
       DWORD change_flags = 0;
       PPRINTER_NOTIFY_INFO raw_info = nullptr;
       if (!FindNextPrinterChangeNotification(
@@ -1145,6 +1230,12 @@ void PrintWatcher::run()
         tick_stall_detection();
         last_stall_check = now;
       }
+
+      // Record event processing duration for performance monitoring.
+      const auto processing_end = std::chrono::steady_clock::now();
+      const double processing_ms =
+        std::chrono::duration<double, std::milli>(processing_end - processing_start).count();
+      perf_monitor_.set_last_event_processing_ms(processing_ms);
     }
 #else
     throw std::runtime_error("Win32 print watching is only supported on Windows");

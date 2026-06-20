@@ -12,6 +12,7 @@
 #include <cstddef>
 #include <exception>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <mutex>
 #include <string>
@@ -122,7 +123,7 @@ void print_usage()
             << "  wpce --sample-xml\n"
             << "  wpce --write-sample-job <output-dir>\n"
             << "  wpce --list-jobs <printer-name>\n"
-            << "  wpce --watch-printer <printer-name> [output-dir] [--stall-timeout <seconds>]\n";
+            << "  wpce --watch-printer <printer-name> [output-dir] [--stall-timeout <seconds>] [--perf-log <file>]\n";
 }
 
 #ifdef _WIN32
@@ -283,7 +284,8 @@ void print_lifecycle_summary_line(const wpce::core::JobLifecycleSummary& summary
 
 int watch_printer(const std::string_view printer_name,
                   const std::filesystem::path& output_directory,
-                  const std::chrono::seconds stall_timeout)
+                  const std::chrono::seconds stall_timeout,
+                  const std::string& perf_log_path = {})
 {
   try
   {
@@ -384,9 +386,42 @@ int watch_printer(const std::string_view printer_name,
     }
     std::cout << "Press Ctrl+C to stop.\n\n";
 
+    // ── Perf log setup ──────────────────────────────────────────────────
+    std::ofstream perf_log;
+    if (!perf_log_path.empty())
+    {
+      perf_log.open(perf_log_path, std::ios::out | std::ios::trunc);
+      if (perf_log)
+      {
+        perf_log << "timestamp_utc,cpu_pct,working_set_mb,handle_count,thread_count,"
+                    "snapshot_queue,page_queue,watcher_idle_ms,event_processing_ms\n";
+      }
+    }
+    auto last_perf_sample = std::chrono::steady_clock::now();
+
     while (!g_stop_requested && watcher.running())
     {
       std::this_thread::sleep_for(std::chrono::milliseconds(200));
+
+      // Periodic performance sampling (~ every 5 seconds).
+      const auto now = std::chrono::steady_clock::now();
+      if (perf_log.is_open() && now - last_perf_sample > std::chrono::seconds{5})
+      {
+        auto& monitor = watcher.perf_monitor();
+        monitor.set_snapshot_writer_queue_depth(writer.queue_depth());
+        const wpce::core::PerfSample sample = monitor.sample();
+        perf_log << sample.timestamp_utc << ','
+                 << sample.cpu_percent << ','
+                 << (sample.working_set_bytes / (1024.0 * 1024.0)) << ','
+                 << sample.handle_count << ','
+                 << sample.thread_count << ','
+                 << sample.snapshot_writer_queue_depth << ','
+                 << sample.page_writer_queue_depth << ','
+                 << sample.watcher_idle_ms << ','
+                 << sample.last_event_processing_ms << '\n';
+        perf_log.flush();
+        last_perf_sample = now;
+      }
     }
     watcher.stop();
     writer.stop();
@@ -517,8 +552,9 @@ int main(const int argc, char* argv[])
 
     std::filesystem::path output_directory = argc > 3 && argv[3][0] != '-' ? argv[3] : "wpce-output";
     std::chrono::seconds stall_timeout{0};
+    std::string perf_log_path;
 
-    // Parse optional --stall-timeout flag.
+    // Parse optional flags.
     for (int i = 3; i < argc; ++i)
     {
       const std::string_view arg = argv[i];
@@ -526,9 +562,13 @@ int main(const int argc, char* argv[])
       {
         try { stall_timeout = std::chrono::seconds{std::stoll(argv[i + 1])}; } catch (...) {}
       }
+      if (arg == "--perf-log" && i + 1 < argc)
+      {
+        perf_log_path = argv[i + 1];
+      }
     }
 
-    return watch_printer(argv[2], output_directory, stall_timeout);
+    return watch_printer(argv[2], output_directory, stall_timeout, perf_log_path);
   }
 
   print_usage();

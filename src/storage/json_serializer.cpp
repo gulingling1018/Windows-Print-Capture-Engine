@@ -65,6 +65,12 @@ void append_json_property(std::ostream& output, const std::string_view name, con
   output << ": " << value;
 }
 
+void append_json_property(std::ostream& output, const std::string_view name, const std::int64_t value)
+{
+  append_json_string(output, name);
+  output << ": " << value;
+}
+
 void append_json_property(std::ostream& output, const std::string_view name, const std::uint32_t value)
 {
   append_json_string(output, name);
@@ -166,6 +172,10 @@ std::string to_json(const core::JobLifecycleEvent& event)
   output << ",\n  ";
   append_json_property(output, "total_pages", event.total_pages);
   output << ",\n  ";
+  append_json_property(output, "delta_ms_since_prev", event.delta_ms_since_prev);
+  output << ",\n  ";
+  append_json_property(output, "cumulative_phase_ms", event.cumulative_phase_ms);
+  output << ",\n  ";
   append_json_property(output, "detail", event.detail);
   output << "\n}\n";
   return output.str();
@@ -189,6 +199,10 @@ void append_json_lifecycle_event(std::ostream& output, const core::JobLifecycleE
   append_json_property(output, "pages_printed", event.pages_printed);
   output << ",\n      ";
   append_json_property(output, "total_pages", event.total_pages);
+  output << ",\n      ";
+  append_json_property(output, "delta_ms_since_prev", event.delta_ms_since_prev);
+  output << ",\n      ";
+  append_json_property(output, "cumulative_phase_ms", event.cumulative_phase_ms);
   output << ",\n      ";
   append_json_property(output, "detail", event.detail);
   output << "\n    }";
@@ -216,6 +230,24 @@ std::string to_json(const core::JobLifecycleSummary& summary)
   output << ",\n  ";
   append_json_property(output, "source", summary.source);
   output << ",\n  ";
+  append_json_property(output, "total_duration_ms", summary.total_duration_ms);
+  output << ",\n  ";
+  // Phase dwells array.
+  output << "\"phase_dwells\": [\n";
+  for (std::size_t i = 0; i < summary.phase_dwells.size(); ++i)
+  {
+    output << "    {\n      ";
+    append_json_property(output, "phase", summary.phase_dwells[i].phase_name);
+    output << ",\n      ";
+    append_json_property(output, "duration_ms", summary.phase_dwells[i].duration_ms);
+    output << "\n    }";
+    if (i + 1 < summary.phase_dwells.size())
+    {
+      output << ',';
+    }
+    output << '\n';
+  }
+  output << "  ],\n  ";
   output << "\"events\": [\n";
   for (std::size_t i = 0; i < summary.events.size(); ++i)
   {

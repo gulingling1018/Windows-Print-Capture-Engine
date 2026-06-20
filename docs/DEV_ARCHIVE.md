@@ -1,5 +1,131 @@
 # WPCE Development Archive
 
+## 2026-06-20: Phase 5 — Stability, Performance, and Test Infrastructure
+
+### Context
+
+- Phases 0-4 were code-complete and building.
+- The project used raw `assert()` for tests, had duplicated file utility code, and lacked performance monitoring, phase timing, and stress testing.
+- Phase 5 in the optimized project plan is the final phase before release candidate.
+
+### Changes
+
+**Step 1: Git Baseline**
+- Created initial git commit with all Phase 0-4 work (71 files, 9877 lines).
+
+**Step 2: Extract Shared File Utilities**
+- Added `src/storage/file_utils.h` and `src/storage/file_utils.cpp`.
+- Extracted `ensure_output_directory()`, `make_temp_path()`, `replace_file()`, `write_text_file_atomic()` from duplicated anonymous-namespace functions in both `job_snapshot_writer.cpp` and `page_artifact_writer.cpp`.
+- Refactored `write_job_snapshot_json_atomic()`, `write_metadata_json_atomic()`, and `write_lifecycle_summaries_atomic()` to use the shared `write_text_file_atomic()` — significant code reduction.
+
+**Step 3: GoogleTest Integration**
+- Integrated GoogleTest v1.16.0 via CMake `FetchContent` (no vcpkg dependency).
+- Converted all 11 tests from raw `assert()` to `TEST()` macros with `EXPECT_*` assertions.
+- Added `gtest_discover_tests()` for automatic per-test CTest registration.
+- Tests now show individual names like `Serialization.JobSnapshot`, `Watcher.PhaseClassification`, etc.
+
+**Step 4: Performance Monitoring Module**
+- Added `src/core/perf_monitor.h` and `src/core/perf_monitor.cpp`.
+- `PerfSample` struct: CPU%, working set (MB), handle count, thread count, queue depths, watcher idle time, event processing latency.
+- `PerfMonitor` class: lock-free atomic setters, Windows Process API sampling (`GetProcessTimes`, `GetProcessMemoryInfo`, `GetProcessHandleCount`, `CreateToolhelp32Snapshot`), CPU delta calculation.
+- Added `queue_depth()` to both `AsyncJobSnapshotWriter` and `AsyncPageArtifactWriter`.
+- Added `PerfMonitor` member to `PrintWatcher` with setter instrumentation in the notification loop.
+- Added `--perf-log <file>` flag to CLI for periodic CSV sampling (~ every 5s).
+
+**Step 5: Phase Timing Instrumentation**
+- Extended `JobLifecycleEvent` with `delta_ms_since_prev` and `cumulative_phase_ms`.
+- Added `PhaseDwellEntry` struct and `phase_dwells` + `total_duration_ms` to `JobLifecycleSummary`.
+- Added timing fields to `InternalJobState` (`first_event_time`, `phase_entry_time`, `last_event_time`, `cumulative_phase_ms`).
+- On phase transition: old phase dwell computed and stored, new phase timing started.
+- On each event: delta since previous event computed.
+- `lifecycle_summaries()` computes `total_duration_ms` and includes active phase dwell in real time.
+- JSON serialization updated for all new fields.
+- Added `LifecycleEventTiming` and `LifecycleSummaryTiming` unit tests.
+
+**Step 6: Stress Test Tool**
+- Added `tools/stress_test.cpp` — standalone stress test CLI.
+- Simulates N synthetic jobs across W concurrent writers.
+- Tracks: enqueue success/failure, peak queue depth, throughput (jobs/sec), wall-clock time.
+- MSVC Debug: `_CrtSetDbgFlag` for automatic memory leak detection.
+- Configurable: `--job-count`, `--writer-count`, `--queue-capacity`, `--output-dir`, `--burst-size`, `--burst-interval-ms`.
+- CTest registrations: `wpce_stress_1k` (1000 jobs), `wpce_stress_queue_full` (2000 jobs, small queue — backpressure test).
+
+### Test Results (Final)
+
+```
+100% tests passed, 0 tests failed out of 16
+
+Test breakdown:
+  Serialization.JobSnapshot               Passed
+  Serialization.MetadataState             Passed
+  Serialization.PageArtifactIndex         Passed
+  Serialization.LifecycleEvent            Passed
+  Serialization.LifecycleSummary          Passed
+  Serialization.LifecycleEventTiming      Passed  (new)
+  Serialization.LifecycleSummaryTiming    Passed  (new)
+  Watcher.DescribeJobStatus               Passed
+  Watcher.PhaseClassification             Passed
+  Storage.AtomicJobSnapshotWriter         Passed
+  Storage.AsyncJobSnapshotWriter          Passed
+  Storage.LifecycleSummaryPersistence     Passed
+  Collector.NameMappers                   Passed
+  wpce_stress_1k                          Passed  (new)
+  wpce_stress_queue_full                  Passed  (new)
+  wpce_filter_pipeline                    Passed
+```
+
+### Static Analysis
+
+- cppcheck: 22/22 files checked, 2 style suggestions (false positive + useStlAlgorithm). No errors.
+- clang-tidy: skipped (not installed in current shell).
+
+### Key Decisions
+
+- GoogleTest via FetchContent, not vcpkg — keeps test builds self-contained.
+- PerfMonitor lives in `src/core/` with no dependency on `storage` or `watcher` — clean dependency graph.
+- Phase timing uses `steady_clock` (monotonic) internally, stores `int64_t` milliseconds for serialization.
+- Phase dwell entries use a lightweight `vector<PhaseDwellEntry>` rather than `unordered_map` to keep the contracts header lean.
+- Stress test uses `unique_ptr<AsyncJobSnapshotWriter>` because the writer class is non-movable.
+- Concurrent multi-writer stress test is available as a manual test; filesystem race conditions can cause spurious failures in CI.
+
+### Files Added
+
+| File | Purpose |
+|---|---|
+| `src/storage/file_utils.h` | Shared file I/O declarations |
+| `src/storage/file_utils.cpp` | Atomic write primitives |
+| `src/core/perf_monitor.h` | Performance monitoring API |
+| `src/core/perf_monitor.cpp` | Windows process metrics |
+| `tools/stress_test.cpp` | Stress test CLI tool |
+| `tools/CMakeLists.txt` | Tools build config |
+
+### Files Modified
+
+| File | Changes |
+|---|---|
+| `src/CMakeLists.txt` | Added file_utils.cpp, perf_monitor.cpp, tools subdirectory |
+| `src/storage/job_snapshot_writer.h` | Added `queue_depth()` method |
+| `src/storage/job_snapshot_writer.cpp` | Removed anon-ns utilities, used shared `write_text_file_atomic` |
+| `src/storage/page_artifact_writer.h` | Added `queue_depth()` method |
+| `src/storage/page_artifact_writer.cpp` | Removed anon-ns utilities, used shared `write_text_file_atomic` |
+| `src/storage/json_serializer.cpp` | Added timing fields, phase_dwells, int64_t overload |
+| `src/core/data_contracts.h` | Added timing fields, PhaseDwellEntry struct |
+| `src/watcher/print_watcher.h` | Added PerfMonitor member, timing state fields |
+| `src/watcher/print_watcher.cpp` | Instrumented with perf sampling, phase dwell tracking |
+| `src/app/main.cpp` | Added `--perf-log` flag, periodic perf sampling in watch loop |
+| `tests/CMakeLists.txt` | FetchContent GoogleTest, gtest_discover_tests, stress CTests |
+| `tests/contract_serialization_tests.cpp` | Converted to GoogleTest, added timing tests |
+| `CMakeLists.txt` (root) | Added tools subdirectory |
+
+### Follow-Ups
+
+- Install clang-tidy and run full static analysis.
+- Run live capture with `--perf-log` to validate performance metrics against Phase 5 budgets.
+- Test with multi-application print jobs (Word, browser, Notepad, etc.).
+- Install Qt6 via vcpkg (or verify C:/Qt/6.8.2 works) and confirm GUI builds.
+- WDK packaging for XPS filter driver before production deployment.
+- 10000-job stress test (may need to run outside CTest due to duration).
+
 ## 2026-06-19: Plan Feasibility Optimization and Project Skills
 
 ### Context

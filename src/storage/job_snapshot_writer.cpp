@@ -1,49 +1,16 @@
 #include "storage/job_snapshot_writer.h"
 
+#include "storage/file_utils.h"
 #include "storage/json_serializer.h"
 
-#ifdef _WIN32
-#include <windows.h>
-#endif
-
-#include <fstream>
 #include <sstream>
 #include <stdexcept>
-#include <system_error>
 #include <utility>
 
 namespace wpce::storage
 {
 namespace
 {
-
-std::filesystem::path ensure_output_directory(const std::filesystem::path& directory)
-{
-  std::filesystem::create_directories(directory);
-  return directory;
-}
-
-std::filesystem::path make_temp_path(const std::filesystem::path& final_path)
-{
-  std::ostringstream suffix;
-  suffix << ".tmp." << std::hash<std::thread::id>{}(std::this_thread::get_id());
-  return final_path.string() + suffix.str();
-}
-
-void replace_file(const std::filesystem::path& temp_path, const std::filesystem::path& final_path)
-{
-#ifdef _WIN32
-  if (!MoveFileExW(
-        temp_path.wstring().c_str(),
-        final_path.wstring().c_str(),
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
-  {
-    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "MoveFileExW");
-  }
-#else
-  std::filesystem::rename(temp_path, final_path);
-#endif
-}
 
 void write_snapshot_files(const JobSnapshotWriterConfig& config, const SnapshotPair& pair)
 {
@@ -100,141 +67,37 @@ void write_lifecycle_summaries_atomic(
   // Write per-job lifecycle archives.
   for (const core::JobLifecycleSummary& summary : summaries)
   {
-    const std::filesystem::path archive_path = lifecycle_summary_archive_path(config, summary);
-    const std::filesystem::path temp_path = make_temp_path(archive_path);
-    ensure_output_directory(archive_path.parent_path());
-
-    try
-    {
-      {
-        std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
-        if (!output)
-        {
-          throw std::runtime_error("failed to open temporary lifecycle summary file");
-        }
-        output << to_json(summary);
-        output.flush();
-        if (!output)
-        {
-          throw std::runtime_error("failed to write temporary lifecycle summary file");
-        }
-      }
-      replace_file(temp_path, archive_path);
-    }
-    catch (...)
-    {
-      std::error_code ignored;
-      std::filesystem::remove(temp_path, ignored);
-      throw;
-    }
+    write_text_file_atomic(to_json(summary), lifecycle_summary_archive_path(config, summary));
   }
 
   // Write a session-level lifecycle manifest.
-  const std::filesystem::path manifest_path = lifecycle_summary_path(config);
-  const std::filesystem::path temp_path = make_temp_path(manifest_path);
-
-  try
+  std::ostringstream manifest;
+  manifest << "{\n  \"session_jobs\": [\n";
+  for (std::size_t i = 0; i < summaries.size(); ++i)
   {
+    manifest << "    {\n      \"job_id\": " << summaries[i].job_id
+             << ",\n      \"final_phase\": \"" << core::to_string(summaries[i].final_phase)
+             << "\",\n      \"event_count\": " << summaries[i].events.size()
+             << ",\n      \"file\": \"jobs/job-" << summaries[i].job_id << "-lifecycle.json\"\n    }";
+    if (i + 1 < summaries.size())
     {
-      std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
-      if (!output)
-      {
-        throw std::runtime_error("failed to open temporary lifecycle manifest file");
-      }
-
-      output << "{\n  \"session_jobs\": [\n";
-      for (std::size_t i = 0; i < summaries.size(); ++i)
-      {
-        output << "    {\n      \"job_id\": " << summaries[i].job_id
-               << ",\n      \"final_phase\": \"" << core::to_string(summaries[i].final_phase)
-               << "\",\n      \"event_count\": " << summaries[i].events.size()
-               << ",\n      \"file\": \"jobs/job-" << summaries[i].job_id << "-lifecycle.json\"\n    }";
-        if (i + 1 < summaries.size())
-        {
-          output << ',';
-        }
-        output << '\n';
-      }
-      output << "  ]\n}\n";
-      output.flush();
-
-      if (!output)
-      {
-        throw std::runtime_error("failed to write temporary lifecycle manifest file");
-      }
+      manifest << ',';
     }
-    replace_file(temp_path, manifest_path);
+    manifest << '\n';
   }
-  catch (...)
-  {
-    std::error_code ignored;
-    std::filesystem::remove(temp_path, ignored);
-    throw;
-  }
+  manifest << "  ]\n}\n";
+
+  write_text_file_atomic(manifest.str(), lifecycle_summary_path(config));
 }
 
 void write_metadata_json_atomic(const core::MetadataSnapshot& snapshot, const std::filesystem::path& path)
 {
-  ensure_output_directory(path.parent_path());
-  const std::filesystem::path temp_path = make_temp_path(path);
-
-  try
-  {
-    {
-      std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
-      if (!output)
-      {
-        throw std::runtime_error("failed to open temporary metadata snapshot file");
-      }
-
-      output << to_json(snapshot);
-      output.flush();
-      if (!output)
-      {
-        throw std::runtime_error("failed to write temporary metadata snapshot file");
-      }
-    }
-
-    replace_file(temp_path, path);
-  }
-  catch (...)
-  {
-    std::error_code ignored;
-    std::filesystem::remove(temp_path, ignored);
-    throw;
-  }
+  write_text_file_atomic(to_json(snapshot), path);
 }
 
 void write_job_snapshot_json_atomic(const core::JobSnapshot& snapshot, const std::filesystem::path& path)
 {
-  ensure_output_directory(path.parent_path());
-  const std::filesystem::path temp_path = make_temp_path(path);
-
-  try
-  {
-    {
-      std::ofstream output(temp_path, std::ios::binary | std::ios::trunc);
-      if (!output)
-      {
-        throw std::runtime_error("failed to open temporary job snapshot file");
-      }
-
-      output << to_json(snapshot);
-      output.flush();
-      if (!output)
-      {
-        throw std::runtime_error("failed to write temporary job snapshot file");
-      }
-    }
-
-    replace_file(temp_path, path);
-  }
-  catch (...)
-  {
-    std::error_code ignored;
-    std::filesystem::remove(temp_path, ignored);
-    throw;
-  }
+  write_text_file_atomic(to_json(snapshot), path);
 }
 
 AsyncJobSnapshotWriter::AsyncJobSnapshotWriter(JobSnapshotWriterConfig config) : config_(std::move(config))
@@ -316,6 +179,12 @@ std::string AsyncJobSnapshotWriter::last_error() const
 {
   std::scoped_lock lock(error_mutex_);
   return last_error_;
+}
+
+std::size_t AsyncJobSnapshotWriter::queue_depth() const noexcept
+{
+  std::scoped_lock lock(queue_mutex_);
+  return queue_.size();
 }
 
 void AsyncJobSnapshotWriter::run()

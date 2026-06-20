@@ -5,7 +5,8 @@
 #include "storage/xml_serializer.h"
 #include "watcher/print_watcher.h"
 
-#include <cassert>
+#include <gtest/gtest.h>
+
 #include <chrono>
 #include <filesystem>
 #include <fstream>
@@ -17,10 +18,31 @@ namespace
 
 void expect_contains(const std::string& text, const std::string& expected)
 {
-  assert(text.find(expected) != std::string::npos);
+  EXPECT_NE(std::string::npos, text.find(expected))
+    << "Expected text to contain \"" << expected << "\"";
 }
 
-void test_job_snapshot_serialization()
+std::filesystem::path make_test_directory(const std::string& name)
+{
+  const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
+  std::ostringstream path;
+  path << "wpce-" << name << '-' << tick;
+  return std::filesystem::temp_directory_path() / path.str();
+}
+
+std::string read_file(const std::filesystem::path& path)
+{
+  std::ifstream input(path, std::ios::binary);
+  std::ostringstream content;
+  content << input.rdbuf();
+  return content.str();
+}
+
+}  // namespace
+
+// ── Serialization tests ──────────────────────────────────────────────────
+
+TEST(Serialization, JobSnapshot)
 {
   const wpce::core::JobSnapshot snapshot{
     .schema_version = 1,
@@ -44,7 +66,7 @@ void test_job_snapshot_serialization()
   expect_contains(xml, "report &quot;Q2&quot;.pdf");
 }
 
-void test_metadata_state_serialization()
+TEST(Serialization, MetadataState)
 {
   wpce::core::MetadataSnapshot snapshot;
   snapshot.job_id = 42;
@@ -71,7 +93,7 @@ void test_metadata_state_serialization()
   expect_contains(xml, "<duplex state=\"unsupported\"></duplex>");
 }
 
-void test_page_artifact_index_serialization()
+TEST(Serialization, PageArtifactIndex)
 {
   const wpce::core::PageArtifactIndex index{
     .schema_version = 1,
@@ -93,135 +115,7 @@ void test_page_artifact_index_serialization()
   expect_contains(xml, "<source>xps-filter</source>");
 }
 
-void test_job_status_description()
-{
-  assert(wpce::watcher::describe_job_status(0) == "unknown");
-  assert(wpce::watcher::describe_job_status(0x00000008) == "spooling");
-  assert(wpce::watcher::describe_job_status(0x00000010 | 0x00000020) == "printing|offline");
-  assert(wpce::watcher::describe_job_status(0x80000000) == "unknown(2147483648)");
-}
-
-std::filesystem::path make_test_directory(const std::string& name)
-{
-  const auto tick = std::chrono::steady_clock::now().time_since_epoch().count();
-  std::ostringstream path;
-  path << "wpce-" << name << '-' << tick;
-  return std::filesystem::temp_directory_path() / path.str();
-}
-
-std::string read_file(const std::filesystem::path& path)
-{
-  std::ifstream input(path, std::ios::binary);
-  std::ostringstream content;
-  content << input.rdbuf();
-  return content.str();
-}
-
-void test_atomic_job_snapshot_writer()
-{
-  const wpce::core::JobSnapshot snapshot{
-    .schema_version = 1,
-    .job_id = 42,
-    .user = "DOMAIN\\alice",
-    .document_name = "report.pdf",
-    .printer_name = "Microsoft Print to PDF",
-    .submit_time_utc = "2026-06-19T11:30:00Z",
-    .status = "spooling",
-    .source = "winspool",
-  };
-
-  const std::filesystem::path directory = make_test_directory("atomic-writer");
-  const std::filesystem::path output_path = directory / "job.json";
-
-  wpce::storage::write_job_snapshot_json_atomic(snapshot, output_path);
-
-  const std::string content = read_file(output_path);
-  expect_contains(content, "\"job_id\": 42");
-  expect_contains(content, "\"source\": \"winspool\"");
-  std::filesystem::remove_all(directory);
-}
-
-void test_async_job_snapshot_writer()
-{
-  const wpce::core::JobSnapshot job{
-    .schema_version = 1,
-    .job_id = 84,
-    .user = "DOMAIN\\bob",
-    .document_name = "invoice.pdf",
-    .printer_name = "Microsoft Print to PDF",
-    .submit_time_utc = "2026-06-19T11:31:00Z",
-    .status = "printing",
-    .source = "winspool",
-  };
-
-  const wpce::core::MetadataSnapshot metadata{
-    .schema_version = 1,
-    .job_id = 84,
-    .total_pages = {"10", wpce::core::FieldState::Reported},
-    .pages_printed = {"3", wpce::core::FieldState::Reported},
-    .copies = {"1", wpce::core::FieldState::Reported},
-    .duplex = {"simplex", wpce::core::FieldState::Reported},
-    .color = {"monochrome", wpce::core::FieldState::Reported},
-    .paper_size = {"A4", wpce::core::FieldState::Reported},
-    .orientation = {"portrait", wpce::core::FieldState::Reported},
-    .n_up = {"1-up (normal)", wpce::core::FieldState::Reported},
-    .collate = {"uncollated", wpce::core::FieldState::Reported},
-    .print_quality = {"high", wpce::core::FieldState::Reported},
-    .dm_fields_hex = "0x0007e35f",
-  };
-
-  const std::filesystem::path directory = make_test_directory("async-writer");
-  const wpce::storage::JobSnapshotWriterConfig config{.output_directory = directory, .queue_capacity = 4};
-  wpce::storage::AsyncJobSnapshotWriter writer(config);
-
-  writer.start();
-  assert(writer.enqueue(job, metadata));
-  writer.stop();
-
-  assert(writer.last_error().empty());
-  expect_contains(read_file(wpce::storage::job_snapshot_path(config)), "\"job_id\": 84");
-  expect_contains(read_file(wpce::storage::job_snapshot_archive_path(config, job)), "\"status\": \"printing\"");
-  expect_contains(read_file(wpce::storage::metadata_snapshot_path(config)), "\"total_pages\": { \"value\": \"10\"");
-  expect_contains(read_file(wpce::storage::metadata_archive_path(config, metadata)), "\"paper_size\": { \"value\": \"A4\"");
-  std::filesystem::remove_all(directory);
-}
-
-void test_phase_classification()
-{
-  using Phase = wpce::core::JobLifecyclePhase;
-
-  // Terminal states.
-  assert(wpce::watcher::classify_phase(0x00000002, "") == Phase::Failed);          // JOB_STATUS_ERROR
-  assert(wpce::watcher::classify_phase(0x00000040, "") == Phase::Failed);          // JOB_STATUS_PAPEROUT
-  assert(wpce::watcher::classify_phase(0x00000100, "") == Phase::Cancelled);       // JOB_STATUS_DELETED
-  assert(wpce::watcher::classify_phase(0x00001000, "") == Phase::Completed);       // JOB_STATUS_COMPLETE
-  assert(wpce::watcher::classify_phase(0x00002000, "") == Phase::Completed);       // JOB_STATUS_RETAINED
-
-  // Active states.
-  assert(wpce::watcher::classify_phase(0x00000010, "") == Phase::Printing);        // JOB_STATUS_PRINTING
-  assert(wpce::watcher::classify_phase(0x00000008, "") == Phase::Spooling);        // JOB_STATUS_SPOOLING
-
-  // Unknown (empty flags).
-  assert(wpce::watcher::classify_phase(0, "") == Phase::Unknown);
-
-  // Terminal phase check.
-  assert(wpce::core::is_terminal_phase(Phase::Completed));
-  assert(wpce::core::is_terminal_phase(Phase::Failed));
-  assert(wpce::core::is_terminal_phase(Phase::Cancelled));
-  assert(!wpce::core::is_terminal_phase(Phase::Stalled));   // Stalled is recoverable
-  assert(!wpce::core::is_terminal_phase(Phase::Printing));
-  assert(!wpce::core::is_terminal_phase(Phase::Spooling));
-  assert(!wpce::core::is_terminal_phase(Phase::Unknown));
-
-  // Phase name.
-  assert(wpce::core::to_string(Phase::Accepted) == "accepted");
-  assert(wpce::core::to_string(Phase::Completed) == "completed");
-  assert(wpce::core::to_string(Phase::Failed) == "failed");
-  assert(wpce::core::to_string(Phase::Cancelled) == "cancelled");
-  assert(wpce::core::to_string(Phase::Stalled) == "stalled");
-}
-
-void test_lifecycle_event_serialization()
+TEST(Serialization, LifecycleEvent)
 {
   const wpce::core::JobLifecycleEvent event{
     .event_id = "42-1",
@@ -241,7 +135,7 @@ void test_lifecycle_event_serialization()
   expect_contains(json, "\"total_pages\": 5");
 }
 
-void test_lifecycle_summary_serialization()
+TEST(Serialization, LifecycleSummary)
 {
   wpce::core::JobLifecycleSummary summary{
     .schema_version = 1,
@@ -299,7 +193,123 @@ void test_lifecycle_summary_serialization()
   expect_contains(json, "\"event_id\": \"99-2\"");
 }
 
-void test_lifecycle_summary_persistence()
+// ── Watcher tests ────────────────────────────────────────────────────────
+
+TEST(Watcher, DescribeJobStatus)
+{
+  EXPECT_EQ("unknown", wpce::watcher::describe_job_status(0));
+  EXPECT_EQ("spooling", wpce::watcher::describe_job_status(0x00000008));
+  EXPECT_EQ("printing|offline", wpce::watcher::describe_job_status(0x00000010 | 0x00000020));
+  EXPECT_EQ("unknown(2147483648)", wpce::watcher::describe_job_status(0x80000000));
+}
+
+TEST(Watcher, PhaseClassification)
+{
+  using Phase = wpce::core::JobLifecyclePhase;
+
+  // Terminal states.
+  EXPECT_EQ(Phase::Failed, wpce::watcher::classify_phase(0x00000002, ""));     // JOB_STATUS_ERROR
+  EXPECT_EQ(Phase::Failed, wpce::watcher::classify_phase(0x00000040, ""));     // JOB_STATUS_PAPEROUT
+  EXPECT_EQ(Phase::Cancelled, wpce::watcher::classify_phase(0x00000100, ""));  // JOB_STATUS_DELETED
+  EXPECT_EQ(Phase::Completed, wpce::watcher::classify_phase(0x00001000, ""));  // JOB_STATUS_COMPLETE
+  EXPECT_EQ(Phase::Completed, wpce::watcher::classify_phase(0x00002000, ""));  // JOB_STATUS_RETAINED
+
+  // Active states.
+  EXPECT_EQ(Phase::Printing, wpce::watcher::classify_phase(0x00000010, ""));   // JOB_STATUS_PRINTING
+  EXPECT_EQ(Phase::Spooling, wpce::watcher::classify_phase(0x00000008, ""));   // JOB_STATUS_SPOOLING
+
+  // Unknown (empty flags).
+  EXPECT_EQ(Phase::Unknown, wpce::watcher::classify_phase(0, ""));
+
+  // Terminal phase check.
+  EXPECT_TRUE(wpce::core::is_terminal_phase(Phase::Completed));
+  EXPECT_TRUE(wpce::core::is_terminal_phase(Phase::Failed));
+  EXPECT_TRUE(wpce::core::is_terminal_phase(Phase::Cancelled));
+  EXPECT_FALSE(wpce::core::is_terminal_phase(Phase::Stalled));
+  EXPECT_FALSE(wpce::core::is_terminal_phase(Phase::Printing));
+  EXPECT_FALSE(wpce::core::is_terminal_phase(Phase::Spooling));
+  EXPECT_FALSE(wpce::core::is_terminal_phase(Phase::Unknown));
+
+  // Phase name.
+  EXPECT_EQ("accepted", wpce::core::to_string(Phase::Accepted));
+  EXPECT_EQ("completed", wpce::core::to_string(Phase::Completed));
+  EXPECT_EQ("failed", wpce::core::to_string(Phase::Failed));
+  EXPECT_EQ("cancelled", wpce::core::to_string(Phase::Cancelled));
+  EXPECT_EQ("stalled", wpce::core::to_string(Phase::Stalled));
+}
+
+// ── Storage tests ────────────────────────────────────────────────────────
+
+TEST(Storage, AtomicJobSnapshotWriter)
+{
+  const wpce::core::JobSnapshot snapshot{
+    .schema_version = 1,
+    .job_id = 42,
+    .user = "DOMAIN\\alice",
+    .document_name = "report.pdf",
+    .printer_name = "Microsoft Print to PDF",
+    .submit_time_utc = "2026-06-19T11:30:00Z",
+    .status = "spooling",
+    .source = "winspool",
+  };
+
+  const std::filesystem::path directory = make_test_directory("atomic-writer");
+  const std::filesystem::path output_path = directory / "job.json";
+
+  wpce::storage::write_job_snapshot_json_atomic(snapshot, output_path);
+
+  const std::string content = read_file(output_path);
+  expect_contains(content, "\"job_id\": 42");
+  expect_contains(content, "\"source\": \"winspool\"");
+  std::filesystem::remove_all(directory);
+}
+
+TEST(Storage, AsyncJobSnapshotWriter)
+{
+  const wpce::core::JobSnapshot job{
+    .schema_version = 1,
+    .job_id = 84,
+    .user = "DOMAIN\\bob",
+    .document_name = "invoice.pdf",
+    .printer_name = "Microsoft Print to PDF",
+    .submit_time_utc = "2026-06-19T11:31:00Z",
+    .status = "printing",
+    .source = "winspool",
+  };
+
+  const wpce::core::MetadataSnapshot metadata{
+    .schema_version = 1,
+    .job_id = 84,
+    .total_pages = {"10", wpce::core::FieldState::Reported},
+    .pages_printed = {"3", wpce::core::FieldState::Reported},
+    .copies = {"1", wpce::core::FieldState::Reported},
+    .duplex = {"simplex", wpce::core::FieldState::Reported},
+    .color = {"monochrome", wpce::core::FieldState::Reported},
+    .paper_size = {"A4", wpce::core::FieldState::Reported},
+    .orientation = {"portrait", wpce::core::FieldState::Reported},
+    .n_up = {"1-up (normal)", wpce::core::FieldState::Reported},
+    .collate = {"uncollated", wpce::core::FieldState::Reported},
+    .print_quality = {"high", wpce::core::FieldState::Reported},
+    .dm_fields_hex = "0x0007e35f",
+  };
+
+  const std::filesystem::path directory = make_test_directory("async-writer");
+  const wpce::storage::JobSnapshotWriterConfig config{.output_directory = directory, .queue_capacity = 4};
+  wpce::storage::AsyncJobSnapshotWriter writer(config);
+
+  writer.start();
+  EXPECT_TRUE(writer.enqueue(job, metadata));
+  writer.stop();
+
+  EXPECT_TRUE(writer.last_error().empty());
+  expect_contains(read_file(wpce::storage::job_snapshot_path(config)), "\"job_id\": 84");
+  expect_contains(read_file(wpce::storage::job_snapshot_archive_path(config, job)), "\"status\": \"printing\"");
+  expect_contains(read_file(wpce::storage::metadata_snapshot_path(config)), "\"total_pages\": { \"value\": \"10\"");
+  expect_contains(read_file(wpce::storage::metadata_archive_path(config, metadata)), "\"paper_size\": { \"value\": \"A4\"");
+  std::filesystem::remove_all(directory);
+}
+
+TEST(Storage, LifecycleSummaryPersistence)
 {
   const std::filesystem::path directory = make_test_directory("lifecycle-persist");
 
@@ -333,44 +343,75 @@ void test_lifecycle_summary_persistence()
   std::filesystem::remove_all(directory);
 }
 
-}  // namespace
+TEST(Serialization, LifecycleEventTiming)
+{
+  wpce::core::JobLifecycleEvent event{
+    .event_id = "42-1",
+    .job_id = 42,
+    .sequence = 1,
+    .timestamp_utc = "2026-06-19T12:00:00Z",
+    .phase = wpce::core::JobLifecyclePhase::Spooling,
+    .status_flags = "spooling",
+    .detail = "Job 42 phase: spooling",
+    .pages_printed = 0,
+    .total_pages = 5,
+    .delta_ms_since_prev = 150,
+    .cumulative_phase_ms = 350,
+  };
 
-void test_debug_mode_name_mappers()
+  const std::string json = wpce::storage::to_json(event);
+  expect_contains(json, "\"delta_ms_since_prev\": 150");
+  expect_contains(json, "\"cumulative_phase_ms\": 350");
+}
+
+TEST(Serialization, LifecycleSummaryTiming)
+{
+  wpce::core::JobLifecycleSummary summary{
+    .schema_version = 1,
+    .job_id = 88,
+    .user = "DOMAIN\\timing-test",
+    .document_name = "timing.pdf",
+    .printer_name = "Microsoft Print to PDF",
+    .submit_time_utc = "2026-06-19T12:00:00Z",
+    .final_phase = wpce::core::JobLifecyclePhase::Completed,
+    .progress_percent = 100,
+    .source = "winspool",
+    .total_duration_ms = 5230,
+  };
+  summary.phase_dwells.push_back({"spooling", 120});
+  summary.phase_dwells.push_back({"printing", 4800});
+  summary.phase_dwells.push_back({"completed", -1});
+
+  const std::string json = wpce::storage::to_json(summary);
+  expect_contains(json, "\"total_duration_ms\": 5230");
+  expect_contains(json, "\"phase_dwells\"");
+  expect_contains(json, "\"phase\": \"spooling\"");
+  expect_contains(json, "\"duration_ms\": 120");
+  expect_contains(json, "\"duration_ms\": -1");
+}
+
+// ── Collector tests ──────────────────────────────────────────────────────
+
+TEST(Collector, NameMappers)
 {
   using namespace wpce::collector;
 
   // N-up.
-  assert(n_up_name(1) == "1-up (normal)");
-  assert(n_up_name(2) == "2-up");
-  assert(n_up_name(4) == "4-up");
-  assert(n_up_name(16) == "16-up");
-  assert(n_up_name(3).empty());
+  EXPECT_EQ("1-up (normal)", n_up_name(1));
+  EXPECT_EQ("2-up", n_up_name(2));
+  EXPECT_EQ("4-up", n_up_name(4));
+  EXPECT_EQ("16-up", n_up_name(16));
+  EXPECT_TRUE(n_up_name(3).empty());
 
   // Collate.
 #ifdef DMCOLLATE_FALSE
-  assert(collate_name(DMCOLLATE_FALSE) == "uncollated");
-  assert(collate_name(DMCOLLATE_TRUE) == "collated");
+  EXPECT_EQ("uncollated", collate_name(DMCOLLATE_FALSE));
+  EXPECT_EQ("collated", collate_name(DMCOLLATE_TRUE));
 #endif
 
   // Print quality.
 #ifdef DMRES_HIGH
-  assert(print_quality_name(DMRES_HIGH) == "high");
-  assert(print_quality_name(DMRES_DRAFT) == "draft");
+  EXPECT_EQ("high", print_quality_name(DMRES_HIGH));
+  EXPECT_EQ("draft", print_quality_name(DMRES_DRAFT));
 #endif
-}
-
-int main()
-{
-  test_job_snapshot_serialization();
-  test_metadata_state_serialization();
-  test_page_artifact_index_serialization();
-  test_job_status_description();
-  test_atomic_job_snapshot_writer();
-  test_async_job_snapshot_writer();
-  test_debug_mode_name_mappers();
-  test_phase_classification();
-  test_lifecycle_event_serialization();
-  test_lifecycle_summary_serialization();
-  test_lifecycle_summary_persistence();
-  return 0;
 }
