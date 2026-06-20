@@ -1,5 +1,6 @@
 #include "ui/main_window.h"
 #include "ui/document_link_delegate.h"
+#include "ui/grip_splitter.h"
 #include "ui/job_detail_panel.h"
 #include "ui/job_table_model.h"
 #include "ui/lifecycle_timeline.h"
@@ -14,6 +15,7 @@
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
+#include <QFile>
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
@@ -329,38 +331,37 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
   tableView_->sortByColumn(JobTableModel::ColSubmitTime, Qt::DescendingOrder);
 
-  // ── Document link delegate: blue underlined, click to open ──────────
+  // ── Document link delegate: click to open captured file ────────────
   auto* docDelegate = new DocumentLinkDelegate(tableView_);
   tableView_->setItemDelegateForColumn(JobTableModel::ColDocument, docDelegate);
   connect(docDelegate, &DocumentLinkDelegate::documentClicked,
-          this, [this](const QString& docName)
+          this, [this](const QModelIndex& proxyIndex)
           {
-            if (!docName.isEmpty() && !lastOutputDir_.isEmpty())
+            const QModelIndex sourceIndex = jobProxy_->mapToSource(proxyIndex);
+            const auto rowData = tableModel_->jobAtRow(sourceIndex.row());
+            if (!rowData.has_value()) return;
+
+            const QString docName = QString::fromStdString(rowData->job.document_name);
+            if (docName.isEmpty()) return;
+
+            // Open the job's JSON file from the capture directory.
+            const QString jobFile = lastOutputDir_
+              + QStringLiteral("/jobs/job-")
+              + QString::number(rowData->job.job_id)
+              + QStringLiteral(".json");
+            if (QFile::exists(jobFile))
             {
-              // Try to open the captured job file for that document.
-              // Scan the jobs directory for matching file.
-              QDir jobsDir(lastOutputDir_ + QStringLiteral("/jobs"));
-              if (jobsDir.exists())
-              {
-                const auto entries = jobsDir.entryInfoList(QDir::Files);
-                for (const auto& entry : entries)
-                {
-                  if (entry.fileName().contains(docName, Qt::CaseInsensitive) ||
-                      entry.fileName().startsWith(QStringLiteral("job-")))
-                  {
-                    QDesktopServices::openUrl(QUrl::fromLocalFile(entry.absoluteFilePath()));
-                    break;
-                  }
-                }
-              }
-              // Fallback: open the output directory itself.
-              if (!jobsDir.exists())
-              {
-                QDesktopServices::openUrl(QUrl::fromLocalFile(lastOutputDir_));
-              }
+              QDesktopServices::openUrl(QUrl::fromLocalFile(jobFile));
+            }
+            else
+            {
+              // Fallback: open the output directory.
+              QDesktopServices::openUrl(QUrl::fromLocalFile(lastOutputDir_));
             }
             statusBar()->showMessage(
-              QStringLiteral("已打开文档: %1").arg(docName), 3000);
+              QStringLiteral("已打开: Job %1 — %2")
+                .arg(rowData->job.job_id)
+                .arg(docName), 3000);
           });
 
   emptyStateLabel_ = new QLabel(QStringLiteral("暂无打印作业"));
@@ -375,21 +376,18 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   detailPanel_ = new JobDetailPanel();
   timeline_ = new LifecycleTimeline();
 
-  // Vertical splitter: user can drag to resize detail vs timeline heights.
-  auto* sideSplitter = new QSplitter(Qt::Vertical);
+  // Vertical splitter with visible grip dots.
+  auto* sideSplitter = new GripSplitter(Qt::Vertical);
   sideSplitter->setObjectName(QStringLiteral("SideSplitter"));
-  sideSplitter->setHandleWidth(6);
-  sideSplitter->setChildrenCollapsible(false);
   sideSplitter->addWidget(detailPanel_);
   sideSplitter->addWidget(timeline_);
   sideSplitter->setStretchFactor(0, 3);
   sideSplitter->setStretchFactor(1, 2);
   sideSplitter->setSizes(QList<int>{300, 200});
 
-  auto* splitter = new QSplitter(Qt::Horizontal);
+  // Horizontal splitter with visible grip dots.
+  auto* splitter = new GripSplitter(Qt::Horizontal);
   splitter->setObjectName(QStringLiteral("WorkspaceSplitter"));
-  splitter->setHandleWidth(6);
-  splitter->setChildrenCollapsible(false);
   splitter->addWidget(tablePanel);
   splitter->addWidget(sideSplitter);
   splitter->setStretchFactor(0, 3);
@@ -411,10 +409,9 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
   // ── Wrap top and bottom in a vertical splitter ──────────────────────
 
-  auto* verticalSplitter = new QSplitter(Qt::Vertical);
+  // Vertical main splitter with visible grip dots.
+  auto* verticalSplitter = new GripSplitter(Qt::Vertical);
   verticalSplitter->setObjectName(QStringLiteral("VerticalSplitter"));
-  verticalSplitter->setHandleWidth(6);
-  verticalSplitter->setChildrenCollapsible(false);
   verticalSplitter->addWidget(splitter);
   verticalSplitter->addWidget(bottomPanel);
   verticalSplitter->setStretchFactor(0, 3);   // top = 75%

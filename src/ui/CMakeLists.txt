@@ -1,5 +1,6 @@
 set(UI_HEADERS
   document_link_delegate.h
+  grip_splitter.h
 )
 
 set(UI_SOURCES

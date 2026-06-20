@@ -168,6 +168,7 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
   }
 
   const JobRowData& data = it.value();
+  const QString userId = QString::fromStdString(data.job.user).trimmed();
 
   if (role == PhaseKeyRole)
   {
@@ -184,41 +185,29 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
     return sortValueForColumn(data, col);
   }
 
-  // ── Per-user identity & color roles ──────────────────────────────
   if (role == UserIdRole)
   {
-    return QString::fromStdString(data.job.user);
+    return userId;
   }
 
   if (role == DocumentPathRole)
   {
-    // Return the document name — caller constructs the actual file path.
     return QString::fromStdString(data.job.document_name);
   }
 
   if (role == RowColorRole)
   {
-    const QString uid = QString::fromStdString(data.job.user);
-    return userBackgroundColor(uid);
+    return userBackgroundColor(userId);
   }
 
   if (role == RowTextColorRole)
   {
-    const QString uid = QString::fromStdString(data.job.user);
-    return userTextColor(uid);
+    return userTextColor(userId);
   }
 
-  // Per-user tinted background for the entire row.
   if (role == Qt::BackgroundRole)
   {
-    const QString uid = QString::fromStdString(data.job.user);
-    const QColor tint = userBackgroundColor(uid);
-    // Very subtle tint — blend with white.
-    return QBrush(QColor(
-      (tint.red()   + 255 * 4) / 5,
-      (tint.green() + 255 * 4) / 5,
-      (tint.blue()  + 255 * 4) / 5
-    ));
+    return QBrush(subtleUserTint(userId));
   }
 
   if (role == Qt::TextAlignmentRole)
@@ -243,18 +232,24 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
     return QBrush(phaseColor(data.phase));
   }
 
-  if (role == Qt::FontRole && (col == ColJobId || col == ColPhase))
+  if (role == Qt::FontRole && (col == ColJobId || col == ColPhase || col == ColPrice))
   {
     QFont font;
     font.setWeight(QFont::DemiBold);
+    if (col == ColPrice)
+    {
+      font.setFamily(QStringLiteral("Cascadia Mono"));
+      font.setStyleHint(QFont::Monospace);
+    }
     return font;
   }
 
   if (role == Qt::ToolTipRole)
   {
-    return QStringLiteral("Job ID %1\n%2\n%3")
+    return QStringLiteral("Job ID %1\n文档: %2\n用户: %3\n打印机: %4")
       .arg(data.job.job_id)
       .arg(QString::fromStdString(data.job.document_name))
+      .arg(userId)
       .arg(QString::fromStdString(data.job.printer_name));
   }
 
@@ -267,16 +262,12 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
   {
     case ColJobId:
       return data.job.job_id;
-
     case ColDocument:
       return QString::fromStdString(data.job.document_name);
-
     case ColUser:
-      return QString::fromStdString(data.job.user);
-
+      return userId;
     case ColPhase:
       return phaseDisplayName(data.phase);
-
     case ColProgress:
     {
       const int pct = progressPercent(data);
@@ -293,23 +284,14 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
       }
       return QStringLiteral("-");
     }
-
     case ColTotalPages:
       return reportedValueOrDash(data.metadata.total_pages);
-
     case ColCopies:
       return reportedValueOrDash(data.metadata.copies);
-
     case ColPrice:
-      if (data.price > 0.0)
-      {
-        return QString::number(data.price, 'f', 2);
-      }
-      return QStringLiteral("-");
-
+      return data.price > 0.0 ? QString::number(data.price, 'f', 2) : QStringLiteral("-");
     case ColSubmitTime:
       return QString::fromStdString(data.job.submit_time_utc);
-
     default:
       return {};
   }

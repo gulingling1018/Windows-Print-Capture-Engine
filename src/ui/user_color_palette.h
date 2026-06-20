@@ -7,58 +7,74 @@
 namespace wpce::ui
 {
 
-/// Generate a stable, visually distinct color for a given user identity.
-/// Uses a palette of 12 hand-picked pastel background colors + matching text colors.
+/// 12-colour palette — saturated enough to be clearly distinguishable.
 inline QColor userBackgroundColor(const QString& userId)
 {
   static const QColor kPalette[] = {
-    QColor(0xdb, 0xea, 0xfe),  // blue
-    QColor(0xdc, 0xfc, 0xe7),  // green
-    QColor(0xfe, 0xf3, 0xc7),  // amber
-    QColor(0xfc, 0xe7, 0xf3),  // pink
-    QColor(0xe0, 0xe7, 0xff),  // indigo
-    QColor(0xd1, 0xfa, 0xe5),  // emerald
-    QColor(0xff, 0xe4, 0xe6),  // rose
-    QColor(0xcd, 0xd5, 0xfd),  // violet
-    QColor(0xa7, 0xf3, 0xd0),  // teal
-    QColor(0xfe, 0xd7, 0xaa),  // orange
-    QColor(0xbb, 0xf7, 0xd0),  // lime
-    QColor(0xe9, 0xd5, 0xff),  // purple
+    QColor(0xd0, 0xe2, 0xff),  // blue    (azure)
+    QColor(0xc8, 0xf5, 0xd6),  // green   (mint)
+    QColor(0xfe, 0xeb, 0xa0),  // amber   (gold)
+    QColor(0xfc, 0xd4, 0xe3),  // pink    (blush)
+    QColor(0xd6, 0xdf, 0xff),  // indigo  (periwinkle)
+    QColor(0xb5, 0xf0, 0xd9),  // emerald (seafoam)
+    QColor(0xff, 0xd2, 0xd6),  // rose    (salmon)
+    QColor(0xc8, 0xce, 0xfc),  // violet  (lavender)
+    QColor(0x8e, 0xea, 0xc8),  // teal    (aquamarine)
+    QColor(0xfe, 0xc8, 0x8e),  // orange  (peach)
+    QColor(0xa8, 0xef, 0xc8),  // lime    (spearmint)
+    QColor(0xe2, 0xc8, 0xfe),  // purple  (orchid)
   };
 
-  const std::size_t index = static_cast<std::size_t>(
+  const auto idx = static_cast<std::size_t>(
     qHash(userId) % static_cast<uint>(12));
-  return kPalette[index];
+  return kPalette[idx];
 }
 
-/// Text color that pairs well with the background for readability.
 inline QColor userTextColor(const QString& userId)
 {
   static const QColor kTextPalette[] = {
-    QColor(0x1e, 0x40, 0xaf),  // blue-900
-    QColor(0x16, 0x53, 0x34),  // green-900
-    QColor(0x92, 0x40, 0x0e),  // amber-900
-    QColor(0x9d, 0x17, 0x4d),  // pink-900
-    QColor(0x31, 0x2e, 0x81),  // indigo-900
-    QColor(0x06, 0x47, 0x10),  // emerald-900
-    QColor(0x9f, 0x12, 0x39),  // rose-900
-    QColor(0x4c, 0x1d, 0x95),  // violet-900
-    QColor(0x13, 0x4e, 0x4a),  // teal-900
-    QColor(0x9a, 0x34, 0x12),  // orange-900
-    QColor(0x3f, 0x62, 0x12),  // lime-900
-    QColor(0x6b, 0x21, 0xa8),  // purple-900
+    QColor(0x0d, 0x2b, 0x6e),
+    QColor(0x0d, 0x3b, 0x1e),
+    QColor(0x5c, 0x2b, 0x00),
+    QColor(0x5e, 0x0e, 0x2f),
+    QColor(0x1a, 0x1a, 0x5e),
+    QColor(0x03, 0x2e, 0x20),
+    QColor(0x5e, 0x0b, 0x20),
+    QColor(0x2e, 0x10, 0x5e),
+    QColor(0x08, 0x2e, 0x2c),
+    QColor(0x5e, 0x1f, 0x08),
+    QColor(0x1e, 0x3a, 0x08),
+    QColor(0x38, 0x10, 0x5e),
   };
 
-  const std::size_t index = static_cast<std::size_t>(
+  const auto idx = static_cast<std::size_t>(
     qHash(userId) % static_cast<uint>(12));
-  return kTextPalette[index];
+  return kTextPalette[idx];
 }
 
-/// A darker border color derived from the user color.
 inline QColor userBorderColor(const QString& userId)
 {
-  const QColor bg = userBackgroundColor(userId);
-  return bg.darker(115);
+  return userBackgroundColor(userId).darker(120);
+}
+
+/// Row tint: blends background with white (2:1 ratio for visible colour).
+inline QColor subtleUserTint(const QString& userId)
+{
+  const QColor c = userBackgroundColor(userId);
+  return QColor(
+    (c.red()   * 3 + 255 * 2) / 5,
+    (c.green() * 3 + 255 * 2) / 5,
+    (c.blue()  * 3 + 255 * 2) / 5);
+}
+
+/// Slightly stronger tint for hover or non-table elements.
+inline QColor mediumUserTint(const QString& userId)
+{
+  const QColor c = userBackgroundColor(userId);
+  return QColor(
+    (c.red()   * 4 + 255 * 1) / 5,
+    (c.green() * 4 + 255 * 1) / 5,
+    (c.blue()  * 4 + 255 * 1) / 5);
 }
 
 }  // namespace wpce::ui
