@@ -1,5 +1,40 @@
 # WPCE Development Archive
 
+## 2026-06-20: UI Polish — Multi-User Coloring, Clickable Docs, Splitter UX, Color Hierarchy
+
+### Changes
+
+**New files (2):**
+- `src/ui/user_color_palette.h` — 12-color pastel palette, hash-stable per-user assignment, bg/text/border color accessors
+- `src/ui/document_link_delegate.h` — QStyledItemDelegate rendering document names as blue underlined links, clicks emit signal
+
+**Stylesheet overhaul (`src/ui/main.cpp`):**
+- Splitter handles: 6px grab zone (was 3px), hover→blue, pressed→dark blue
+- Container hierarchy: HeroBar (dark blue gradient) / TablePanel (white card) / MetricCard (white+hover blue) / DetailPanel+TimelinePanel (white cards) / StatisticsPanel (blue gradient) / BottomPanel (transparent)
+- Color hierarchy (6 levels): L1 white (hero title) / L2 #0f172a (panel headers) / L3 #1e293b (body) / L4 #0f172a (metric values, 800 weight) / L5 #64748b (muted labels) / L6 #94a3b8 (hints)
+- Status pill: idle=gray, running=green (tuned #dcfce7/#166534)
+- Buttons: primary blue, danger red, quiet ghost
+- Tables: alternating rows, subtle separators, element padding
+- Scrollbars: wider (10px), rounded handles
+
+**Per-user row coloring (`job_table_model`, `user_task_model`):**
+- `JobTableModel::data()` returns BackgroundRole with per-user pastel tint (80% white blend)
+- `JobTableModel::data()` returns RowColorRole, RowTextColorRole, UserIdRole, DocumentPathRole
+- `UserTaskModel::data()` returns BackgroundRole with per-user pastel tint (75% white blend)
+- Color assigned via `qHash(userId) % 12` — stable across restarts
+
+**Clickable document links:**
+- `DocumentLinkDelegate` installed as item delegate for `ColDocument`
+- Blue underlined rendering in table cells
+- Click opens captured document file or jobs directory via `QDesktopServices`
+
+**Splitter UX:**
+- All three splitters: `setHandleWidth(6)` — wider grab zone
+- Side pane: QSplitter(Qt::Vertical) replaces QVBoxLayout — detail/timeline freely resizable
+
+### Modified Files (8)
+All in `src/ui/`: `main.cpp`, `main_window.cpp`, `job_table_model.{h,cpp}`, `user_task_model.cpp`, `CMakeLists.txt`, +2 new files
+
 ## 2026-06-20: Qt6 GUI Enhancement — Pricing, Statistics, and User-Task Management
 
 ### Context

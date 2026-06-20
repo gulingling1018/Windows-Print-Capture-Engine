@@ -1,3 +1,7 @@
+set(UI_HEADERS
+  document_link_delegate.h
+)
+
 set(UI_SOURCES
   main.cpp
   main_window.cpp
@@ -8,6 +12,7 @@ set(UI_SOURCES
   statistics_panel.cpp
   user_task_model.cpp
   user_task_panel.cpp
+  ${UI_HEADERS}
 )
 
 add_executable(wpce_ui WIN32 ${UI_SOURCES})

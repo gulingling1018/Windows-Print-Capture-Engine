@@ -1,5 +1,6 @@
 #include "ui/job_table_model.h"
 #include "ui/pricing_config.h"
+#include "ui/user_color_palette.h"
 
 #include <QBrush>
 #include <QColor>
@@ -181,6 +182,43 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
   if (role == SortRole)
   {
     return sortValueForColumn(data, col);
+  }
+
+  // ── Per-user identity & color roles ──────────────────────────────
+  if (role == UserIdRole)
+  {
+    return QString::fromStdString(data.job.user);
+  }
+
+  if (role == DocumentPathRole)
+  {
+    // Return the document name — caller constructs the actual file path.
+    return QString::fromStdString(data.job.document_name);
+  }
+
+  if (role == RowColorRole)
+  {
+    const QString uid = QString::fromStdString(data.job.user);
+    return userBackgroundColor(uid);
+  }
+
+  if (role == RowTextColorRole)
+  {
+    const QString uid = QString::fromStdString(data.job.user);
+    return userTextColor(uid);
+  }
+
+  // Per-user tinted background for the entire row.
+  if (role == Qt::BackgroundRole)
+  {
+    const QString uid = QString::fromStdString(data.job.user);
+    const QColor tint = userBackgroundColor(uid);
+    // Very subtle tint — blend with white.
+    return QBrush(QColor(
+      (tint.red()   + 255 * 4) / 5,
+      (tint.green() + 255 * 4) / 5,
+      (tint.blue()  + 255 * 4) / 5
+    ));
   }
 
   if (role == Qt::TextAlignmentRole)

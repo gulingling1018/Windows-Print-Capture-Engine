@@ -1,6 +1,8 @@
 #include "ui/user_task_model.h"
 #include "ui/pricing_config.h"
+#include "ui/user_color_palette.h"
 
+#include <QBrush>
 #include <QColor>
 #include <QDateTime>
 #include <QFont>
@@ -75,6 +77,17 @@ QVariant UserTaskModel::data(const QModelIndex& index, int role) const
       case ColPrice:
         return static_cast<int>(Qt::AlignRight | Qt::AlignVCenter);
     }
+  }
+
+  // ── Per-user row coloring ────────────────────────────────────────
+  if (role == Qt::BackgroundRole)
+  {
+    const QColor tint = userBackgroundColor(task.userId);
+    return QBrush(QColor(
+      (tint.red()   + 255 * 3) / 4,
+      (tint.green() + 255 * 3) / 4,
+      (tint.blue()  + 255 * 3) / 4
+    ));
   }
 
   if (role == Qt::ForegroundRole && index.column() == ColStatus)

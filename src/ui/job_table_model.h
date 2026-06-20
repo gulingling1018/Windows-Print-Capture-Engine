@@ -51,7 +51,11 @@ class JobTableModel : public QAbstractTableModel
   {
     PhaseKeyRole = Qt::UserRole + 1,
     ProgressPercentRole,
-    SortRole
+    SortRole,
+    UserIdRole,          // QString — user identity for color coding
+    DocumentPathRole,    // QString — full path to the document file
+    RowColorRole,        // QColor — per-user background tint
+    RowTextColorRole     // QColor — per-user foreground
   };
 
   explicit JobTableModel(QObject* parent = nullptr);
