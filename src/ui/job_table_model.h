@@ -38,6 +38,7 @@ class JobTableModel : public QAbstractTableModel
     ColJobId = 0,
     ColDocument,
     ColUser,
+    ColPrinter,
     ColPhase,
     ColProgress,
     ColTotalPages,

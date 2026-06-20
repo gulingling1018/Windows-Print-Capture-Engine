@@ -52,6 +52,8 @@ QVariant UserTaskModel::data(const QModelIndex& index, int role) const
   {
     switch (index.column())
     {
+      case ColTaskId:
+        return task.taskId;
       case ColUser:
         return task.userId;
       case ColDate:
@@ -71,6 +73,7 @@ QVariant UserTaskModel::data(const QModelIndex& index, int role) const
   {
     switch (index.column())
     {
+      case ColTaskId:
       case ColJobCount:
       case ColTotalPages:
         return static_cast<int>(Qt::AlignCenter);
@@ -115,6 +118,8 @@ QVariant UserTaskModel::headerData(int section, Qt::Orientation orientation, int
 
   switch (section)
   {
+    case ColTaskId:
+      return QStringLiteral("任务ID");
     case ColUser:
       return QStringLiteral("用户");
     case ColDate:
@@ -227,6 +232,7 @@ void UserTaskModel::onJobSnapshot(core::JobSnapshot snapshot)
   const int newRow = static_cast<int>(tasks_.size());
   beginInsertRows(QModelIndex(), newRow, newRow);
   UserTask newTask;
+  newTask.taskId = generateTaskId(today);
   newTask.userId = userId;
   newTask.date = today;
   newTask.jobIds.push_back(jobId);
@@ -291,10 +297,24 @@ void UserTaskModel::clear()
   tasks_.clear();
   activeTaskIndex_.clear();
   jobToTaskRow_.clear();
+  dailyTaskCounter_ = 0;
+  lastTaskDate_ = QDate();
   endResetModel();
 }
 
 // ── Private ────────────────────────────────────────────────────────
+
+QString UserTaskModel::generateTaskId(const QDate& date)
+{
+  if (date != lastTaskDate_)
+  {
+    dailyTaskCounter_ = 0;
+    lastTaskDate_ = date;
+  }
+  ++dailyTaskCounter_;
+  return date.toString(QStringLiteral("yyyyMMdd-"))
+    + QStringLiteral("%1").arg(dailyTaskCounter_, 3, 10, QLatin1Char('0'));
+}
 
 int UserTaskModel::rowForUser(const QString& userId) const
 {

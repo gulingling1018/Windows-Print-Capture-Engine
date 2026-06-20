@@ -23,12 +23,14 @@ struct JobCostEntry
 };
 
 /// A user task binds multiple print jobs to one user on one date.
+/// Each task gets a daily auto-increment ID: "YYYYMMDD-NNN".
 struct UserTask
 {
+  QString taskId;           // "20260620-001", "20260620-002", ...
   QString userId;
   QDate date;
   QVector<std::uint32_t> jobIds;
-  QMap<std::uint32_t, JobCostEntry> jobCosts;  // job_id → {pages, price}
+  QMap<std::uint32_t, JobCostEntry> jobCosts;
   int totalPages{0};
   double totalPrice{0.0};
   bool completed{false};
@@ -45,7 +47,8 @@ class UserTaskModel : public QAbstractTableModel
  public:
   enum Column
   {
-    ColUser = 0,
+    ColTaskId = 0,
+    ColUser,
     ColDate,
     ColJobCount,
     ColTotalPages,
@@ -82,9 +85,13 @@ class UserTaskModel : public QAbstractTableModel
  private:
   int rowForUser(const QString& userId) const;
 
+  QString generateTaskId(const QDate& date);
+
   QVector<UserTask> tasks_;
   QMap<QString, int> activeTaskIndex_;          // userId → row index (active tasks only)
   QMap<std::uint32_t, int> jobToTaskRow_;       // job_id → task row index
+  int dailyTaskCounter_{0};
+  QDate lastTaskDate_;
 };
 
 }  // namespace wpce::ui

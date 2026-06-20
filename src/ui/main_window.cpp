@@ -318,6 +318,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColJobId, QHeaderView::Interactive);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColDocument, QHeaderView::Stretch);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColUser, QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPrinter, QHeaderView::Interactive);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPhase, QHeaderView::Interactive);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColProgress, QHeaderView::Interactive);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColTotalPages, QHeaderView::Interactive);

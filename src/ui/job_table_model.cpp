@@ -106,6 +106,8 @@ QVariant sortValueForColumn(const JobRowData& data, const int column)
       return data.totalPages;
     case JobTableModel::ColCopies:
       return reportedValueOrDash(data.metadata.copies);
+    case JobTableModel::ColPrinter:
+      return QString::fromStdString(data.job.printer_name).toCaseFolded();
     case JobTableModel::ColPrice:
       return data.price;
     case JobTableModel::ColSubmitTime:
@@ -288,6 +290,8 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
       return reportedValueOrDash(data.metadata.total_pages);
     case ColCopies:
       return reportedValueOrDash(data.metadata.copies);
+    case ColPrinter:
+      return QString::fromStdString(data.job.printer_name);
     case ColPrice:
       return data.price > 0.0 ? QString::number(data.price, 'f', 2) : QStringLiteral("-");
     case ColSubmitTime:
@@ -322,6 +326,8 @@ QVariant JobTableModel::headerData(const int section,
       return QStringLiteral("页数");
     case ColCopies:
       return QStringLiteral("份数");
+    case ColPrinter:
+      return QStringLiteral("打印机");
     case ColPrice:
       return QStringLiteral("费用 (¥)");
     case ColSubmitTime:
