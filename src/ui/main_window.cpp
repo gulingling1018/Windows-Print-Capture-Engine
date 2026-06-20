@@ -307,34 +307,44 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   tableView_->setWordWrap(false);
   tableView_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
   tableView_->verticalHeader()->hide();
-  tableView_->verticalHeader()->setDefaultSectionSize(42);
+  tableView_->verticalHeader()->setDefaultSectionSize(38);
   tableView_->horizontalHeader()->setHighlightSections(false);
   tableView_->horizontalHeader()->setStretchLastSection(false);
   tableView_->horizontalHeader()->setSectionsClickable(true);
   tableView_->horizontalHeader()->setSectionsMovable(false);
+  tableView_->horizontalHeader()->setMinimumSectionSize(36);
 
-  // All columns Interactive so user can drag-resize.
-  // ColDocument uses Stretch to absorb remaining space.
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColJobId, QHeaderView::Interactive);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColDocument, QHeaderView::Stretch);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColUser, QHeaderView::Interactive);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPrinter, QHeaderView::Interactive);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPhase, QHeaderView::Interactive);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColProgress, QHeaderView::Interactive);
+  // ── Column resize modes ────────────────────────────────────────────
+
+  // Fixed-width columns with sensible defaults.
+  // All Interactive — user can drag to resize after first paint.
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColJobId,      QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColDocument,   QHeaderView::Stretch);     // absorbs free space
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColUser,       QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPrinter,    QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPhase,      QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColProgress,   QHeaderView::Interactive);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColTotalPages, QHeaderView::Interactive);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColCopies, QHeaderView::Interactive);
-  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPrice, QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColCopies,     QHeaderView::Interactive);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPrice,      QHeaderView::Interactive);
   tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColSubmitTime, QHeaderView::Interactive);
 
-  // Snap to content on first load, then user overrides by dragging.
-  tableView_->resizeColumnsToContents();
-  tableView_->horizontalHeader()->setMinimumSectionSize(40);
+  // ── Explicit default widths (px) — user can override by dragging ──
+  tableView_->setColumnWidth(JobTableModel::ColJobId,      70);
+  tableView_->setColumnWidth(JobTableModel::ColUser,       110);
+  tableView_->setColumnWidth(JobTableModel::ColPrinter,    130);
+  tableView_->setColumnWidth(JobTableModel::ColPhase,      72);
+  tableView_->setColumnWidth(JobTableModel::ColProgress,   120);
+  tableView_->setColumnWidth(JobTableModel::ColTotalPages, 52);
+  tableView_->setColumnWidth(JobTableModel::ColCopies,     48);
+  tableView_->setColumnWidth(JobTableModel::ColPrice,      80);
+  tableView_->setColumnWidth(JobTableModel::ColSubmitTime, 155);
 
   tableView_->sortByColumn(JobTableModel::ColSubmitTime, Qt::DescendingOrder);
 
-  // ── Document link delegate: click to open captured file ────────────
+  // ── Custom delegate for all columns ────────────────────────────────
   auto* docDelegate = new DocumentLinkDelegate(tableView_);
-  tableView_->setItemDelegateForColumn(JobTableModel::ColDocument, docDelegate);
+  tableView_->setItemDelegate(docDelegate);
   connect(docDelegate, &DocumentLinkDelegate::documentClicked,
           this, [this](const QModelIndex& proxyIndex)
           {

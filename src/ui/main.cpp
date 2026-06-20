@@ -166,24 +166,35 @@ int main(int argc, char* argv[])
     //  TABLES
     // ═══════════════════════════════════════════════════════════════
     "QTableView#JobTable {"
-    "  background: #ffffff; alternate-background-color: #fafbfc;"
+    "  background: #ffffff; alternate-background-color: #f7f8fb;"
     "  border: none; border-radius: 6px; gridline-color: transparent;"
     "  selection-background-color: #dbeafe; selection-color: #0f172a;"
     "}"
-    "QTableView#JobTable::item { padding: 7px 10px; }"
+    "QTableView#JobTable::item {"
+    "  padding: 0px 0px;"
+    "  border-bottom: 1px solid #edf0f5;"
+    "}"
+    "QTableView#JobTable::item:selected {"
+    "  border-bottom: 1px solid #bfdbfe;"
+    "}"
     "QTableView#TaskTable {"
-    "  background: #ffffff; alternate-background-color: #fafbfc;"
+    "  background: #ffffff; alternate-background-color: #f7f8fb;"
     "  border: none; border-radius: 6px; gridline-color: transparent;"
     "  selection-background-color: #dbeafe; selection-color: #0f172a;"
     "}"
-    "QTableView#TaskTable::item { padding: 7px 10px; }"
+    "QTableView#TaskTable::item {"
+    "  padding: 0px 0px;"
+    "  border-bottom: 1px solid #edf0f5;"
+    "}"
 
     // ═══════════════════════════════════════════════════════════════
-    //  HEADER VIEW
+    //  HEADER VIEW — crisp, bordered
     // ═══════════════════════════════════════════════════════════════
     "QHeaderView::section {"
-    "  background: #f1f5f9; color: #475569; padding: 8px 10px;"
-    "  border: 0; border-bottom: 2px solid #e2e8f0; font-weight: 700; font-size: 9pt;"
+    "  background: #f1f5f9; color: #475569; padding: 7px 10px;"
+    "  border: 0; border-bottom: 2px solid #cbd5e1;"
+    "  border-right: 1px solid #e2e8f0;"
+    "  font-weight: 700; font-size: 9pt;"
     "}"
 
     // ═══════════════════════════════════════════════════════════════
