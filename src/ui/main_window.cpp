@@ -4,136 +4,451 @@
 #include "ui/lifecycle_timeline.h"
 #include "ui/watcher_bridge.h"
 
-#include "watcher/print_watcher.h"
-
-#ifdef _WIN32
-#include <windows.h>
-#include <winspool.h>
-#endif
-
-#include <QApplication>
+#include <QAbstractItemView>
+#include <QComboBox>
 #include <QDateTime>
-#include <QFileDialog>
-#include <QFormLayout>
-#include <QGroupBox>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QItemSelectionModel>
 #include <QLabel>
-#include <QMessageBox>
+#include <QLineEdit>
+#include <QMetaType>
+#include <QSortFilterProxyModel>
+#include <QStackedWidget>
 #include <QStandardPaths>
-#include <QToolBar>
+#include <QStyle>
+#include <QUrl>
 #include <QVBoxLayout>
-
-#include <filesystem>
-#include <memory>
-#include <string>
-#include <vector>
 
 namespace wpce::ui
 {
 
-// ── MainWindow ─────────────────────────────────────────────────────────
+namespace
+{
+
+class JobFilterProxyModel final : public QSortFilterProxyModel
+{
+ public:
+  explicit JobFilterProxyModel(QObject* parent = nullptr)
+      : QSortFilterProxyModel(parent)
+  {
+    setDynamicSortFilter(true);
+    setSortRole(JobTableModel::SortRole);
+  }
+
+  void setSearchText(const QString& text)
+  {
+    const QString normalized = text.trimmed();
+    if (searchText_ == normalized)
+    {
+      return;
+    }
+    searchText_ = normalized;
+    invalidateFilter();
+  }
+
+  void setPhaseKey(const QString& key)
+  {
+    if (phaseKey_ == key)
+    {
+      return;
+    }
+    phaseKey_ = key;
+    invalidateFilter();
+  }
+
+ protected:
+  bool filterAcceptsRow(const int sourceRow,
+                        const QModelIndex& sourceParent) const override
+  {
+    const auto* model = sourceModel();
+    if (model == nullptr)
+    {
+      return false;
+    }
+
+    if (!phaseKey_.isEmpty())
+    {
+      const QModelIndex phaseIndex =
+        model->index(sourceRow, JobTableModel::ColPhase, sourceParent);
+      if (phaseIndex.data(JobTableModel::PhaseKeyRole).toString() != phaseKey_)
+      {
+        return false;
+      }
+    }
+
+    if (searchText_.isEmpty())
+    {
+      return true;
+    }
+
+    for (int column = 0; column < model->columnCount(sourceParent); ++column)
+    {
+      const QModelIndex index = model->index(sourceRow, column, sourceParent);
+      const QString value = index.data(Qt::DisplayRole).toString();
+      if (value.contains(searchText_, Qt::CaseInsensitive))
+      {
+        return true;
+      }
+    }
+
+    return false;
+  }
+
+  bool lessThan(const QModelIndex& left,
+                const QModelIndex& right) const override
+  {
+    const QVariant lhs = left.data(JobTableModel::SortRole);
+    const QVariant rhs = right.data(JobTableModel::SortRole);
+
+    const auto isNumeric = [](const QVariant& value)
+    {
+      const int type = value.typeId();
+      return type == QMetaType::Int ||
+             type == QMetaType::UInt ||
+             type == QMetaType::LongLong ||
+             type == QMetaType::ULongLong;
+    };
+
+    if (isNumeric(lhs) && isNumeric(rhs))
+    {
+      return lhs.toLongLong() < rhs.toLongLong();
+    }
+
+    return QString::localeAwareCompare(lhs.toString(), rhs.toString()) < 0;
+  }
+
+ private:
+  QString searchText_;
+  QString phaseKey_;
+};
+
+void repolish(QWidget* widget)
+{
+  if (widget == nullptr)
+  {
+    return;
+  }
+
+  widget->style()->unpolish(widget);
+  widget->style()->polish(widget);
+  widget->update();
+}
+
+QFrame* makeMetricCard(const QString& caption, QLabel* value)
+{
+  auto* card = new QFrame();
+  card->setObjectName(QStringLiteral("MetricCard"));
+
+  auto* layout = new QVBoxLayout(card);
+  layout->setContentsMargins(14, 12, 14, 12);
+  layout->setSpacing(6);
+
+  auto* captionLabel = new QLabel(caption);
+  captionLabel->setObjectName(QStringLiteral("MetricLabel"));
+
+  if (value->objectName().isEmpty())
+  {
+    value->setObjectName(QStringLiteral("MetricValue"));
+  }
+  value->setTextInteractionFlags(Qt::TextSelectableByMouse);
+
+  layout->addWidget(captionLabel);
+  layout->addWidget(value);
+  return card;
+}
+
+void setButtonRole(QPushButton* button, const char* role)
+{
+  button->setProperty("buttonRole", role);
+  button->setCursor(Qt::PointingHandCursor);
+}
+
+}  // namespace
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 {
-  setWindowTitle(QStringLiteral("WPCE \xe6\x89\x93\xe5\x8d\xb0\xe4\xbb\xbb\xe5\x8a\xa1\xe7\x9b\x91\xe6\x8e\xa7")); // WPCE 打印任务监控
-  resize(1100, 680);
+  setWindowTitle(QStringLiteral("WPCE 打印捕获控制台"));
+  resize(1280, 760);
+  setMinimumSize(1040, 640);
 
-  // ── Toolbar ──────────────────────────────────────────────────────────
+  bridge_ = new WatcherBridge(this);
+  tableModel_ = new JobTableModel(this);
+  jobProxy_ = new JobFilterProxyModel(this);
+  jobProxy_->setSourceModel(tableModel_);
 
-  auto* toolbar = new QToolBar(QStringLiteral("\xe5\xb7\xa5\xe5\x85\xb7\xe6\xa0\x8f")); // 工具栏
-  toolbar->setMovable(false);
-  addToolBar(toolbar);
+  auto* central = new QWidget(this);
+  central->setObjectName(QStringLiteral("AppRoot"));
+  auto* root = new QVBoxLayout(central);
+  root->setContentsMargins(20, 18, 20, 16);
+  root->setSpacing(14);
+  setCentralWidget(central);
 
-  startBtn_ = new QPushButton(QStringLiteral("\xe2\x96\xb6 \xe5\xbc\x80\xe5\xa7\x8b\xe7\x9b\x91\xe5\x90\xac")); // ▶ 开始监听
-  startBtn_->setStyleSheet(QStringLiteral("QPushButton { color: #1a8c4a; font-weight: bold; }"));
-  toolbar->addWidget(startBtn_);
+  auto* hero = new QFrame();
+  hero->setObjectName(QStringLiteral("HeroBar"));
+  auto* heroLayout = new QHBoxLayout(hero);
+  heroLayout->setContentsMargins(18, 16, 18, 16);
+  heroLayout->setSpacing(18);
 
-  stopBtn_ = new QPushButton(QStringLiteral("\xe2\x96\xa0 \xe5\x81\x9c\xe6\xad\xa2")); // ■ 停止
-  stopBtn_->setStyleSheet(QStringLiteral("QPushButton { color: #cc2222; font-weight: bold; }"));
-  toolbar->addWidget(stopBtn_);
+  auto* titleBlock = new QVBoxLayout();
+  titleBlock->setContentsMargins(0, 0, 0, 0);
+  titleBlock->setSpacing(4);
 
-  toolbar->addSeparator();
+  auto* title = new QLabel(QStringLiteral("WPCE 打印捕获控制台"));
+  title->setObjectName(QStringLiteral("WindowTitle"));
+  auto* subtitle = new QLabel(QStringLiteral("打印作业、参数与生命周期审计"));
+  subtitle->setObjectName(QStringLiteral("WindowSubtitle"));
+  titleBlock->addWidget(title);
+  titleBlock->addWidget(subtitle);
+  heroLayout->addLayout(titleBlock, 1);
 
-  printerCountLabel_ = new QLabel();
-  toolbar->addWidget(printerCountLabel_);
+  startBtn_ = new QPushButton(QStringLiteral("开始监听"));
+  startBtn_->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
+  setButtonRole(startBtn_, "primary");
 
-  // ── Central area ─────────────────────────────────────────────────────
+  stopBtn_ = new QPushButton(QStringLiteral("停止"));
+  stopBtn_->setIcon(style()->standardIcon(QStyle::SP_MediaStop));
+  setButtonRole(stopBtn_, "danger");
+
+  openOutputBtn_ = new QPushButton(QStringLiteral("打开目录"));
+  openOutputBtn_->setIcon(style()->standardIcon(QStyle::SP_DirOpenIcon));
+  setButtonRole(openOutputBtn_, "quiet");
+
+  heroLayout->addWidget(startBtn_);
+  heroLayout->addWidget(stopBtn_);
+  heroLayout->addWidget(openOutputBtn_);
+  root->addWidget(hero);
+
+  auto* metrics = new QHBoxLayout();
+  metrics->setContentsMargins(0, 0, 0, 0);
+  metrics->setSpacing(12);
+
+  sessionStateLabel_ = new QLabel(QStringLiteral("待启动"));
+  sessionStateLabel_->setObjectName(QStringLiteral("StatusPill"));
+  sessionStateLabel_->setProperty("state", "idle");
+
+  printerCountLabel_ = new QLabel(QStringLiteral("0"));
+  jobCountLabel_ = new QLabel(QStringLiteral("0"));
+
+  outputDirLabel_ = new QLabel(QStringLiteral("尚未创建"));
+  outputDirLabel_->setObjectName(QStringLiteral("PathValue"));
+  outputDirLabel_->setWordWrap(true);
+
+  metrics->addWidget(makeMetricCard(QStringLiteral("监听状态"), sessionStateLabel_), 0);
+  metrics->addWidget(makeMetricCard(QStringLiteral("打印机"), printerCountLabel_), 0);
+  metrics->addWidget(makeMetricCard(QStringLiteral("作业"), jobCountLabel_), 0);
+  metrics->addWidget(makeMetricCard(QStringLiteral("输出目录"), outputDirLabel_), 1);
+  root->addLayout(metrics);
+
+  auto* tablePanel = new QFrame();
+  tablePanel->setObjectName(QStringLiteral("Panel"));
+  auto* tablePanelLayout = new QVBoxLayout(tablePanel);
+  tablePanelLayout->setContentsMargins(16, 14, 16, 16);
+  tablePanelLayout->setSpacing(12);
+
+  auto* tableHeader = new QHBoxLayout();
+  tableHeader->setContentsMargins(0, 0, 0, 0);
+  tableHeader->setSpacing(10);
+
+  auto* tableTitle = new QLabel(QStringLiteral("作业队列"));
+  tableTitle->setObjectName(QStringLiteral("PanelHeader"));
+  resultCountLabel_ = new QLabel(QStringLiteral("显示 0 / 0"));
+  resultCountLabel_->setObjectName(QStringLiteral("MutedText"));
+
+  searchEdit_ = new QLineEdit();
+  searchEdit_->setObjectName(QStringLiteral("SearchBox"));
+  searchEdit_->setPlaceholderText(QStringLiteral("搜索"));
+  searchEdit_->setClearButtonEnabled(true);
+
+  phaseFilter_ = new QComboBox();
+  phaseFilter_->setObjectName(QStringLiteral("PhaseFilter"));
+  phaseFilter_->addItem(QStringLiteral("全部阶段"), QString());
+  phaseFilter_->addItem(QStringLiteral("已接收"), QStringLiteral("accepted"));
+  phaseFilter_->addItem(QStringLiteral("假脱机"), QStringLiteral("spooling"));
+  phaseFilter_->addItem(QStringLiteral("打印中"), QStringLiteral("printing"));
+  phaseFilter_->addItem(QStringLiteral("已完成"), QStringLiteral("completed"));
+  phaseFilter_->addItem(QStringLiteral("失败"), QStringLiteral("failed"));
+  phaseFilter_->addItem(QStringLiteral("已取消"), QStringLiteral("cancelled"));
+  phaseFilter_->addItem(QStringLiteral("停滞"), QStringLiteral("stalled"));
+  phaseFilter_->setSizeAdjustPolicy(QComboBox::AdjustToContents);
+
+  clearFilterBtn_ = new QPushButton(QStringLiteral("重置"));
+  clearFilterBtn_->setIcon(style()->standardIcon(QStyle::SP_DialogResetButton));
+  setButtonRole(clearFilterBtn_, "quiet");
+
+  tableHeader->addWidget(tableTitle);
+  tableHeader->addWidget(resultCountLabel_);
+  tableHeader->addStretch(1);
+  tableHeader->addWidget(searchEdit_);
+  tableHeader->addWidget(phaseFilter_);
+  tableHeader->addWidget(clearFilterBtn_);
+  tablePanelLayout->addLayout(tableHeader);
 
   tableView_ = new QTableView();
+  tableView_->setObjectName(QStringLiteral("JobTable"));
+  tableView_->setModel(jobProxy_);
   tableView_->setSelectionBehavior(QAbstractItemView::SelectRows);
   tableView_->setSelectionMode(QAbstractItemView::SingleSelection);
+  tableView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
   tableView_->setAlternatingRowColors(true);
-  tableView_->setSortingEnabled(false);
-  tableView_->horizontalHeader()->setStretchLastSection(true);
+  tableView_->setSortingEnabled(true);
+  tableView_->setShowGrid(false);
+  tableView_->setWordWrap(false);
+  tableView_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
   tableView_->verticalHeader()->hide();
+  tableView_->verticalHeader()->setDefaultSectionSize(42);
+  tableView_->horizontalHeader()->setHighlightSections(false);
+  tableView_->horizontalHeader()->setStretchLastSection(false);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColJobId, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColDocument, QHeaderView::Stretch);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColUser, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColPhase, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColProgress, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColTotalPages, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColCopies, QHeaderView::ResizeToContents);
+  tableView_->horizontalHeader()->setSectionResizeMode(JobTableModel::ColSubmitTime, QHeaderView::ResizeToContents);
+  tableView_->sortByColumn(JobTableModel::ColSubmitTime, Qt::DescendingOrder);
 
-  tableModel_ = new JobTableModel(this);
-  tableView_->setModel(tableModel_);
+  emptyStateLabel_ = new QLabel(QStringLiteral("暂无打印作业"));
+  emptyStateLabel_->setObjectName(QStringLiteral("EmptyState"));
+  emptyStateLabel_->setAlignment(Qt::AlignCenter);
+
+  tableStack_ = new QStackedWidget();
+  tableStack_->addWidget(emptyStateLabel_);
+  tableStack_->addWidget(tableView_);
+  tablePanelLayout->addWidget(tableStack_, 1);
 
   detailPanel_ = new JobDetailPanel();
   timeline_ = new LifecycleTimeline();
 
-  auto* rightWidget = new QWidget();
-  auto* rightLayout = new QVBoxLayout(rightWidget);
-  rightLayout->setContentsMargins(0, 0, 0, 0);
-  rightLayout->addWidget(detailPanel_, 1);
-  rightLayout->addWidget(timeline_, 1);
+  auto* sidePane = new QWidget();
+  sidePane->setObjectName(QStringLiteral("SidePane"));
+  auto* sideLayout = new QVBoxLayout(sidePane);
+  sideLayout->setContentsMargins(0, 0, 0, 0);
+  sideLayout->setSpacing(12);
+  sideLayout->addWidget(detailPanel_, 3);
+  sideLayout->addWidget(timeline_, 2);
 
   auto* splitter = new QSplitter(Qt::Horizontal);
-  splitter->addWidget(tableView_);
-  splitter->addWidget(rightWidget);
+  splitter->setObjectName(QStringLiteral("WorkspaceSplitter"));
+  splitter->setChildrenCollapsible(false);
+  splitter->addWidget(tablePanel);
+  splitter->addWidget(sidePane);
   splitter->setStretchFactor(0, 3);
   splitter->setStretchFactor(1, 2);
+  splitter->setSizes(QList<int>{760, 420});
+  root->addWidget(splitter, 1);
 
-  setCentralWidget(splitter);
-
-  // ── Status bar ───────────────────────────────────────────────────────
-
-  statusBar()->showMessage(QStringLiteral("\xe5\xb0\xb1\xe7\xbb\xaa")); // 就绪
-
-  // ── Bridge ───────────────────────────────────────────────────────────
-
-  bridge_ = new WatcherBridge(this);
-
-  // ── Connections ──────────────────────────────────────────────────────
+  statusBar()->showMessage(QStringLiteral("就绪"));
 
   connect(startBtn_, &QPushButton::clicked, this, &MainWindow::onStartClicked);
   connect(stopBtn_, &QPushButton::clicked, this, &MainWindow::onStopClicked);
+  connect(openOutputBtn_, &QPushButton::clicked, this, &MainWindow::onOpenOutputClicked);
+  connect(clearFilterBtn_, &QPushButton::clicked, this,
+          [this]()
+          {
+            searchEdit_->clear();
+            phaseFilter_->setCurrentIndex(0);
+          });
+
+  connect(searchEdit_, &QLineEdit::textChanged, this,
+          [this](const QString& text)
+          {
+            static_cast<JobFilterProxyModel*>(jobProxy_)->setSearchText(text);
+            refreshEmptyState();
+            selectFirstVisibleRow();
+          });
+  connect(phaseFilter_, QOverload<int>::of(&QComboBox::currentIndexChanged),
+          this,
+          [this](int)
+          {
+            static_cast<JobFilterProxyModel*>(jobProxy_)
+              ->setPhaseKey(phaseFilter_->currentData().toString());
+            refreshEmptyState();
+            selectFirstVisibleRow();
+          });
 
   connect(tableView_->selectionModel(), &QItemSelectionModel::currentRowChanged,
           this, &MainWindow::onTableSelectionChanged);
+
+  connect(tableModel_, &QAbstractItemModel::dataChanged, this,
+          [this](const QModelIndex&, const QModelIndex&, const QList<int>&)
+          {
+            refreshSelectedJob();
+            refreshSummaryCards();
+            refreshEmptyState();
+          });
+  connect(tableModel_, &QAbstractItemModel::rowsInserted, this,
+          [this](const QModelIndex&, int, int)
+          {
+            refreshSummaryCards();
+            refreshEmptyState();
+            QTimer::singleShot(0, this, &MainWindow::selectFirstVisibleRow);
+          });
+  connect(tableModel_, &QAbstractItemModel::modelReset, this,
+          [this]()
+          {
+            refreshSummaryCards();
+            refreshEmptyState();
+            refreshSelectedJob();
+          });
+
+  connect(jobProxy_, &QAbstractItemModel::rowsInserted, this,
+          [this](const QModelIndex&, int, int)
+          {
+            refreshEmptyState();
+            selectFirstVisibleRow();
+          });
+  connect(jobProxy_, &QAbstractItemModel::rowsRemoved, this,
+          [this](const QModelIndex&, int, int)
+          {
+            refreshEmptyState();
+            refreshSelectedJob();
+          });
+  connect(jobProxy_, &QAbstractItemModel::modelReset, this,
+          [this]()
+          {
+            refreshEmptyState();
+            refreshSelectedJob();
+          });
+  connect(jobProxy_, &QAbstractItemModel::layoutChanged, this,
+          [this]()
+          {
+            refreshEmptyState();
+          });
 
   connect(bridge_, &WatcherBridge::jobSnapshotReceived,
           tableModel_, &JobTableModel::onJobSnapshot);
   connect(bridge_, &WatcherBridge::jobSnapshotReceived,
           this, &MainWindow::onJobCountChanged);
-
   connect(bridge_, &WatcherBridge::metadataReceived,
           tableModel_, &JobTableModel::onMetadata);
-
   connect(bridge_, &WatcherBridge::lifecycleEventReceived,
           tableModel_, &JobTableModel::onLifecycleEvent);
-
-  connect(bridge_, &WatcherBridge::lifecycleEventReceived,
-          timeline_, &LifecycleTimeline::addEvent);
-
   connect(bridge_, &WatcherBridge::watcherError, this,
           [this](const QString& error)
           {
-            statusBar()->showMessage(
-              QStringLiteral("\xe2\x9a\xa0 %1").arg(error)); // ⚠ error
+            statusBar()->showMessage(QStringLiteral("警告: %1").arg(error), 5000);
+            updateButtonStates();
+            updatePrinterLabel();
           });
-
   connect(bridge_, &WatcherBridge::printerSkipped,
           this, &MainWindow::onPrinterSkipped);
-
-  // ── Auto-start ───────────────────────────────────────────────────────
+  connect(bridge_, &WatcherBridge::sessionFinished, this,
+          [this]()
+          {
+            updateButtonStates();
+            updatePrinterLabel();
+          });
 
   updateButtonStates();
   updatePrinterLabel();
+  refreshSummaryCards();
+  refreshEmptyState();
 
-  // Start after the event loop is running.
   QTimer::singleShot(100, this, &MainWindow::autoStart);
 }
 
@@ -142,29 +457,34 @@ MainWindow::~MainWindow()
   bridge_->stopWatching();
 }
 
-// ── Slots ──────────────────────────────────────────────────────────────
-
 void MainWindow::onStartClicked()
 {
-  observedJobCount_ = 0;
-  timeline_->clear();
+  if (bridge_->isRunning())
+  {
+    return;
+  }
+
+  tableModel_->clear();
   detailPanel_->clear();
+  timeline_->clear();
 
-  // Default output directory: Documents\WPCE\capture-<timestamp>
-  const QString docPath = QStandardPaths::writableLocation(
-    QStandardPaths::DocumentsLocation);
-  const QString ts = QDateTime::currentDateTime().toString(
-    QStringLiteral("yyyyMMdd-HHmmss"));
-  const QString outputDir = QStringLiteral("%1/WPCE/%2")
-    .arg(docPath, ts);
+  const QString documentsPath =
+    QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation);
+  const QString timestamp =
+    QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
+  lastOutputDir_ =
+    QDir(documentsPath).filePath(QStringLiteral("WPCE/capture-%1").arg(timestamp));
 
-  bridge_->startWatching(outputDir);
+  outputDirLabel_->setText(QDir::toNativeSeparators(lastOutputDir_));
+  outputDirLabel_->setToolTip(QDir::toNativeSeparators(lastOutputDir_));
+
+  bridge_->startWatching(lastOutputDir_);
   updateButtonStates();
   updatePrinterLabel();
+  refreshSummaryCards();
 
   statusBar()->showMessage(
-    QStringLiteral("\xe7\x9b\x91\xe5\x90\xac\xe4\xb8\xad\xe2\x80\xa6 \xe2\x86\x92 %1") // 监听中… → …
-    .arg(outputDir));
+    QStringLiteral("监听中 -> %1").arg(QDir::toNativeSeparators(lastOutputDir_)));
 }
 
 void MainWindow::onStopClicked()
@@ -172,47 +492,41 @@ void MainWindow::onStopClicked()
   bridge_->stopWatching();
   updateButtonStates();
   updatePrinterLabel();
-  statusBar()->showMessage(QStringLiteral("\xe5\xb7\xb2\xe5\x81\x9c\xe6\xad\xa2")); // 已停止
+  statusBar()->showMessage(QStringLiteral("已停止"));
+}
+
+void MainWindow::onOpenOutputClicked()
+{
+  if (lastOutputDir_.isEmpty())
+  {
+    return;
+  }
+
+  QDesktopServices::openUrl(QUrl::fromLocalFile(lastOutputDir_));
 }
 
 void MainWindow::onTableSelectionChanged()
 {
-  const QModelIndex& idx = tableView_->currentIndex();
-  if (!idx.isValid())
-  {
-    detailPanel_->clear();
-    timeline_->clear();
-    return;
-  }
-
-  const int row = idx.row();
-  const JobRowData* rowData = tableModel_->jobAtRow(row);
-  if (rowData == nullptr)
-  {
-    detailPanel_->clear();
-    timeline_->clear();
-    return;
-  }
-
-  detailPanel_->showJob(rowData->job, rowData->metadata);
+  refreshSelectedJob();
 }
 
 void MainWindow::onPrinterSkipped(const QString& printerName)
 {
-  statusBar()->showMessage(
-    QStringLiteral("\xe8\xb7\xb3\xe8\xbf\x87: %1").arg(printerName), // 跳过: ...
-    3000);
+  statusBar()->showMessage(QStringLiteral("已跳过打印机: %1").arg(printerName),
+                           3000);
 }
 
 void MainWindow::onJobCountChanged()
 {
-  ++observedJobCount_;
-  statusBar()->showMessage(
-    QStringLiteral("\xe5\xb7\xb2\xe8\xa7\x82\xe5\xaf\x9f %1 \xe4\xb8\xaa\xe4\xbb\xbb\xe5\x8a\xa1") // 已观察 N 个任务
-    .arg(observedJobCount_));
+  QTimer::singleShot(0, this,
+                     [this]()
+                     {
+                       refreshSummaryCards();
+                       statusBar()->showMessage(
+                         QStringLiteral("已同步 %1 个打印任务")
+                           .arg(tableModel_->rowCount()));
+                     });
 }
-
-// ── Helpers ─────────────────────────────────────────────────────────────
 
 void MainWindow::autoStart()
 {
@@ -224,21 +538,92 @@ void MainWindow::updateButtonStates()
   const bool running = bridge_->isRunning();
   startBtn_->setEnabled(!running);
   stopBtn_->setEnabled(running);
+  openOutputBtn_->setEnabled(!lastOutputDir_.isEmpty());
 }
 
 void MainWindow::updatePrinterLabel()
 {
-  if (!bridge_->isRunning())
+  const bool running = bridge_->isRunning();
+  sessionStateLabel_->setText(running ? QStringLiteral("运行中")
+                                      : QStringLiteral("待启动"));
+  sessionStateLabel_->setProperty("state", running ? "running" : "idle");
+  repolish(sessionStateLabel_);
+
+  const int printerCount = running ? bridge_->watchedPrinters().size() : 0;
+  printerCountLabel_->setText(QString::number(printerCount));
+}
+
+void MainWindow::refreshSummaryCards()
+{
+  const int total = tableModel_->rowCount();
+  const int visible = jobProxy_->rowCount();
+
+  jobCountLabel_->setText(QString::number(total));
+  resultCountLabel_->setText(QStringLiteral("显示 %1 / %2").arg(visible).arg(total));
+
+  const bool filtersActive =
+    !searchEdit_->text().trimmed().isEmpty() || phaseFilter_->currentIndex() != 0;
+  clearFilterBtn_->setEnabled(filtersActive);
+}
+
+void MainWindow::refreshEmptyState()
+{
+  refreshSummaryCards();
+
+  const bool hasVisibleRows = jobProxy_->rowCount() > 0;
+  tableStack_->setCurrentWidget(hasVisibleRows ? static_cast<QWidget*>(tableView_)
+                                               : static_cast<QWidget*>(emptyStateLabel_));
+
+  if (hasVisibleRows)
   {
-    printerCountLabel_->setText(
-      QStringLiteral("\xe6\x9c\xaa\xe5\xbc\x80\xe5\xa7\x8b")); // 未开始
     return;
   }
 
-  const QStringList printers = bridge_->watchedPrinters();
-  printerCountLabel_->setText(
-    QStringLiteral("\xe6\xad\xa3\xe5\x9c\xa8\xe7\x9b\x91\xe5\x90\xac %1 \xe5\x8f\xb0\xe6\x89\x93\xe5\x8d\xb0\xe6\x9c\xba") // 正在监听 N 台打印机
-    .arg(printers.size()));
+  emptyStateLabel_->setText(tableModel_->rowCount() == 0
+                              ? QStringLiteral("暂无打印作业")
+                              : QStringLiteral("没有匹配的作业"));
+}
+
+void MainWindow::refreshSelectedJob()
+{
+  const QModelIndex proxyIndex = tableView_->currentIndex();
+  if (!proxyIndex.isValid())
+  {
+    detailPanel_->clear();
+    timeline_->clear();
+    return;
+  }
+
+  const QModelIndex sourceIndex = jobProxy_->mapToSource(proxyIndex);
+  if (!sourceIndex.isValid())
+  {
+    detailPanel_->clear();
+    timeline_->clear();
+    return;
+  }
+
+  const auto rowData = tableModel_->jobAtRow(sourceIndex.row());
+  if (!rowData.has_value())
+  {
+    detailPanel_->clear();
+    timeline_->clear();
+    return;
+  }
+
+  detailPanel_->showJob(rowData->job, rowData->metadata);
+  timeline_->loadEvents(rowData->lifecycleEvents);
+}
+
+void MainWindow::selectFirstVisibleRow()
+{
+  if (tableView_->currentIndex().isValid() || jobProxy_->rowCount() == 0)
+  {
+    return;
+  }
+
+  const QModelIndex index = jobProxy_->index(0, 0);
+  tableView_->selectionModel()->setCurrentIndex(
+    index, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
 }
 
 }  // namespace wpce::ui

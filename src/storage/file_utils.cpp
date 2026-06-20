@@ -4,6 +4,7 @@
 #include <windows.h>
 #endif
 
+#include <chrono>
 #include <fstream>
 #include <sstream>
 #include <stdexcept>
@@ -29,13 +30,31 @@ std::filesystem::path make_temp_path(const std::filesystem::path& final_path)
 void replace_file(const std::filesystem::path& temp_path, const std::filesystem::path& final_path)
 {
 #ifdef _WIN32
-  if (!MoveFileExW(
-        temp_path.wstring().c_str(),
-        final_path.wstring().c_str(),
-        MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+  constexpr int kMaxAttempts = 8;
+  DWORD last_error = ERROR_SUCCESS;
+
+  for (int attempt = 0; attempt < kMaxAttempts; ++attempt)
   {
-    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "MoveFileExW");
+    if (MoveFileExW(
+          temp_path.wstring().c_str(),
+          final_path.wstring().c_str(),
+          MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH))
+    {
+      return;
+    }
+
+    last_error = GetLastError();
+    if (last_error != ERROR_ACCESS_DENIED &&
+        last_error != ERROR_SHARING_VIOLATION &&
+        last_error != ERROR_LOCK_VIOLATION)
+    {
+      break;
+    }
+
+    std::this_thread::sleep_for(std::chrono::milliseconds(10 * (attempt + 1)));
   }
+
+  throw std::system_error(static_cast<int>(last_error), std::system_category(), "MoveFileExW");
 #else
   std::filesystem::rename(temp_path, final_path);
 #endif

@@ -18,3 +18,26 @@ if(MSVC)
 else()
   target_compile_options(wpce_stress_test PRIVATE -Wall -Wextra -Wpedantic)
 endif()
+
+# ── Virtual Print Simulator ──────────────────────────────────────────
+
+add_executable(wpce_sim simulator.cpp)
+
+target_link_libraries(wpce_sim PRIVATE wpce_core Winspool.lib)
+
+target_include_directories(wpce_sim PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_BINARY_DIR}/generated
+)
+
+target_compile_features(wpce_sim PRIVATE cxx_std_20)
+
+if(WIN32)
+  target_compile_definitions(wpce_sim PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+endif()
+
+if(MSVC)
+  target_compile_options(wpce_sim PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
+else()
+  target_compile_options(wpce_sim PRIVATE -Wall -Wextra -Wpedantic)
+endif()

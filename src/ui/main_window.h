@@ -8,6 +8,11 @@
 #include <QTableView>
 #include <QTimer>
 
+class QComboBox;
+class QLineEdit;
+class QSortFilterProxyModel;
+class QStackedWidget;
+
 namespace wpce::ui
 {
 
@@ -16,13 +21,6 @@ class JobTableModel;
 class JobDetailPanel;
 class LifecycleTimeline;
 
-/// Main application window for the WPCE Print Job Monitor.
-///
-/// Watches ALL local printers by default.  Layout:
-///   [Toolbar: ▶ Start | ■ Stop | watched printer count]
-///   [Job Table .................] [Detail Panel]
-///                                [Timeline  ]
-///   [Status Bar                          ]
 class MainWindow : public QMainWindow
 {
   Q_OBJECT
@@ -34,6 +32,7 @@ class MainWindow : public QMainWindow
  private slots:
   void onStartClicked();
   void onStopClicked();
+  void onOpenOutputClicked();
   void onTableSelectionChanged();
   void onPrinterSkipped(const QString& printerName);
   void onJobCountChanged();
@@ -42,23 +41,36 @@ class MainWindow : public QMainWindow
   void autoStart();
   void updateButtonStates();
   void updatePrinterLabel();
+  void refreshSummaryCards();
+  void refreshEmptyState();
+  void refreshSelectedJob();
+  void selectFirstVisibleRow();
 
-  // ── Bridge ───────────────────────────────────────────────────────────
   WatcherBridge* bridge_ = nullptr;
 
-  // ── Toolbar widgets ──────────────────────────────────────────────────
+  QLabel* sessionStateLabel_ = nullptr;
   QLabel* printerCountLabel_ = nullptr;
+  QLabel* jobCountLabel_ = nullptr;
+  QLabel* outputDirLabel_ = nullptr;
+  QLabel* resultCountLabel_ = nullptr;
+  QLabel* emptyStateLabel_ = nullptr;
+
   QPushButton* startBtn_ = nullptr;
   QPushButton* stopBtn_ = nullptr;
+  QPushButton* openOutputBtn_ = nullptr;
+  QPushButton* clearFilterBtn_ = nullptr;
 
-  // ── Central area ─────────────────────────────────────────────────────
+  QLineEdit* searchEdit_ = nullptr;
+  QComboBox* phaseFilter_ = nullptr;
+
   QTableView* tableView_ = nullptr;
+  QStackedWidget* tableStack_ = nullptr;
   JobTableModel* tableModel_ = nullptr;
+  QSortFilterProxyModel* jobProxy_ = nullptr;
   JobDetailPanel* detailPanel_ = nullptr;
   LifecycleTimeline* timeline_ = nullptr;
 
-  // ── Statistics ───────────────────────────────────────────────────────
-  int observedJobCount_ = 0;
+  QString lastOutputDir_;
 };
 
 }  // namespace wpce::ui

@@ -555,6 +555,13 @@ core::JobLifecycleEvent make_lifecycle_event(std::uint32_t job_id,
   return event;
 }
 
+bool is_active_phase(const core::JobLifecyclePhase phase) noexcept
+{
+  return phase == core::JobLifecyclePhase::Accepted ||
+         phase == core::JobLifecyclePhase::Spooling ||
+         phase == core::JobLifecyclePhase::Printing;
+}
+
 #endif
 
 }  // namespace
@@ -698,18 +705,36 @@ std::vector<JobSnapshotWithMetadata> enumerate_printer_jobs(const std::wstring& 
     throw std::runtime_error(format_win32_error("EnumJobsW", probe_error));
   }
 
-  std::vector<BYTE> buffer(bytes_needed);
-  if (!EnumJobsW(
-        printer.get(),
-        0,
-        kMaxJobsPerSnapshot,
-        2,
-        buffer.data(),
-        static_cast<DWORD>(buffer.size()),
-        &bytes_needed,
-        &jobs_returned))
+  // Add headroom — the spooler may add jobs between probe and fetch during
+  // high-concurrency scenarios (e.g. simulator stress tests).
+  std::vector<BYTE> buffer(bytes_needed + (sizeof(JOB_INFO_2W) * 64));
+  DWORD buffer_size = static_cast<DWORD>(buffer.size());
+
+  for (int attempt = 0; attempt < 2; ++attempt)
   {
-    throw_last_error("EnumJobsW");
+    if (EnumJobsW(
+          printer.get(),
+          0,
+          kMaxJobsPerSnapshot,
+          2,
+          buffer.data(),
+          buffer_size,
+          &bytes_needed,
+          &jobs_returned))
+    {
+      break;
+    }
+
+    const DWORD err = GetLastError();
+    if (err == ERROR_INSUFFICIENT_BUFFER && attempt == 0)
+    {
+      // Retry once with the new size reported by the failed call.
+      buffer.resize(bytes_needed + (sizeof(JOB_INFO_2W) * 64));
+      buffer_size = static_cast<DWORD>(buffer.size());
+      continue;
+    }
+
+    throw std::runtime_error(format_win32_error("EnumJobsW", err));
   }
 
   const auto* jobs = reinterpret_cast<const JOB_INFO_2W*>(buffer.data());
@@ -1038,6 +1063,17 @@ void PrintWatcher::run()
     core::JobLifecyclePhase new_phase = core::JobLifecyclePhase::Unknown;
 #endif
 
+    // Some virtual and network-like printers briefly report zero status flags
+    // while the job is still queued. Preserve the last active phase so stall
+    // detection can fire instead of losing the job to an "unknown" terminal-ish
+    // state.
+    if (new_phase == core::JobLifecyclePhase::Unknown &&
+        is_active_phase(state.current_phase) &&
+        !state.summary.events.empty())
+    {
+      new_phase = state.current_phase;
+    }
+
     // If the phase hasn't changed (and it's not the first event), suppress duplicate.
     if (new_phase == state.current_phase && !state.summary.events.empty())
     {
@@ -1276,26 +1312,50 @@ void PrintWatcher::tick_stall_detection()
     {
       continue;
     }
+    if (state.current_phase == core::JobLifecyclePhase::Stalled)
+    {
+      continue;
+    }
 
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - state.last_progress_time);
     if (elapsed >= config_.stall_timeout && state.current_phase != core::JobLifecyclePhase::Unknown)
     {
-      // Emit stalled event.
-      if (lifecycle_callback_)
+      const int pages_printed = state.summary.events.empty()
+        ? 0
+        : state.summary.events.back().pages_printed;
+      const int total_pages = state.summary.events.empty()
+        ? -1
+        : state.summary.events.back().total_pages;
+
+      core::JobLifecycleEvent event = make_lifecycle_event(
+        job_id,
+        state.next_sequence,
+        core::JobLifecyclePhase::Stalled,
+        state.summary.last_status,
+        pages_printed,
+        total_pages);
+
+      if (state.last_event_time.time_since_epoch().count() > 0)
       {
-        core::JobLifecycleEvent event = make_lifecycle_event(
-          job_id,
-          state.next_sequence,
-          core::JobLifecyclePhase::Stalled,
-          state.summary.last_status,
-          state.summary.progress_percent >= 0 ? state.summary.progress_percent : 0,
-          -1);
-        lifecycle_callback_(event);
+        event.delta_ms_since_prev = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - state.last_event_time).count();
+      }
+      if (state.phase_entry_time.time_since_epoch().count() > 0)
+      {
+        event.cumulative_phase_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+          now - state.phase_entry_time).count();
       }
 
-      // Mark as stalled so we don't re-emit.
-      state.current_phase = core::JobLifecyclePhase::Stalled;
+      state.summary.events.push_back(event);
       state.summary.final_phase = core::JobLifecyclePhase::Stalled;
+      state.current_phase = core::JobLifecyclePhase::Stalled;
+      state.last_event_time = now;
+      state.next_sequence++;
+
+      if (lifecycle_callback_)
+      {
+        lifecycle_callback_(event);
+      }
     }
   }
 }

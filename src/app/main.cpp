@@ -123,7 +123,7 @@ void print_usage()
             << "  wpce --sample-xml\n"
             << "  wpce --write-sample-job <output-dir>\n"
             << "  wpce --list-jobs <printer-name>\n"
-            << "  wpce --watch-printer <printer-name> [output-dir] [--stall-timeout <seconds>] [--perf-log <file>]\n";
+            << "  wpce --watch-printer <printer-name> [output-dir] [--stall-timeout <seconds>] [--duration <seconds>] [--perf-log <file>]\n";
 }
 
 #ifdef _WIN32
@@ -285,6 +285,7 @@ void print_lifecycle_summary_line(const wpce::core::JobLifecycleSummary& summary
 int watch_printer(const std::string_view printer_name,
                   const std::filesystem::path& output_directory,
                   const std::chrono::seconds stall_timeout,
+                  const std::chrono::seconds duration_limit,
                   const std::string& perf_log_path = {})
 {
   try
@@ -377,12 +378,17 @@ int watch_printer(const std::string_view printer_name,
       std::move(lifecycle_callback));
 
     watcher.start();
+    const auto watch_started_at = std::chrono::steady_clock::now();
 
     std::cout << "=== Watching \"" << printer_name << "\" ===\n";
     std::cout << "Output: " << output_directory << '\n';
     if (stall_timeout.count() > 0)
     {
       std::cout << "Stall timeout: " << stall_timeout.count() << "s\n";
+    }
+    if (duration_limit.count() > 0)
+    {
+      std::cout << "Duration limit: " << duration_limit.count() << "s\n";
     }
     std::cout << "Press Ctrl+C to stop.\n\n";
 
@@ -405,6 +411,12 @@ int watch_printer(const std::string_view printer_name,
 
       // Periodic performance sampling (~ every 5 seconds).
       const auto now = std::chrono::steady_clock::now();
+      if (duration_limit.count() > 0 && now - watch_started_at >= duration_limit)
+      {
+        g_stop_requested = true;
+        break;
+      }
+
       if (perf_log.is_open() && now - last_perf_sample > std::chrono::seconds{5})
       {
         auto& monitor = watcher.perf_monitor();
@@ -426,21 +438,21 @@ int watch_printer(const std::string_view printer_name,
     watcher.stop();
     writer.stop();
 
-    // ── Error reporting ─────────────────────────────────────────────────
+    // ── Collect errors (but continue to write summaries) ────────────────
 
-    const std::string error = watcher.last_error();
-    if (!error.empty())
+    const std::string watcher_error = watcher.last_error();
+    if (!watcher_error.empty())
     {
-      std::cerr << "\n! Print watcher stopped with an error: " << error << '\n';
-      return 2;
+      std::cerr << "\n! Print watcher stopped with an error: " << watcher_error << '\n';
     }
 
     const std::string writer_error = writer.last_error();
     if (!writer_error.empty())
     {
       std::cerr << "! Job snapshot writer stopped with an error: " << writer_error << '\n';
-      return 2;
     }
+
+    const bool had_error = !watcher_error.empty() || !writer_error.empty();
 
     // ── Per-session summary ─────────────────────────────────────────────
 
@@ -465,7 +477,7 @@ int watch_printer(const std::string_view printer_name,
       std::cout << '\n';
     }
 
-    // ── Persist lifecycle summaries ─────────────────────────────────────
+    // ── Persist lifecycle summaries (even on watcher error) ─────────────
 
     if (!summaries.empty())
     {
@@ -485,7 +497,7 @@ int watch_printer(const std::string_view printer_name,
     }
 
     std::cout << "\nQueued " << queued_snapshots << " snapshot(s). Dropped " << dropped_snapshots << ".\n";
-    return 0;
+    return had_error ? 2 : 0;
   }
   catch (const std::exception& error)
   {
@@ -552,6 +564,7 @@ int main(const int argc, char* argv[])
 
     std::filesystem::path output_directory = argc > 3 && argv[3][0] != '-' ? argv[3] : "wpce-output";
     std::chrono::seconds stall_timeout{0};
+    std::chrono::seconds duration_limit{0};
     std::string perf_log_path;
 
     // Parse optional flags.
@@ -562,13 +575,17 @@ int main(const int argc, char* argv[])
       {
         try { stall_timeout = std::chrono::seconds{std::stoll(argv[i + 1])}; } catch (...) {}
       }
+      if (arg == "--duration" && i + 1 < argc)
+      {
+        try { duration_limit = std::chrono::seconds{std::stoll(argv[i + 1])}; } catch (...) {}
+      }
       if (arg == "--perf-log" && i + 1 < argc)
       {
         perf_log_path = argv[i + 1];
       }
     }
 
-    return watch_printer(argv[2], output_directory, stall_timeout, perf_log_path);
+    return watch_printer(argv[2], output_directory, stall_timeout, duration_limit, perf_log_path);
   }
 
   print_usage();

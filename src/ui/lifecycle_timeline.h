@@ -12,7 +12,6 @@
 namespace wpce::ui
 {
 
-/// Timeline widget showing lifecycle events for a selected job.
 class LifecycleTimeline : public QWidget
 {
   Q_OBJECT
@@ -21,17 +20,13 @@ class LifecycleTimeline : public QWidget
   explicit LifecycleTimeline(QWidget* parent = nullptr);
 
  public slots:
-  /// Append a new lifecycle event.  Events are displayed in arrival order.
   void addEvent(const core::JobLifecycleEvent& event);
-
-  /// Load the full event history for a job (from lifecycle summaries).
   void loadEvents(const std::vector<core::JobLifecycleEvent>& events);
-
-  /// Clear the timeline.
   void clear();
 
  private:
-  static QString phaseIcon(core::JobLifecyclePhase phase) noexcept;
+  static QString phaseDisplayName(core::JobLifecyclePhase phase) noexcept;
+  void ensureEventMode();
 
   QLabel* header_ = nullptr;
   QListWidget* list_ = nullptr;

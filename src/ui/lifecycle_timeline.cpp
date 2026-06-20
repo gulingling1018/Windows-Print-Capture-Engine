@@ -1,5 +1,6 @@
 #include "ui/lifecycle_timeline.h"
 
+#include <QAbstractItemView>
 #include <QFont>
 #include <QFrame>
 #include <QVBoxLayout>
@@ -7,76 +8,126 @@
 namespace wpce::ui
 {
 
-QString LifecycleTimeline::phaseIcon(core::JobLifecyclePhase phase) noexcept
+namespace
+{
+
+constexpr int kEmptyMarkerRole = Qt::UserRole + 101;
+
+QString formatDuration(const std::int64_t milliseconds)
+{
+  if (milliseconds <= 0)
+  {
+    return QStringLiteral("0 ms");
+  }
+
+  if (milliseconds < 1000)
+  {
+    return QStringLiteral("%1 ms").arg(milliseconds);
+  }
+
+  const double seconds = static_cast<double>(milliseconds) / 1000.0;
+  return QStringLiteral("%1 s").arg(seconds, 0, 'f', 1);
+}
+
+}  // namespace
+
+QString LifecycleTimeline::phaseDisplayName(const core::JobLifecyclePhase phase) noexcept
 {
   switch (phase)
   {
-    case core::JobLifecyclePhase::Accepted:  return QStringLiteral("\xe2\x9e\xa4");   // ➤
-    case core::JobLifecyclePhase::Spooling:  return QStringLiteral("\xe2\x8f\xb3");   // ⏳
-    case core::JobLifecyclePhase::Printing:  return QStringLiteral("\xf0\x9f\x96\xa8"); // 🖨
-    case core::JobLifecyclePhase::Completed: return QStringLiteral("\xe2\x9c\x93");   // ✓
-    case core::JobLifecyclePhase::Failed:    return QStringLiteral("\xe2\x9c\x97");   // ✗
-    case core::JobLifecyclePhase::Cancelled: return QStringLiteral("\xe2\x9c\x82");   // ✂
-    case core::JobLifecyclePhase::Stalled:   return QStringLiteral("\xe2\x9a\xa0");   // ⚠
-    default:                                 return QStringLiteral("?");
+    case core::JobLifecyclePhase::Accepted:
+      return QStringLiteral("已接收");
+    case core::JobLifecyclePhase::Spooling:
+      return QStringLiteral("假脱机");
+    case core::JobLifecyclePhase::Printing:
+      return QStringLiteral("打印中");
+    case core::JobLifecyclePhase::Completed:
+      return QStringLiteral("已完成");
+    case core::JobLifecyclePhase::Failed:
+      return QStringLiteral("失败");
+    case core::JobLifecyclePhase::Cancelled:
+      return QStringLiteral("已取消");
+    case core::JobLifecyclePhase::Stalled:
+      return QStringLiteral("停滞");
+    case core::JobLifecyclePhase::Unknown:
+    default:
+      return QStringLiteral("未知");
   }
 }
 
 LifecycleTimeline::LifecycleTimeline(QWidget* parent) : QWidget(parent)
 {
-  auto* root = new QVBoxLayout(this);
-  root->setContentsMargins(8, 8, 8, 8);
+  setObjectName(QStringLiteral("TimelinePanel"));
 
-  header_ = new QLabel(QStringLiteral("\xe7\x94\x9f\xe5\x91\xbd\xe5\x91\xa8\xe6\x9c\x9f")); // 生命周期
-  QFont headerFont = header_->font();
-  headerFont.setBold(true);
-  headerFont.setPointSize(headerFont.pointSize() + 2);
-  header_->setFont(headerFont);
+  auto* root = new QVBoxLayout(this);
+  root->setContentsMargins(16, 16, 16, 16);
+  root->setSpacing(12);
+
+  header_ = new QLabel(QStringLiteral("生命周期"));
+  header_->setObjectName(QStringLiteral("PanelHeader"));
   root->addWidget(header_);
 
-  auto* rule = new QFrame();
-  rule->setFrameShape(QFrame::HLine);
-  rule->setFrameShadow(QFrame::Sunken);
-  root->addWidget(rule);
+  auto* divider = new QFrame();
+  divider->setObjectName(QStringLiteral("Divider"));
+  divider->setFrameShape(QFrame::HLine);
+  root->addWidget(divider);
 
   list_ = new QListWidget();
-  list_->setAlternatingRowColors(true);
-  QFont monoFont("Consolas");
-  monoFont.setPointSize(10);
-  list_->setFont(monoFont);
+  list_->setObjectName(QStringLiteral("TimelineList"));
+  list_->setFrameShape(QFrame::NoFrame);
+  list_->setSelectionMode(QAbstractItemView::NoSelection);
+  list_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
+  QFont font(QStringLiteral("Cascadia Mono"));
+  font.setStyleHint(QFont::Monospace);
+  font.setPointSize(10);
+  list_->setFont(font);
   root->addWidget(list_, 1);
+
+  clear();
+}
+
+void LifecycleTimeline::ensureEventMode()
+{
+  if (list_->count() == 1 &&
+      list_->item(0)->data(kEmptyMarkerRole).toBool())
+  {
+    list_->clear();
+  }
 }
 
 void LifecycleTimeline::addEvent(const core::JobLifecycleEvent& event)
 {
-  // If switching to a new job, clear first.
   if (event.job_id != currentJobId_ && currentJobId_ != 0)
   {
     clear();
   }
   currentJobId_ = event.job_id;
+  ensureEventMode();
 
-  const QString icon = phaseIcon(event.phase);
-  const QString phaseStr = QString::fromUtf8(core::to_string(event.phase).data());
-
-  // Extract time portion from timestamp.
-  QString timeStr = QString::fromStdString(event.timestamp_utc);
-  if (timeStr.length() >= 19)
+  QString time = QString::fromStdString(event.timestamp_utc);
+  if (time.length() >= 19)
   {
-    timeStr = timeStr.mid(11, 8);  // "HH:MM:SS"
+    time = time.mid(11, 8);
   }
 
-  QString text = QStringLiteral("%1  %2  %3")
-    .arg(timeStr, icon, phaseStr);
-
-  // Append progress info.
+  QString progress = QStringLiteral("-");
   if (event.total_pages > 0)
   {
     const int pct = (event.pages_printed * 100) / event.total_pages;
-    text += QStringLiteral("  (%1%)").arg(pct);
+    progress = QStringLiteral("%1 / %2  %3%")
+                 .arg(event.pages_printed)
+                 .arg(event.total_pages)
+                 .arg(pct);
   }
 
+  const QString text = QStringLiteral("%1  %2  %3  +%4")
+                         .arg(time,
+                              phaseDisplayName(event.phase),
+                              progress,
+                              formatDuration(event.delta_ms_since_prev));
+
   auto* item = new QListWidgetItem(text);
+  item->setToolTip(QString::fromStdString(event.detail));
   list_->addItem(item);
   list_->scrollToBottom();
 }
@@ -94,6 +145,11 @@ void LifecycleTimeline::clear()
 {
   currentJobId_ = 0;
   list_->clear();
+
+  auto* item = new QListWidgetItem(QStringLiteral("暂无生命周期事件"));
+  item->setData(kEmptyMarkerRole, true);
+  item->setFlags(Qt::NoItemFlags);
+  list_->addItem(item);
 }
 
 }  // namespace wpce::ui

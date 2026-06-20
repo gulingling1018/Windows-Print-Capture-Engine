@@ -103,7 +103,13 @@ void WatcherBridge::startWatching(const QString& outputDir)
     watchedPrinters_.clear();
   }
 
-  if (printers.empty()) return;
+  if (printers.empty())
+  {
+    running_ = false;
+    emit watcherError(QStringLiteral("未发现本地打印机"));
+    emit sessionFinished();
+    return;
+  }
 
   for (const auto& printerName : printers)
   {

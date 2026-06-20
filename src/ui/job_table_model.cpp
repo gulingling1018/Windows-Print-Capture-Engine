@@ -1,8 +1,12 @@
 #include "ui/job_table_model.h"
 
-#include "watcher/print_watcher.h"
+#include <QBrush>
+#include <QColor>
+#include <QFont>
 
-#include <cstdint>
+#include <algorithm>
+#include <climits>
+#include <string_view>
 
 namespace wpce::ui
 {
@@ -10,24 +14,101 @@ namespace wpce::ui
 namespace
 {
 
-QString phaseIcon(core::JobLifecyclePhase phase) noexcept
+QString fromView(const std::string_view value)
+{
+  return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
+}
+
+QString phaseDisplayName(const core::JobLifecyclePhase phase) noexcept
 {
   switch (phase)
   {
-    case core::JobLifecyclePhase::Accepted:  return QStringLiteral("\xe2\x9e\xa4");   // ➤
-    case core::JobLifecyclePhase::Spooling:  return QStringLiteral("\xe2\x8f\xb3");   // ⏳
-    case core::JobLifecyclePhase::Printing:  return QStringLiteral("\xf0\x9f\x96\xa8"); // 🖨
-    case core::JobLifecyclePhase::Completed: return QStringLiteral("\xe2\x9c\x93");   // ✓
-    case core::JobLifecyclePhase::Failed:    return QStringLiteral("\xe2\x9c\x97");   // ✗
-    case core::JobLifecyclePhase::Cancelled: return QStringLiteral("\xe2\x9c\x82");   // ✂
-    case core::JobLifecyclePhase::Stalled:   return QStringLiteral("\xe2\x9a\xa0");   // ⚠
-    default:                                 return QStringLiteral("?");
+    case core::JobLifecyclePhase::Accepted:
+      return QStringLiteral("已接收");
+    case core::JobLifecyclePhase::Spooling:
+      return QStringLiteral("假脱机");
+    case core::JobLifecyclePhase::Printing:
+      return QStringLiteral("打印中");
+    case core::JobLifecyclePhase::Completed:
+      return QStringLiteral("已完成");
+    case core::JobLifecyclePhase::Failed:
+      return QStringLiteral("失败");
+    case core::JobLifecyclePhase::Cancelled:
+      return QStringLiteral("已取消");
+    case core::JobLifecyclePhase::Stalled:
+      return QStringLiteral("停滞");
+    case core::JobLifecyclePhase::Unknown:
+    default:
+      return QStringLiteral("未知");
   }
 }
 
-QString phaseName(core::JobLifecyclePhase phase) noexcept
+QColor phaseColor(const core::JobLifecyclePhase phase) noexcept
 {
-  return QString::fromUtf8(core::to_string(phase).data());
+  switch (phase)
+  {
+    case core::JobLifecyclePhase::Completed:
+      return QColor(0x0f, 0x8a, 0x5f);
+    case core::JobLifecyclePhase::Failed:
+      return QColor(0xd9, 0x2d, 0x20);
+    case core::JobLifecyclePhase::Cancelled:
+      return QColor(0x66, 0x70, 0x85);
+    case core::JobLifecyclePhase::Stalled:
+      return QColor(0xb5, 0x47, 0x08);
+    case core::JobLifecyclePhase::Printing:
+    case core::JobLifecyclePhase::Spooling:
+      return QColor(0x25, 0x63, 0xeb);
+    case core::JobLifecyclePhase::Accepted:
+      return QColor(0x7c, 0x3a, 0xed);
+    case core::JobLifecyclePhase::Unknown:
+    default:
+      return QColor(0x66, 0x70, 0x85);
+  }
+}
+
+int progressPercent(const JobRowData& data) noexcept
+{
+  if (data.totalPages <= 0)
+  {
+    return -1;
+  }
+
+  const int pct = (data.pagesPrinted * 100) / data.totalPages;
+  return std::clamp(pct, 0, 100);
+}
+
+QString reportedValueOrDash(const core::FieldValue& field)
+{
+  if (field.state == core::FieldState::Reported && !field.value.empty())
+  {
+    return QString::fromStdString(field.value);
+  }
+  return QStringLiteral("-");
+}
+
+QVariant sortValueForColumn(const JobRowData& data, const int column)
+{
+  switch (column)
+  {
+    case JobTableModel::ColJobId:
+      return static_cast<qlonglong>(data.job.job_id);
+    case JobTableModel::ColDocument:
+      return QString::fromStdString(data.job.document_name).toCaseFolded();
+    case JobTableModel::ColUser:
+      return QString::fromStdString(data.job.user).toCaseFolded();
+    case JobTableModel::ColPhase:
+      return phaseDisplayName(data.phase);
+    case JobTableModel::ColProgress:
+      return progressPercent(data);
+    case JobTableModel::ColTotalPages:
+      return data.totalPages;
+    case JobTableModel::ColCopies:
+      return reportedValueOrDash(data.metadata.copies);
+    case JobTableModel::ColSubmitTime:
+      return QString::fromStdString(data.job.submit_time_utc);
+    default:
+      return {};
+  }
 }
 
 }  // namespace
@@ -35,26 +116,34 @@ QString phaseName(core::JobLifecyclePhase phase) noexcept
 JobTableModel::JobTableModel(QObject* parent) : QAbstractTableModel(parent)
 {
   flushTimer_ = new QTimer(this);
-  flushTimer_->setInterval(200);
+  flushTimer_->setInterval(160);
   flushTimer_->setSingleShot(true);
   connect(flushTimer_, &QTimer::timeout, this, &JobTableModel::flushPendingUpdates);
 }
 
 int JobTableModel::rowCount(const QModelIndex& parent) const
 {
-  if (parent.isValid()) return 0;
+  if (parent.isValid())
+  {
+    return 0;
+  }
+
+  std::scoped_lock lock(dataMutex_);
   return static_cast<int>(jobOrder_.size());
 }
 
 int JobTableModel::columnCount(const QModelIndex& parent) const
 {
-  if (parent.isValid()) return 0;
+  if (parent.isValid())
+  {
+    return 0;
+  }
   return ColumnCount;
 }
 
-QVariant JobTableModel::data(const QModelIndex& index, int role) const
+QVariant JobTableModel::data(const QModelIndex& index, const int role) const
 {
-  if (!index.isValid() || role != Qt::DisplayRole)
+  if (!index.isValid())
   {
     return {};
   }
@@ -62,74 +151,123 @@ QVariant JobTableModel::data(const QModelIndex& index, int role) const
   const int row = index.row();
   const int col = index.column();
 
+  std::scoped_lock lock(dataMutex_);
   if (row < 0 || row >= jobOrder_.size())
   {
     return {};
   }
 
-  std::scoped_lock lock(dataMutex_);
-
-  const std::uint32_t jobId = jobOrder_.at(row);
-  auto it = jobs_.find(jobId);
+  const auto it = jobs_.find(jobOrder_.at(row));
   if (it == jobs_.end())
   {
     return {};
   }
 
-  const JobRowData& d = it.value();
+  const JobRowData& data = it.value();
+
+  if (role == PhaseKeyRole)
+  {
+    return fromView(core::to_string(data.phase));
+  }
+
+  if (role == ProgressPercentRole)
+  {
+    return progressPercent(data);
+  }
+
+  if (role == SortRole)
+  {
+    return sortValueForColumn(data, col);
+  }
+
+  if (role == Qt::TextAlignmentRole)
+  {
+    switch (col)
+    {
+      case ColJobId:
+      case ColPhase:
+      case ColProgress:
+      case ColTotalPages:
+      case ColCopies:
+        return Qt::AlignCenter;
+      default:
+        return Qt::AlignVCenter;
+    }
+  }
+
+  if (role == Qt::ForegroundRole && col == ColPhase)
+  {
+    return QBrush(phaseColor(data.phase));
+  }
+
+  if (role == Qt::FontRole && (col == ColJobId || col == ColPhase))
+  {
+    QFont font;
+    font.setWeight(QFont::DemiBold);
+    return font;
+  }
+
+  if (role == Qt::ToolTipRole)
+  {
+    return QStringLiteral("Job ID %1\n%2\n%3")
+      .arg(data.job.job_id)
+      .arg(QString::fromStdString(data.job.document_name))
+      .arg(QString::fromStdString(data.job.printer_name));
+  }
+
+  if (role != Qt::DisplayRole && role != Qt::EditRole)
+  {
+    return {};
+  }
 
   switch (col)
   {
     case ColJobId:
-      return d.job.job_id;
+      return data.job.job_id;
 
     case ColDocument:
-      return QString::fromStdString(d.job.document_name);
+      return QString::fromStdString(data.job.document_name);
 
     case ColUser:
-      return QString::fromStdString(d.job.user);
+      return QString::fromStdString(data.job.user);
 
     case ColPhase:
-      return QStringLiteral("%1 %2")
-        .arg(phaseIcon(d.phase), phaseName(d.phase));
+      return phaseDisplayName(data.phase);
 
     case ColProgress:
-      if (d.totalPages > 0)
+    {
+      const int pct = progressPercent(data);
+      if (pct >= 0)
       {
-        const int pct = (d.pagesPrinted * 100) / d.totalPages;
-        return QStringLiteral("%1/%2 (%3%)")
-          .arg(d.pagesPrinted).arg(d.totalPages).arg(pct);
+        return QStringLiteral("%1 / %2  %3%")
+          .arg(data.pagesPrinted)
+          .arg(data.totalPages)
+          .arg(pct);
       }
-      if (d.metadata.pages_printed.state == core::FieldState::Reported)
+      if (data.metadata.pages_printed.state == core::FieldState::Reported)
       {
-        return QString::fromStdString(d.metadata.pages_printed.value);
+        return QString::fromStdString(data.metadata.pages_printed.value);
       }
       return QStringLiteral("-");
+    }
 
     case ColTotalPages:
-      if (d.metadata.total_pages.state == core::FieldState::Reported)
-      {
-        return QString::fromStdString(d.metadata.total_pages.value);
-      }
-      return QStringLiteral("-");
+      return reportedValueOrDash(data.metadata.total_pages);
 
     case ColCopies:
-      if (d.metadata.copies.state == core::FieldState::Reported)
-      {
-        return QString::fromStdString(d.metadata.copies.value);
-      }
-      return QStringLiteral("-");
+      return reportedValueOrDash(data.metadata.copies);
 
     case ColSubmitTime:
-      return QString::fromStdString(d.job.submit_time_utc);
+      return QString::fromStdString(data.job.submit_time_utc);
 
     default:
       return {};
   }
 }
 
-QVariant JobTableModel::headerData(int section, Qt::Orientation orientation,
-                                   int role) const
+QVariant JobTableModel::headerData(const int section,
+                                   const Qt::Orientation orientation,
+                                   const int role) const
 {
   if (orientation != Qt::Horizontal || role != Qt::DisplayRole)
   {
@@ -138,68 +276,109 @@ QVariant JobTableModel::headerData(int section, Qt::Orientation orientation,
 
   switch (section)
   {
-    case ColJobId:       return QStringLiteral("Job ID");
-    case ColDocument:    return QStringLiteral("\xe6\x96\x87\xe6\xa1\xa3");   // 文档
-    case ColUser:        return QStringLiteral("\xe7\x94\xa8\xe6\x88\xb7");   // 用户
-    case ColPhase:       return QStringLiteral("\xe9\x98\xb6\xe6\xae\xb5");   // 阶段
-    case ColProgress:    return QStringLiteral("\xe8\xbf\x9b\xe5\xba\xa6");   // 进度
-    case ColTotalPages:  return QStringLiteral("\xe9\xa1\xb5\xe6\x95\xb0");   // 页数
-    case ColCopies:      return QStringLiteral("\xe4\xbb\xbd\xe6\x95\xb0");   // 份数
-    case ColSubmitTime:  return QStringLiteral("\xe6\x97\xb6\xe9\x97\xb4");   // 时间
-    default:             return {};
+    case ColJobId:
+      return QStringLiteral("Job ID");
+    case ColDocument:
+      return QStringLiteral("文档");
+    case ColUser:
+      return QStringLiteral("用户");
+    case ColPhase:
+      return QStringLiteral("阶段");
+    case ColProgress:
+      return QStringLiteral("进度");
+    case ColTotalPages:
+      return QStringLiteral("页数");
+    case ColCopies:
+      return QStringLiteral("份数");
+    case ColSubmitTime:
+      return QStringLiteral("提交时间");
+    default:
+      return {};
   }
 }
 
-const JobRowData* JobTableModel::jobAtRow(int row) const
+std::optional<JobRowData> JobTableModel::jobAtRow(const int row) const
 {
   std::scoped_lock lock(dataMutex_);
-  if (row < 0 || row >= jobOrder_.size()) return nullptr;
+  if (row < 0 || row >= jobOrder_.size())
+  {
+    return std::nullopt;
+  }
 
-  auto it = jobs_.find(jobOrder_.at(row));
-  if (it == jobs_.end()) return nullptr;
+  const auto it = jobs_.find(jobOrder_.at(row));
+  if (it == jobs_.end())
+  {
+    return std::nullopt;
+  }
 
-  return &it.value();
+  return it.value();
 }
 
-// ── Slot: onJobSnapshot ───────────────────────────────────────────────
+void JobTableModel::clear()
+{
+  flushTimer_->stop();
+
+  beginResetModel();
+  {
+    std::scoped_lock lock(dataMutex_);
+    jobOrder_.clear();
+    jobs_.clear();
+    dirtyRows_.clear();
+  }
+  endResetModel();
+}
 
 void JobTableModel::onJobSnapshot(core::JobSnapshot snapshot)
 {
-  if (snapshot.job_id == 0) return;
+  if (snapshot.job_id == 0)
+  {
+    return;
+  }
+
+  const std::uint32_t jobId = snapshot.job_id;
+  int newRow = -1;
+  bool insertRow = false;
 
   {
     std::scoped_lock lock(dataMutex_);
 
-    auto& row = jobs_[snapshot.job_id];
-    row.job = std::move(snapshot);
-
-    const int modelRow = jobOrder_.indexOf(row.job.job_id);
+    const int modelRow = jobOrder_.indexOf(jobId);
     if (modelRow < 0)
     {
-      // New job — insert at end.
-      const int newRow = static_cast<int>(jobOrder_.size());
-      beginInsertRows(QModelIndex(), newRow, newRow);
-      jobOrder_.append(row.job.job_id);
-      endInsertRows();
+      newRow = static_cast<int>(jobOrder_.size());
+      insertRow = true;
     }
     else
     {
+      jobs_[jobId].job = std::move(snapshot);
       dirtyRows_.insert(modelRow);
     }
   }
 
-  // Schedule a flush.
+  if (insertRow)
+  {
+    beginInsertRows(QModelIndex(), newRow, newRow);
+    {
+      std::scoped_lock lock(dataMutex_);
+      auto& row = jobs_[jobId];
+      row.job = std::move(snapshot);
+      jobOrder_.append(jobId);
+    }
+    endInsertRows();
+  }
+
   if (!flushTimer_->isActive())
   {
     QMetaObject::invokeMethod(flushTimer_, "start", Qt::QueuedConnection);
   }
 }
 
-// ── Slot: onMetadata ──────────────────────────────────────────────────
-
 void JobTableModel::onMetadata(core::MetadataSnapshot metadata)
 {
-  if (metadata.job_id == 0) return;
+  if (metadata.job_id == 0)
+  {
+    return;
+  }
 
   {
     std::scoped_lock lock(dataMutex_);
@@ -207,11 +386,23 @@ void JobTableModel::onMetadata(core::MetadataSnapshot metadata)
     auto& row = jobs_[metadata.job_id];
     row.metadata = std::move(metadata);
 
-    // Update pages from metadata.
-    try { row.totalPages = std::stoi(row.metadata.total_pages.value); }
-    catch (...) { row.totalPages = 0; }
-    try { row.pagesPrinted = std::stoi(row.metadata.pages_printed.value); }
-    catch (...) { row.pagesPrinted = 0; }
+    try
+    {
+      row.totalPages = std::stoi(row.metadata.total_pages.value);
+    }
+    catch (...)
+    {
+      row.totalPages = 0;
+    }
+
+    try
+    {
+      row.pagesPrinted = std::stoi(row.metadata.pages_printed.value);
+    }
+    catch (...)
+    {
+      row.pagesPrinted = 0;
+    }
 
     const int modelRow = jobOrder_.indexOf(row.metadata.job_id);
     if (modelRow >= 0)
@@ -226,26 +417,29 @@ void JobTableModel::onMetadata(core::MetadataSnapshot metadata)
   }
 }
 
-// ── Slot: onLifecycleEvent ────────────────────────────────────────────
-
 void JobTableModel::onLifecycleEvent(core::JobLifecycleEvent event)
 {
-  if (event.job_id == 0) return;
+  if (event.job_id == 0)
+  {
+    return;
+  }
+
+  const std::uint32_t jobId = event.job_id;
 
   {
     std::scoped_lock lock(dataMutex_);
 
-    auto& row = jobs_[event.job_id];
+    auto& row = jobs_[jobId];
     row.phase = event.phase;
 
-    // Pages from lifecycle event may be more up-to-date than metadata.
     if (event.total_pages > 0)
     {
       row.totalPages = event.total_pages;
     }
     row.pagesPrinted = event.pages_printed;
+    row.lifecycleEvents.push_back(std::move(event));
 
-    const int modelRow = jobOrder_.indexOf(event.job_id);
+    const int modelRow = jobOrder_.indexOf(jobId);
     if (modelRow >= 0)
     {
       dirtyRows_.insert(modelRow);
@@ -258,8 +452,6 @@ void JobTableModel::onLifecycleEvent(core::JobLifecycleEvent event)
   }
 }
 
-// ── Flush ─────────────────────────────────────────────────────────────
-
 void JobTableModel::flushPendingUpdates()
 {
   QSet<int> rows;
@@ -268,14 +460,17 @@ void JobTableModel::flushPendingUpdates()
     rows.swap(dirtyRows_);
   }
 
-  if (rows.isEmpty()) return;
+  if (rows.isEmpty())
+  {
+    return;
+  }
 
   int minRow = INT_MAX;
   int maxRow = -1;
-  for (int r : rows)
+  for (const int row : rows)
   {
-    if (r < minRow) minRow = r;
-    if (r > maxRow) maxRow = r;
+    minRow = std::min(minRow, row);
+    maxRow = std::max(maxRow, row);
   }
 
   if (minRow <= maxRow)

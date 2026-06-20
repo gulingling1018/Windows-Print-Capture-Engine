@@ -1,10 +1,12 @@
 #include "ui/job_detail_panel.h"
 
+#include <QColor>
 #include <QFont>
-#include <QFormLayout>
 #include <QFrame>
 #include <QHBoxLayout>
-#include <QScrollArea>
+#include <QSizePolicy>
+
+#include <string_view>
 
 namespace wpce::ui
 {
@@ -12,95 +14,155 @@ namespace wpce::ui
 namespace
 {
 
-QColor stateColor(core::FieldState state)
+QString fromView(const std::string_view value)
+{
+  return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
+}
+
+QString stateKey(const core::FieldState state)
+{
+  return fromView(core::to_string(state));
+}
+
+QString stateLabel(const core::FieldState state)
 {
   switch (state)
   {
-    case core::FieldState::Reported:     return QColor(0x1a, 0x8c, 0x4a);
-    case core::FieldState::NotReported:  return QColor(0x99, 0x99, 0x99);
-    case core::FieldState::Unsupported:  return QColor(0xcc, 0x88, 0x00);
-    case core::FieldState::Unknown:      return QColor(0xcc, 0x66, 0x00);
-    case core::FieldState::Error:        return QColor(0xcc, 0x22, 0x22);
-    default:                             return QColor(0x99, 0x99, 0x99);
+    case core::FieldState::Reported:
+      return QStringLiteral("已报告");
+    case core::FieldState::Unsupported:
+      return QStringLiteral("不支持");
+    case core::FieldState::NotReported:
+      return QStringLiteral("未报告");
+    case core::FieldState::Error:
+      return QStringLiteral("错误");
+    case core::FieldState::Unknown:
+    default:
+      return QStringLiteral("未知");
+  }
+}
+
+QColor stateColor(const core::FieldState state)
+{
+  switch (state)
+  {
+    case core::FieldState::Reported:
+      return QColor(0x0f, 0x8a, 0x5f);
+    case core::FieldState::Unsupported:
+      return QColor(0xb5, 0x47, 0x08);
+    case core::FieldState::NotReported:
+      return QColor(0x66, 0x70, 0x85);
+    case core::FieldState::Unknown:
+      return QColor(0x47, 0x55, 0x67);
+    case core::FieldState::Error:
+      return QColor(0xd9, 0x2d, 0x20);
+    default:
+      return QColor(0x66, 0x70, 0x85);
   }
 }
 
 QLabel* makeSectionHeader(const QString& text)
 {
   auto* label = new QLabel(text);
-  QFont f = label->font();
-  f.setBold(true);
-  f.setPointSize(f.pointSize() + 1);
-  label->setFont(f);
+  label->setObjectName(QStringLiteral("PanelHeader"));
   return label;
-}
-
-QFrame* makeRule()
-{
-  auto* rule = new QFrame();
-  rule->setFrameShape(QFrame::HLine);
-  rule->setFrameShadow(QFrame::Sunken);
-  return rule;
 }
 
 QLabel* makeMonoLabel(const QString& text)
 {
-  auto* label = new QLabel(text);
-  QFont f("Consolas");
-  f.setPointSize(10);
-  label->setFont(f);
+  auto* label = new QLabel(text.isEmpty() ? QStringLiteral("-") : text);
+  QFont font(QStringLiteral("Cascadia Mono"));
+  font.setStyleHint(QFont::Monospace);
+  font.setPointSize(10);
+  label->setFont(font);
+  label->setObjectName(QStringLiteral("MonoValue"));
   label->setWordWrap(true);
   label->setTextInteractionFlags(Qt::TextSelectableByMouse);
+  label->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+  return label;
+}
+
+QLabel* makeNameLabel(const QString& text)
+{
+  auto* label = new QLabel(text);
+  label->setObjectName(QStringLiteral("FieldName"));
+  label->setMinimumWidth(82);
   return label;
 }
 
 QLabel* makeStateBadge(const core::FieldState state)
 {
-  auto* label = new QLabel(QString::fromUtf8(core::to_string(state).data()));
-  QFont f = label->font();
-  f.setPointSize(f.pointSize() - 1);
-  label->setFont(f);
-  const QColor c = stateColor(state);
-  label->setStyleSheet(QStringLiteral("color: %1;").arg(c.name()));
+  auto* label = new QLabel(stateLabel(state));
+  label->setObjectName(QStringLiteral("StateBadge"));
+  label->setProperty("state", stateKey(state));
+  label->setAlignment(Qt::AlignCenter);
+  label->setMinimumWidth(74);
   return label;
+}
+
+QFrame* makeDivider()
+{
+  auto* divider = new QFrame();
+  divider->setObjectName(QStringLiteral("Divider"));
+  divider->setFrameShape(QFrame::HLine);
+  return divider;
+}
+
+QLabel* makeEmptyHint(const QString& text)
+{
+  auto* label = new QLabel(text);
+  label->setObjectName(QStringLiteral("EmptyHint"));
+  label->setAlignment(Qt::AlignLeft | Qt::AlignVCenter);
+  label->setWordWrap(true);
+  return label;
+}
+
+QFrame* makePlainRow(const QString& name, const QString& value)
+{
+  auto* rowFrame = new QFrame();
+  rowFrame->setObjectName(QStringLiteral("FieldRow"));
+
+  auto* row = new QHBoxLayout(rowFrame);
+  row->setContentsMargins(10, 7, 10, 7);
+  row->setSpacing(10);
+
+  row->addWidget(makeNameLabel(name));
+  row->addWidget(makeMonoLabel(value), 1);
+  return rowFrame;
 }
 
 }  // namespace
 
-// ── JobDetailPanel ─────────────────────────────────────────────────────
-
 JobDetailPanel::JobDetailPanel(QWidget* parent) : QWidget(parent)
 {
+  setObjectName(QStringLiteral("DetailPanel"));
+
   root_ = new QVBoxLayout(this);
-  root_->setContentsMargins(8, 8, 8, 8);
+  root_->setContentsMargins(16, 16, 16, 16);
+  root_->setSpacing(12);
 
-  // ── Job info section ─────────────────────────────────────────────────
-
-  jobHeader_ = makeSectionHeader(
-    QStringLiteral("\xe4\xbb\xbb\xe5\x8a\xa1\xe4\xbf\xa1\xe6\x81\xaf")); // 任务信息
+  jobHeader_ = makeSectionHeader(QStringLiteral("作业详情"));
   root_->addWidget(jobHeader_);
-  root_->addWidget(makeRule());
+  root_->addWidget(makeDivider());
 
   jobInfoLayout_ = new QVBoxLayout();
-  jobInfoLayout_->setContentsMargins(4, 4, 4, 4);
+  jobInfoLayout_->setContentsMargins(0, 0, 0, 0);
+  jobInfoLayout_->setSpacing(8);
   root_->addLayout(jobInfoLayout_);
 
-  // ── Spacer ────────────────────────────────────────────────────────────
+  root_->addSpacing(6);
 
-  root_->addSpacing(12);
-
-  // ── Metadata section ──────────────────────────────────────────────────
-
-  metaHeader_ = makeSectionHeader(
-    QStringLiteral("\xe6\x89\x93\xe5\x8d\xb0\xe5\x8f\x82\xe6\x95\xb0")); // 打印参数
+  metaHeader_ = makeSectionHeader(QStringLiteral("打印参数"));
   root_->addWidget(metaHeader_);
-  root_->addWidget(makeRule());
+  root_->addWidget(makeDivider());
 
   metaLayout_ = new QVBoxLayout();
-  metaLayout_->setContentsMargins(4, 4, 4, 4);
+  metaLayout_->setContentsMargins(0, 0, 0, 0);
+  metaLayout_->setSpacing(8);
   root_->addLayout(metaLayout_);
 
   root_->addStretch();
+  clear();
 }
 
 void JobDetailPanel::showJob(const core::JobSnapshot& job,
@@ -114,98 +176,62 @@ void JobDetailPanel::clear()
 {
   clearLayout(jobInfoLayout_);
   clearLayout(metaLayout_);
-}
 
-// ── Job info ──────────────────────────────────────────────────────────
+  jobInfoLayout_->addWidget(makeEmptyHint(QStringLiteral("暂无选中作业")));
+  metaLayout_->addWidget(makeEmptyHint(QStringLiteral("等待打印参数")));
+}
 
 void JobDetailPanel::rebuildJobInfo(const core::JobSnapshot& job)
 {
   clearLayout(jobInfoLayout_);
 
-  // Use a form-like pair of mono labels.
-  auto add = [&](const QString& label, const QString& value)
-  {
-    auto* row = new QHBoxLayout();
-    row->setContentsMargins(2, 1, 2, 1);
-
-    auto* nameLabel = new QLabel(label);
-    QFont f = nameLabel->font();
-    f.setPointSize(f.pointSize() - 1);
-    nameLabel->setFont(f);
-    nameLabel->setStyleSheet(QStringLiteral("color: #666;"));
-    nameLabel->setMinimumWidth(70);
-
-    auto* valLabel = makeMonoLabel(value);
-
-    row->addWidget(nameLabel);
-    row->addWidget(valLabel, 1);
-    jobInfoLayout_->addLayout(row);
-  };
-
-  add(QStringLiteral("Job ID"),     QString::number(job.job_id));
-  add(QStringLiteral("\xe6\x96\x87\xe6\xa1\xa3"),        // 文档
-      QString::fromStdString(job.document_name));
-  add(QStringLiteral("\xe7\x94\xa8\xe6\x88\xb7"),        // 用户
-      QString::fromStdString(job.user));
-  add(QStringLiteral("\xe6\x89\x93\xe5\x8d\xb0\xe6\x9c\xba"),  // 打印机
-      QString::fromStdString(job.printer_name));
-  add(QStringLiteral("\xe6\x8f\x90\xe4\xba\xa4"),        // 提交
-      QString::fromStdString(job.submit_time_utc));
-  add(QStringLiteral("\xe7\x8a\xb6\xe6\x80\x81"),        // 状态
-      QString::fromStdString(job.status));
+  jobInfoLayout_->addWidget(makePlainRow(QStringLiteral("Job ID"),
+                                         QString::number(job.job_id)));
+  jobInfoLayout_->addWidget(makePlainRow(QStringLiteral("文档"),
+                                         QString::fromStdString(job.document_name)));
+  jobInfoLayout_->addWidget(makePlainRow(QStringLiteral("用户"),
+                                         QString::fromStdString(job.user)));
+  jobInfoLayout_->addWidget(makePlainRow(QStringLiteral("打印机"),
+                                         QString::fromStdString(job.printer_name)));
+  jobInfoLayout_->addWidget(makePlainRow(QStringLiteral("提交"),
+                                         QString::fromStdString(job.submit_time_utc)));
+  jobInfoLayout_->addWidget(makePlainRow(QStringLiteral("状态"),
+                                         QString::fromStdString(job.status)));
 }
-
-// ── Metadata ──────────────────────────────────────────────────────────
 
 void JobDetailPanel::rebuildMetadata(const core::MetadataSnapshot& metadata)
 {
   clearLayout(metaLayout_);
 
-  addFieldRow(QStringLiteral("\xe6\x80\xbb\xe9\xa1\xb5\xe6\x95\xb0"), metadata.total_pages);    // 总页数
-  addFieldRow(QStringLiteral("\xe5\xb7\xb2\xe6\x89\x93\xe5\x8d\xb0"), metadata.pages_printed); // 已打印
-  addFieldRow(QStringLiteral("\xe4\xbb\xbd\xe6\x95\xb0"),     metadata.copies);               // 份数
-  addFieldRow(QStringLiteral("\xe5\x8f\x8c\xe9\x9d\xa2"),     metadata.duplex);               // 双面
-  addFieldRow(QStringLiteral("\xe9\xa2\x9c\xe8\x89\xb2"),     metadata.color);                // 颜色
-  addFieldRow(QStringLiteral("\xe7\xba\xb8\xe5\xbc\xa0"),     metadata.paper_size);            // 纸张
-  addFieldRow(QStringLiteral("\xe6\x96\xb9\xe5\x90\x91"),     metadata.orientation);           // 方向
-  addFieldRow(QStringLiteral("N-up"),        metadata.n_up);
-  addFieldRow(QStringLiteral("\xe9\x80\x90\xe4\xbb\xbd"),     metadata.collate);               // 逐份
-  addFieldRow(QStringLiteral("\xe6\x89\x93\xe5\x8d\xb0\xe8\xb4\xa8\xe9\x87\x8f"), metadata.print_quality); // 打印质量
+  addFieldRow(QStringLiteral("总页数"), metadata.total_pages);
+  addFieldRow(QStringLiteral("已打印"), metadata.pages_printed);
+  addFieldRow(QStringLiteral("份数"), metadata.copies);
+  addFieldRow(QStringLiteral("双面"), metadata.duplex);
+  addFieldRow(QStringLiteral("颜色"), metadata.color);
+  addFieldRow(QStringLiteral("纸张"), metadata.paper_size);
+  addFieldRow(QStringLiteral("方向"), metadata.orientation);
+  addFieldRow(QStringLiteral("N-up"), metadata.n_up);
+  addFieldRow(QStringLiteral("逐份"), metadata.collate);
+  addFieldRow(QStringLiteral("质量"), metadata.print_quality);
 
-  // dm_fields is a plain diagnostic string, not a FieldValue.
   if (!metadata.dm_fields_hex.empty())
   {
-    auto* row = new QHBoxLayout();
-    row->setContentsMargins(2, 1, 2, 1);
-
-    auto* nameLabel = new QLabel(QStringLiteral("dm_fields"));
-    QFont f = nameLabel->font();
-    f.setPointSize(f.pointSize() - 1);
-    nameLabel->setFont(f);
-    nameLabel->setStyleSheet(QStringLiteral("color: #666;"));
-    nameLabel->setMinimumWidth(70);
-
-    auto* valLabel = makeMonoLabel(
-      QString::fromStdString(metadata.dm_fields_hex));
-    valLabel->setStyleSheet(
-      QStringLiteral("color: %1;").arg(stateColor(core::FieldState::Reported).name()));
-
-    row->addWidget(nameLabel);
-    row->addWidget(valLabel, 1);
-    metaLayout_->addLayout(row);
+    auto* rowFrame = makePlainRow(QStringLiteral("dm_fields"),
+                                  QString::fromStdString(metadata.dm_fields_hex));
+    metaLayout_->addWidget(rowFrame);
   }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
 void JobDetailPanel::clearLayout(QLayout* layout)
 {
-  if (layout == nullptr) return;
+  if (layout == nullptr)
+  {
+    return;
+  }
 
-  QLayoutItem* item;
+  QLayoutItem* item = nullptr;
   while ((item = layout->takeAt(0)) != nullptr)
   {
-    // Recursively clear child layouts.
     if (auto* childLayout = item->layout())
     {
       clearLayout(childLayout);
@@ -221,30 +247,24 @@ void JobDetailPanel::clearLayout(QLayout* layout)
 }
 
 void JobDetailPanel::addFieldRow(const QString& label,
-                                 const core::FieldValue& fv)
+                                 const core::FieldValue& value)
 {
-  auto* row = new QHBoxLayout();
-  row->setContentsMargins(2, 1, 2, 1);
+  auto* rowFrame = new QFrame();
+  rowFrame->setObjectName(QStringLiteral("FieldRow"));
 
-  auto* nameLabel = new QLabel(label);
-  QFont f = nameLabel->font();
-  f.setPointSize(f.pointSize() - 1);
-  nameLabel->setFont(f);
-  nameLabel->setStyleSheet(QStringLiteral("color: #666;"));
-  nameLabel->setMinimumWidth(70);
+  auto* row = new QHBoxLayout(rowFrame);
+  row->setContentsMargins(10, 7, 10, 7);
+  row->setSpacing(10);
 
-  const QColor color = stateColor(fv.state);
+  auto* valueLabel = makeMonoLabel(QString::fromStdString(value.value));
+  valueLabel->setStyleSheet(QStringLiteral("color: %1;")
+                              .arg(stateColor(value.state).name()));
 
-  auto* valLabel = makeMonoLabel(QString::fromStdString(fv.value));
-  valLabel->setStyleSheet(QStringLiteral("color: %1;").arg(color.name()));
+  row->addWidget(makeNameLabel(label));
+  row->addWidget(valueLabel, 1);
+  row->addWidget(makeStateBadge(value.state));
 
-  auto* badge = makeStateBadge(fv.state);
-
-  row->addWidget(nameLabel);
-  row->addWidget(valLabel, 1);
-  row->addWidget(badge);
-
-  metaLayout_->addLayout(row);
+  metaLayout_->addWidget(rowFrame);
 }
 
 }  // namespace wpce::ui

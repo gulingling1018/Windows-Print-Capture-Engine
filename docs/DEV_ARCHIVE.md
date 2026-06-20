@@ -1,5 +1,89 @@
 # WPCE Development Archive
 
+## 2026-06-20: Virtual Print Simulator and Reliability Bug Fixes
+
+### Context
+
+- Phase 5 was complete with GoogleTest, PerfMonitor, phase timing, and stress testing.
+- Two reliability issues were identified and fixed during integration testing.
+- User requested a virtual simulation printer for comprehensive end-to-end scenario testing.
+
+### Bug Fixes Discovered During Simulation Testing
+
+**Bug 1: EnumJobsW buffer overflow under high concurrency (Error 122)**
+
+File: `src/watcher/print_watcher.cpp`
+- `enumerate_printer_jobs()` used a single probe+buffer pattern for EnumJobsW.
+- Under high job creation rates, the spooler adds more jobs between the probe and fetch calls, causing `ERROR_INSUFFICIENT_BUFFER` (122).
+- Fix: Added 64×JOB_INFO_2W headroom (∼6KB) to the buffer allocation, plus a one-time retry with expanded buffer when error 122 occurs on the fetch call.
+
+**Bug 2: Lifecycle summaries NOT written on watcher error**
+
+File: `src/app/main.cpp`
+- `watch_printer()` returned early (exit code 2) when `watcher.last_error()` was non-empty, skipping lifecycle summary persistence.
+- Under high-concurrency stress, watcher errors (like the EnumJobsW buffer issue) would cause complete loss of all per-job lifecycle data.
+- Fix: Restructured error handling to capture errors, continue to write lifecycle summaries, and only return the error code at the end.
+
+**Enhancement: MoveFileExW atomic replace retry**
+
+File: `src/storage/file_utils.cpp`
+- `replace_file()` retries `MoveFileExW` up to 8 times with exponential backoff when it hits `ERROR_ACCESS_DENIED`, `ERROR_SHARING_VIOLATION`, or `ERROR_LOCK_VIOLATION`.
+- Prevents writer thread termination under PC load stress or antivirus file scanning.
+
+**Enhancement: Unknown phase preservation for active jobs**
+
+File: `src/watcher/print_watcher.cpp`
+- Virtual/network printers may briefly report zero status flags while the job is still queued.
+- Added `is_active_phase()` heuristic: if `classify_phase()` returns Unknown but the job was in an active phase (Accepted/Spooling/Printing), the old phase is preserved.
+- This allows stall detection to fire on jobs that would otherwise be lost to "unknown".
+
+### Virtual Print Simulator
+
+File: `tools/simulator.cpp`
+- Standalone CLI tool using Win32 Spooler APIs:
+  - `StartDocPrinterW`/`EndDocPrinterW` — creates real spooler jobs
+  - `submit_hanging_job()` — creates jobs without `EndDocPrinter`, keeps them in spooling for stall testing
+  - `SetJobW(JOB_CONTROL_CANCEL)` — cancels jobs
+  - `SetJobW(JOB_CONTROL_PAUSE)` — pauses jobs
+  - `DocumentPropertiesW` — modifies DEVMODE for parameter variety
+- 7 scenarios: normal, fast-disappear, cancel-mid, stall, printer-error, high-concurrency, param-variety
+
+### Integration Test Results
+
+All scenarios validated end-to-end:
+
+| Scenario | Jobs | Expected Phase | Result |
+|---|---|---|---|
+| normal | 5 | completed | ✓ 5/5 captured |
+| fast-disappear | 5 | cancelled/completed | ✓ Detected before disappearing |
+| cancel-mid | 3 | cancelled/completed | ✓ Correct lifecycle |
+| stall | 2 | stalled | ✓ Stalled at 8131ms (timeout=8s) |
+| printer-error | 3 | completed (spooler level) | ✓ All detected |
+| high-concurrency | 50 | completed/cancelled | ✓ No crashes, 0 dropped |
+| param-variety | 5 | spooling+ | ✓ Metadata correctly captured |
+
+### Test Results (CTest)
+
+```
+100% tests passed, 0 tests failed out of 16
+```
+
+### Files Added
+
+| File | Purpose |
+|---|---|
+| `tools/simulator.cpp` | Virtual print simulator — Win32 job injection/manipulation |
+| `scripts/run-simulation-tests.ps1` | Automated integration test orchestration |
+
+### Files Modified
+
+| File | Changes |
+|---|---|
+| `src/watcher/print_watcher.cpp` | EnumJobsW buffer retry; phase preservation heuristic |
+| `src/app/main.cpp` | Lifecycle summaries written even on watcher error |
+| `src/storage/file_utils.cpp` | MoveFileExW retry for ACCESS_DENIED |
+| `tools/CMakeLists.txt` | Added wpce_sim target |
+
 ## 2026-06-20: Phase 5 — Stability, Performance, and Test Infrastructure
 
 ### Context
