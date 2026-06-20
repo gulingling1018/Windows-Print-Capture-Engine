@@ -1,0 +1,5 @@
+interface:
+  display_name: "WPCE DevOps"
+  short_description: "Maintain WPCE build, release, and rollback workflows."
+  default_prompt: "Use $wpce-devops to prepare WPCE build, CI, and release checks."
+

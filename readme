@@ -1,0 +1,510 @@
+# Windows Print Capture Engine (WPCE)
+
+## 1. 项目目标
+
+### 1.1 项目名称
+
+Windows Print Capture Engine（WPCE）
+
+### 1.2 项目定位
+
+构建一个运行于 Windows 10/11 的轻量级打印采集系统。
+
+系统应能够在不影响打印性能的前提下，实时获取：
+
+* JobId
+* 用户信息
+* 文档名称
+* 打印机名称
+* 打印参数
+* Page PrintTicket
+* FixedPage原始引用
+
+并提供统一的数据存储接口。
+
+---
+
+## 2. 业务目标
+
+### MVP目标
+
+实现：
+
+#### 打印任务监听
+
+采集：
+
+* JobId
+* User
+* DocumentName
+* PrinterName
+* SubmitTime
+
+#### 打印参数采集
+
+采集：
+
+* Copies
+* Duplex
+* Color
+* PaperSize
+* Orientation
+
+#### 页面级采集
+
+采集：
+
+* Job PrintTicket
+* Document PrintTicket
+* Page PrintTicket
+* FixedPage Reference
+
+#### 数据落盘
+
+保存：
+
+* JSON
+* XML
+* FixedPage
+
+---
+
+## 3. 非功能目标
+
+### 性能目标
+
+打印链路增加延迟：
+
+≤ 50ms
+
+### 内存目标
+
+常驻内存：
+
+≤ 50MB
+
+### CPU目标
+
+空闲：
+
+< 1%
+
+打印期间：
+
+< 5%
+
+### 稳定性目标
+
+连续运行：
+
+30天+
+
+无崩溃
+
+### 兼容性目标
+
+支持：
+
+* Windows 10
+* Windows 11
+
+x64
+
+---
+
+## 4. 技术架构
+
+### 核心语言
+
+C++20
+
+禁止：
+
+* Electron
+* Java
+
+允许：
+
+* 少量C#
+
+仅用于管理工具
+
+---
+
+### 核心组件
+
+#### Print Watcher
+
+职责：
+
+监听打印任务
+
+技术：
+
+Win32 Spooler API
+
+---
+
+#### Metadata Collector
+
+职责：
+
+采集：
+
+* JOB_INFO_2
+* DEVMODE
+
+---
+
+#### XPS Filter
+
+职责：
+
+采集：
+
+* PrintTicket
+* FixedPage
+
+技术：
+
+XPSDrv
+
+---
+
+#### Local Store
+
+职责：
+
+本地持久化
+
+格式：
+
+JSON
+XML
+
+---
+
+### 日志系统
+
+推荐：
+
+spdlog
+
+输出：
+
+* Console
+* File
+
+支持：
+
+* Rotation
+* Async
+
+---
+
+## 5. 项目目录
+
+project-root/
+
+src/
+
+core/
+
+watcher/
+
+collector/
+
+filter/
+
+storage/
+
+common/
+
+tests/
+
+docs/
+
+scripts/
+
+tools/
+
+build/
+
+deploy/
+
+---
+
+## 6. 开发阶段
+
+### Phase 1
+
+打印任务监听
+
+输出：
+
+job.json
+
+验收：
+
+能够采集：
+
+* JobId
+* User
+* Printer
+* Document
+
+---
+
+### Phase 2
+
+打印参数采集
+
+输出：
+
+metadata.json
+
+验收：
+
+能够获取：
+
+* Copies
+* Duplex
+* Color
+* PaperSize
+* Orientation
+
+准确率：
+
+95%以上
+
+---
+
+### Phase 3
+
+XPS Filter
+
+输出：
+
+PrintTicket
+
+验收：
+
+能够输出：
+
+* Job PT
+* Document PT
+* Page PT
+
+---
+
+### Phase 4
+
+FixedPage采集
+
+输出：
+
+page_xxx.fpage
+
+验收：
+
+成功获取页面引用
+
+不影响打印
+
+---
+
+### Phase 5
+
+稳定性优化
+
+验收：
+
+连续打印10000任务
+
+无崩溃
+
+无内存泄漏
+
+---
+
+## 7. 测试标准
+
+### 单元测试
+
+覆盖率：
+
+≥ 80%
+
+框架：
+
+GoogleTest
+
+---
+
+### 集成测试
+
+验证：
+
+Office
+PDF
+浏览器
+
+打印流程
+
+---
+
+### 压力测试
+
+连续：
+
+10000+
+
+打印任务
+
+---
+
+### 稳定性测试
+
+运行：
+
+7天
+
+监控：
+
+CPU
+
+Memory
+
+Handle
+
+Thread
+
+---
+
+## 8. 验收标准
+
+### 功能验收
+
+采集成功率：
+
+≥ 99%
+
+### 性能验收
+
+打印延迟：
+
+≤ 50ms
+
+### 稳定性验收
+
+Crash：
+
+0
+
+Memory Leak：
+
+0
+
+### 代码验收
+
+clang-tidy
+
+cppcheck
+
+全部通过
+
+---
+
+## 9. 发布标准
+
+Release必须包含：
+
+* Source
+* Binary
+* Symbols
+* Changelog
+* Test Report
+
+所有阶段必须可回滚
+
+
+## 10. Agent（Claude Code / Codex / OpenHands）技能要求
+
+配置 4 个专职 Agent：
+
+1. Architecture Agent
+
+职责：
+
+系统架构
+接口设计
+模块拆分
+性能评审
+WDK方案设计
+
+Skills：
+
+C++
+Windows Internals
+Win32
+COM
+XPSDrv
+WDK
+Design Pattern
+2. Development Agent
+
+职责：
+
+编码实现
+单元测试
+重构
+代码评审
+
+Skills：
+
+C++20
+STL
+Win32 API
+COM
+Multithreading
+GoogleTest
+CMake
+3. QA Agent
+
+职责：
+
+测试用例生成
+压力测试
+兼容性测试
+缺陷跟踪
+
+Skills：
+
+GoogleTest
+Stress Test
+Performance Test
+Windows Diagnostics
+ProcMon
+WPA
+ETW
+4. DevOps Agent
+
+职责：
+
+Git管理
+CI/CD
+构建
+发布
+日志分析
+
+Skills：
+
+Git
+GitHub Actions
+CMake
+Ninja
+MSVC
+clang-format
+clang-tidy
+cppcheck
+spdlog

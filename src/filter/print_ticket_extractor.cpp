@@ -1,0 +1,123 @@
+#include "filter/print_ticket_extractor.h"
+#include "common/com_ptr.h"
+
+#include <cassert>
+#include <stdexcept>
+#include <string>
+#include <vector>
+
+namespace wpce::filter
+{
+
+std::string read_print_stream(IUnknown* pStream)
+{
+  if (pStream == nullptr)
+  {
+    return {};
+  }
+
+  IPrintReadStream* read_stream = nullptr;
+  HRESULT hr = pStream->QueryInterface(
+    __uuidof(IPrintReadStream),
+    reinterpret_cast<void**>(&read_stream));
+
+  if (FAILED(hr) || read_stream == nullptr)
+  {
+    return {};
+  }
+
+  std::string result;
+  constexpr std::size_t kChunkSize = 4096;
+  std::vector<BYTE> buffer(kChunkSize);
+
+  while (true)
+  {
+    ULONG bytes_read = 0;
+    BOOL eof = FALSE;
+
+    hr = read_stream->ReadBytes(
+      buffer.data(),
+      static_cast<ULONG>(buffer.size()),
+      &bytes_read,
+      &eof);
+
+    if (FAILED(hr))
+    {
+      read_stream->Release();
+      return {};
+    }
+
+    if (bytes_read > 0)
+    {
+      result.append(reinterpret_cast<const char*>(buffer.data()), bytes_read);
+    }
+
+    if (eof)
+    {
+      break;
+    }
+  }
+
+  read_stream->Release();
+  return result;
+}
+
+std::string extract_print_ticket_xml(IPartPrintTicket* pPrintTicket)
+{
+  if (pPrintTicket == nullptr)
+  {
+    return {};
+  }
+
+  common::com_ptr<IPrintReadStream> stream;
+  {
+    IPrintReadStream* raw = nullptr;
+    HRESULT hr = pPrintTicket->GetStream(&raw);
+    if (FAILED(hr) || raw == nullptr)
+    {
+      return {};
+    }
+    stream.attach(raw);
+  }
+
+  return read_print_stream(stream.get());
+}
+
+std::string read_istream_to_string(IStream* pStream)
+{
+  if (pStream == nullptr)
+  {
+    return {};
+  }
+
+  // Seek to beginning to get total size.
+  LARGE_INTEGER zero{};
+  ULARGE_INTEGER end{};
+  HRESULT hr = pStream->Seek(zero, STREAM_SEEK_END, &end);
+  if (FAILED(hr))
+  {
+    return {};
+  }
+
+  const ULONG size = static_cast<ULONG>(end.QuadPart);
+  std::string result;
+  result.resize(size);
+
+  hr = pStream->Seek(zero, STREAM_SEEK_SET, nullptr);
+  if (FAILED(hr))
+  {
+    return {};
+  }
+
+  ULONG bytes_read = 0;
+  hr = pStream->Read(result.data(), size, &bytes_read);
+  if (FAILED(hr))
+  {
+    return {};
+  }
+
+  result.resize(bytes_read);
+  return result;
+}
+
+}  // namespace wpce::filter

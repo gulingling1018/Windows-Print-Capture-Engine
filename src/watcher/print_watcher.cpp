@@ -1,0 +1,1212 @@
+#include "watcher/print_watcher.h"
+#include "collector/metadata_collector.h"
+
+#ifdef _WIN32
+#include <windows.h>
+#include <winspool.h>
+#endif
+
+#include <algorithm>
+#include <array>
+#include <chrono>
+#include <cstddef>
+#include <cstdio>
+#include <iomanip>
+#include <optional>
+#include <sstream>
+#include <stdexcept>
+#include <string_view>
+#include <unordered_map>
+#include <utility>
+
+namespace wpce::watcher
+{
+namespace
+{
+
+// ── UTC timestamp generator ────────────────────────────────────────────
+
+std::string utc_timestamp_now()
+{
+  SYSTEMTIME st{};
+  GetSystemTime(&st);
+
+  std::ostringstream output;
+  output << std::setfill('0')
+         << std::setw(4) << st.wYear << '-'
+         << std::setw(2) << st.wMonth << '-'
+         << std::setw(2) << st.wDay << 'T'
+         << std::setw(2) << st.wHour << ':'
+         << std::setw(2) << st.wMinute << ':'
+         << std::setw(2) << st.wSecond << 'Z';
+  return output.str();
+}
+
+// ── Phase classification ───────────────────────────────────────────────
+
+// Status flags that map to each lifecycle phase.
+// Priority: terminal phases checked first → Failed > Cancelled > Completed > Printing > Spooling > Accepted > Unknown.
+
+bool has_all_status_bits(std::uint32_t value, std::uint32_t mask) noexcept
+{
+  return (value & mask) == mask;
+}
+
+// ── Status-name lookup (unchanged from Phase 1) ────────────────────────
+
+struct StatusName
+{
+  std::uint32_t flag;
+  std::string_view name;
+};
+
+#ifdef _WIN32
+constexpr StatusName kStatusNames[] = {
+  {JOB_STATUS_PAUSED, "paused"},
+  {JOB_STATUS_ERROR, "error"},
+  {JOB_STATUS_DELETING, "deleting"},
+  {JOB_STATUS_SPOOLING, "spooling"},
+  {JOB_STATUS_PRINTING, "printing"},
+  {JOB_STATUS_OFFLINE, "offline"},
+  {JOB_STATUS_PAPEROUT, "paperout"},
+  {JOB_STATUS_PRINTED, "printed"},
+  {JOB_STATUS_DELETED, "deleted"},
+  {JOB_STATUS_BLOCKED_DEVQ, "blocked_devq"},
+  {JOB_STATUS_USER_INTERVENTION, "user_intervention"},
+  {JOB_STATUS_RESTART, "restart"},
+#ifdef JOB_STATUS_COMPLETE
+  {JOB_STATUS_COMPLETE, "complete"},
+#endif
+#ifdef JOB_STATUS_RETAINED
+  {JOB_STATUS_RETAINED, "retained"},
+#endif
+#ifdef JOB_STATUS_RENDERING_LOCALLY
+  {JOB_STATUS_RENDERING_LOCALLY, "rendering_locally"},
+#endif
+};
+#else
+constexpr StatusName kStatusNames[] = {
+  {0x00000001, "paused"},
+  {0x00000002, "error"},
+  {0x00000004, "deleting"},
+  {0x00000008, "spooling"},
+  {0x00000010, "printing"},
+  {0x00000020, "offline"},
+  {0x00000040, "paperout"},
+  {0x00000080, "printed"},
+  {0x00000100, "deleted"},
+  {0x00000200, "blocked_devq"},
+  {0x00000400, "user_intervention"},
+  {0x00000800, "restart"},
+  {0x00001000, "complete"},
+  {0x00002000, "retained"},
+  {0x00004000, "rendering_locally"},
+};
+#endif
+
+std::string make_signature(const core::JobSnapshot& snapshot)
+{
+  std::ostringstream signature;
+  signature << snapshot.job_id << '\n'
+            << snapshot.user << '\n'
+            << snapshot.document_name << '\n'
+            << snapshot.printer_name << '\n'
+            << snapshot.submit_time_utc << '\n'
+            << snapshot.status;
+  return signature.str();
+}
+
+#ifdef _WIN32
+
+std::string format_win32_error(const std::string_view operation, const DWORD error)
+{
+  LPSTR message = nullptr;
+  const DWORD size = FormatMessageA(
+    FORMAT_MESSAGE_ALLOCATE_BUFFER | FORMAT_MESSAGE_FROM_SYSTEM | FORMAT_MESSAGE_IGNORE_INSERTS,
+    nullptr,
+    error,
+    MAKELANGID(LANG_NEUTRAL, SUBLANG_DEFAULT),
+    reinterpret_cast<LPSTR>(&message),
+    0,
+    nullptr);
+
+  std::ostringstream output;
+  output << operation << " failed with Win32 error " << error;
+  if (size > 0 && message != nullptr)
+  {
+    std::string text(message, size);
+    while (!text.empty() && (text.back() == '\r' || text.back() == '\n' || text.back() == '.'))
+    {
+      text.pop_back();
+    }
+    output << ": " << text;
+  }
+
+  if (message != nullptr)
+  {
+    LocalFree(message);
+  }
+
+  return output.str();
+}
+
+[[noreturn]] void throw_last_error(const std::string_view operation)
+{
+  throw std::runtime_error(format_win32_error(operation, GetLastError()));
+}
+
+class PrinterHandle
+{
+ public:
+  explicit PrinterHandle(const std::wstring& printer_name)
+  {
+    if (!OpenPrinterW(const_cast<LPWSTR>(printer_name.c_str()), &handle_, nullptr))
+    {
+      throw_last_error("OpenPrinterW");
+    }
+  }
+
+  ~PrinterHandle()
+  {
+    if (handle_ != nullptr)
+    {
+      ClosePrinter(handle_);
+    }
+  }
+
+  PrinterHandle(const PrinterHandle&) = delete;
+  PrinterHandle& operator=(const PrinterHandle&) = delete;
+
+  [[nodiscard]] HANDLE get() const noexcept
+  {
+    return handle_;
+  }
+
+ private:
+  HANDLE handle_{nullptr};
+};
+
+class ChangeNotificationHandle
+{
+ public:
+  explicit ChangeNotificationHandle(HANDLE printer)
+  {
+    job_notify_type_.Type = JOB_NOTIFY_TYPE;
+    job_notify_type_.Count = static_cast<DWORD>(job_fields_.size());
+    job_notify_type_.pFields = job_fields_.data();
+
+    options_.Version = 2;
+    options_.Count = 1;
+    options_.pTypes = &job_notify_type_;
+
+    handle_ = FindFirstPrinterChangeNotification(
+      printer,
+      PRINTER_CHANGE_ADD_JOB | PRINTER_CHANGE_SET_JOB | PRINTER_CHANGE_WRITE_JOB | PRINTER_CHANGE_DELETE_JOB,
+      0,
+      &options_);
+
+    if (handle_ == nullptr || handle_ == INVALID_HANDLE_VALUE)
+    {
+      throw_last_error("FindFirstPrinterChangeNotification");
+    }
+  }
+
+  ~ChangeNotificationHandle()
+  {
+    if (handle_ != nullptr && handle_ != INVALID_HANDLE_VALUE)
+    {
+      FindClosePrinterChangeNotification(handle_);
+    }
+  }
+
+  ChangeNotificationHandle(const ChangeNotificationHandle&) = delete;
+  ChangeNotificationHandle& operator=(const ChangeNotificationHandle&) = delete;
+
+  [[nodiscard]] HANDLE get() const noexcept
+  {
+    return handle_;
+  }
+
+ private:
+  std::array<WORD, 5> job_fields_{
+    JOB_NOTIFY_FIELD_PRINTER_NAME,
+    JOB_NOTIFY_FIELD_USER_NAME,
+    JOB_NOTIFY_FIELD_STATUS,
+    JOB_NOTIFY_FIELD_DOCUMENT,
+    JOB_NOTIFY_FIELD_SUBMITTED,
+  };
+  PRINTER_NOTIFY_OPTIONS_TYPE job_notify_type_{};
+  PRINTER_NOTIFY_OPTIONS options_{};
+  HANDLE handle_{nullptr};
+};
+
+class NotifyInfoHandle
+{
+ public:
+  explicit NotifyInfoHandle(PPRINTER_NOTIFY_INFO info) noexcept : info_(info) {}
+
+  ~NotifyInfoHandle()
+  {
+    if (info_ != nullptr)
+    {
+      FreePrinterNotifyInfo(info_);
+    }
+  }
+
+  NotifyInfoHandle(const NotifyInfoHandle&) = delete;
+  NotifyInfoHandle& operator=(const NotifyInfoHandle&) = delete;
+
+  [[nodiscard]] PPRINTER_NOTIFY_INFO get() const noexcept
+  {
+    return info_;
+  }
+
+ private:
+  PPRINTER_NOTIFY_INFO info_{nullptr};
+};
+
+std::string to_utf8(const wchar_t* value)
+{
+  if (value == nullptr || value[0] == L'\0')
+  {
+    return {};
+  }
+
+  const int size = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+  if (size <= 1)
+  {
+    return {};
+  }
+
+  std::string result(static_cast<std::size_t>(size), '\0');
+  const int written = WideCharToMultiByte(CP_UTF8, 0, value, -1, result.data(), size, nullptr, nullptr);
+  if (written <= 0)
+  {
+    throw_last_error("WideCharToMultiByte");
+  }
+
+  if (!result.empty() && result.back() == '\0')
+  {
+    result.pop_back();
+  }
+  return result;
+}
+
+std::string to_utf8_buffer(const void* value, const DWORD size_bytes)
+{
+  if (value == nullptr || size_bytes < sizeof(wchar_t))
+  {
+    return {};
+  }
+
+  const auto* text = static_cast<const wchar_t*>(value);
+  const std::size_t length = size_bytes / sizeof(wchar_t);
+  if (length == 0 || text[0] == L'\0')
+  {
+    return {};
+  }
+
+  std::wstring bounded(text, text + length);
+  while (!bounded.empty() && bounded.back() == L'\0')
+  {
+    bounded.pop_back();
+  }
+  return to_utf8(bounded.c_str());
+}
+
+std::string format_system_time_utc(const SYSTEMTIME& submitted)
+{
+  if (submitted.wYear == 0)
+  {
+    return {};
+  }
+
+  std::ostringstream output;
+  output << std::setfill('0') << std::setw(4) << submitted.wYear << '-' << std::setw(2) << submitted.wMonth << '-'
+         << std::setw(2) << submitted.wDay << 'T' << std::setw(2) << submitted.wHour << ':' << std::setw(2)
+         << submitted.wMinute << ':' << std::setw(2) << submitted.wSecond << 'Z';
+  return output.str();
+}
+
+core::JobSnapshot to_snapshot(const JOB_INFO_2W& job)
+{
+  return core::JobSnapshot{
+    .schema_version = 1,
+    .job_id = job.JobId,
+    .user = to_utf8(job.pUserName),
+    .document_name = to_utf8(job.pDocument),
+    .printer_name = to_utf8(job.pPrinterName),
+    .submit_time_utc = format_system_time_utc(job.Submitted),
+    .status = describe_job_status(job.Status),
+    .source = "winspool",
+  };
+}
+
+std::optional<JobSnapshotWithMetadata> get_job_snapshot_by_id(HANDLE printer, const DWORD job_id)
+{
+  DWORD bytes_needed = 0;
+  if (GetJobW(printer, job_id, 2, nullptr, 0, &bytes_needed) != FALSE)
+  {
+    return std::nullopt;
+  }
+
+  const DWORD probe_error = GetLastError();
+  if (probe_error != ERROR_INSUFFICIENT_BUFFER || bytes_needed == 0)
+  {
+    return std::nullopt;
+  }
+
+  std::vector<BYTE> buffer(bytes_needed);
+  if (!GetJobW(printer, job_id, 2, buffer.data(), static_cast<DWORD>(buffer.size()), &bytes_needed))
+  {
+    return std::nullopt;
+  }
+
+  const auto* job = reinterpret_cast<const JOB_INFO_2W*>(buffer.data());
+  return JobSnapshotWithMetadata{.job = to_snapshot(*job), .metadata = collector::extract_metadata(*job)};
+}
+
+struct JobNotificationSnapshot
+{
+  std::uint32_t job_id{0};
+  std::string user;
+  std::string document_name;
+  std::string printer_name;
+  std::string submit_time_utc;
+  std::string status;
+  bool has_field_data{false};
+};
+
+bool has_job_change_flags(const DWORD change_flags) noexcept
+{
+  return (change_flags &
+          (PRINTER_CHANGE_ADD_JOB | PRINTER_CHANGE_SET_JOB | PRINTER_CHANGE_WRITE_JOB | PRINTER_CHANGE_DELETE_JOB)) !=
+         0;
+}
+
+std::string fallback_status_from_change_flags(const DWORD change_flags)
+{
+  if ((change_flags & PRINTER_CHANGE_DELETE_JOB) != 0)
+  {
+    return "notification_deleted_or_unavailable";
+  }
+  if ((change_flags & PRINTER_CHANGE_ADD_JOB) != 0)
+  {
+    return "notification_added_or_unavailable";
+  }
+  if ((change_flags & PRINTER_CHANGE_WRITE_JOB) != 0)
+  {
+    return "notification_written_or_unavailable";
+  }
+  if ((change_flags & PRINTER_CHANGE_SET_JOB) != 0)
+  {
+    return "notification_changed_or_unavailable";
+  }
+  return "notification_only";
+}
+
+void apply_job_notification_field(JobNotificationSnapshot& snapshot, const PRINTER_NOTIFY_INFO_DATA& data)
+{
+  snapshot.has_field_data = true;
+
+  switch (data.Field)
+  {
+    case JOB_NOTIFY_FIELD_PRINTER_NAME:
+      snapshot.printer_name = to_utf8_buffer(data.NotifyData.Data.pBuf, data.NotifyData.Data.cbBuf);
+      break;
+    case JOB_NOTIFY_FIELD_USER_NAME:
+      snapshot.user = to_utf8_buffer(data.NotifyData.Data.pBuf, data.NotifyData.Data.cbBuf);
+      break;
+    case JOB_NOTIFY_FIELD_STATUS:
+      snapshot.status = describe_job_status(data.NotifyData.adwData[0]);
+      break;
+    case JOB_NOTIFY_FIELD_DOCUMENT:
+      snapshot.document_name = to_utf8_buffer(data.NotifyData.Data.pBuf, data.NotifyData.Data.cbBuf);
+      break;
+    case JOB_NOTIFY_FIELD_SUBMITTED:
+      if (data.NotifyData.Data.pBuf != nullptr && data.NotifyData.Data.cbBuf >= sizeof(SYSTEMTIME))
+      {
+        const auto* submitted = static_cast<const SYSTEMTIME*>(data.NotifyData.Data.pBuf);
+        snapshot.submit_time_utc = format_system_time_utc(*submitted);
+      }
+      break;
+    default:
+      break;
+  }
+}
+
+std::vector<JobNotificationSnapshot> parse_job_notifications(
+  const PRINTER_NOTIFY_INFO* info,
+  const DWORD change_flags)
+{
+  std::unordered_map<std::uint32_t, JobNotificationSnapshot> snapshots;
+
+  if (info != nullptr)
+  {
+    for (DWORD index = 0; index < info->Count; ++index)
+    {
+      const PRINTER_NOTIFY_INFO_DATA& data = info->aData[index];
+      if (data.Type != JOB_NOTIFY_TYPE || data.Id == 0)
+      {
+        continue;
+      }
+
+      auto& snapshot = snapshots[data.Id];
+      snapshot.job_id = data.Id;
+      apply_job_notification_field(snapshot, data);
+    }
+  }
+
+  std::vector<JobNotificationSnapshot> result;
+  result.reserve(snapshots.size());
+  for (auto& entry : snapshots)
+  {
+    if (entry.second.status.empty())
+    {
+      entry.second.status = fallback_status_from_change_flags(change_flags);
+    }
+    result.push_back(std::move(entry.second));
+  }
+
+  std::sort(result.begin(), result.end(), [](const JobNotificationSnapshot& left, const JobNotificationSnapshot& right) {
+    return left.job_id < right.job_id;
+  });
+  return result;
+}
+
+core::JobSnapshot make_notification_only_snapshot(
+  const std::string& configured_printer_name,
+  const JobNotificationSnapshot& notification,
+  const std::unordered_map<std::uint32_t, core::JobSnapshot>& known_snapshots)
+{
+  core::JobSnapshot snapshot;
+  const auto existing = known_snapshots.find(notification.job_id);
+  if (existing != known_snapshots.end())
+  {
+    snapshot = existing->second;
+  }
+
+  snapshot.schema_version = 1;
+  snapshot.job_id = notification.job_id;
+  snapshot.source = "winspool-notify";
+
+  if (!notification.user.empty())
+  {
+    snapshot.user = notification.user;
+  }
+  if (!notification.document_name.empty())
+  {
+    snapshot.document_name = notification.document_name;
+  }
+  if (!notification.printer_name.empty())
+  {
+    snapshot.printer_name = notification.printer_name;
+  }
+  if (snapshot.printer_name.empty())
+  {
+    snapshot.printer_name = configured_printer_name;
+  }
+  if (!notification.submit_time_utc.empty())
+  {
+    snapshot.submit_time_utc = notification.submit_time_utc;
+  }
+  if (!notification.status.empty())
+  {
+    snapshot.status = notification.status;
+  }
+  if (snapshot.status.empty())
+  {
+    snapshot.status = "notification_only";
+  }
+
+  return snapshot;
+}
+
+// ── Lifecycle event builder helper ─────────────────────────────────────
+
+core::JobLifecycleEvent make_lifecycle_event(std::uint32_t job_id,
+                                             int sequence,
+                                             core::JobLifecyclePhase phase,
+                                             const std::string& status_string,
+                                             int pages_printed,
+                                             int total_pages)
+{
+  core::JobLifecycleEvent event;
+  event.event_id = std::to_string(job_id) + "-" + std::to_string(sequence);
+  event.job_id = job_id;
+  event.sequence = sequence;
+  event.timestamp_utc = utc_timestamp_now();
+  event.phase = phase;
+  event.status_flags = status_string;
+  event.pages_printed = pages_printed;
+  event.total_pages = total_pages;
+
+  // Build human-readable detail.
+  std::ostringstream detail;
+  detail << "Job " << job_id << " phase: " << core::to_string(phase);
+  if (total_pages > 0)
+  {
+    detail << ", page " << pages_printed << '/' << total_pages
+           << " (" << (pages_printed * 100 / total_pages) << "%)";
+  }
+  detail << ", status: " << status_string;
+  event.detail = detail.str();
+
+  return event;
+}
+
+#endif
+
+}  // namespace
+
+// ── Public phase classifier ─────────────────────────────────────────────
+
+core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
+                                       const std::string& /*status_string*/) noexcept
+{
+  if (status_flags == 0)
+  {
+    return core::JobLifecyclePhase::Unknown;
+  }
+
+  // Terminal / error states first (priority order).
+#ifdef JOB_STATUS_ERROR
+  if (has_all_status_bits(status_flags, JOB_STATUS_ERROR))
+    return core::JobLifecyclePhase::Failed;
+#endif
+#ifdef JOB_STATUS_PAPEROUT
+  if (has_all_status_bits(status_flags, JOB_STATUS_PAPEROUT))
+    return core::JobLifecyclePhase::Failed;
+#endif
+#ifdef JOB_STATUS_OFFLINE
+  if (has_all_status_bits(status_flags, JOB_STATUS_OFFLINE))
+    return core::JobLifecyclePhase::Failed;
+#endif
+#ifdef JOB_STATUS_USER_INTERVENTION
+  if (has_all_status_bits(status_flags, JOB_STATUS_USER_INTERVENTION))
+    return core::JobLifecyclePhase::Failed;
+#endif
+
+#ifdef JOB_STATUS_DELETED
+  if (has_all_status_bits(status_flags, JOB_STATUS_DELETED))
+    return core::JobLifecyclePhase::Cancelled;
+#endif
+#ifdef JOB_STATUS_DELETING
+  if (has_all_status_bits(status_flags, JOB_STATUS_DELETING) &&
+      !has_all_status_bits(status_flags, JOB_STATUS_DELETED))
+    return core::JobLifecyclePhase::Cancelled;
+#endif
+
+#ifdef JOB_STATUS_COMPLETE
+  if (has_all_status_bits(status_flags, JOB_STATUS_COMPLETE))
+    return core::JobLifecyclePhase::Completed;
+#endif
+#ifdef JOB_STATUS_RETAINED
+  if (has_all_status_bits(status_flags, JOB_STATUS_RETAINED))
+    return core::JobLifecyclePhase::Completed;
+#endif
+#ifdef JOB_STATUS_PRINTED
+  if (has_all_status_bits(status_flags, JOB_STATUS_PRINTED) &&
+      !has_all_status_bits(status_flags, JOB_STATUS_RETAINED))
+    return core::JobLifecyclePhase::Completed;
+#endif
+
+  // Active / in-progress states.
+#ifdef JOB_STATUS_PRINTING
+  if (has_all_status_bits(status_flags, JOB_STATUS_PRINTING))
+    return core::JobLifecyclePhase::Printing;
+#endif
+
+#ifdef JOB_STATUS_SPOOLING
+  if (has_all_status_bits(status_flags, JOB_STATUS_SPOOLING))
+    return core::JobLifecyclePhase::Spooling;
+#endif
+
+#ifdef JOB_STATUS_RENDERING_LOCALLY
+  if (has_all_status_bits(status_flags, JOB_STATUS_RENDERING_LOCALLY))
+    return core::JobLifecyclePhase::Spooling;
+#endif
+
+  // Paused / blocked — still active but not progressing.
+#ifdef JOB_STATUS_PAUSED
+  if (has_all_status_bits(status_flags, JOB_STATUS_PAUSED))
+    return core::JobLifecyclePhase::Spooling;
+#endif
+#ifdef JOB_STATUS_BLOCKED_DEVQ
+  if (has_all_status_bits(status_flags, JOB_STATUS_BLOCKED_DEVQ))
+    return core::JobLifecyclePhase::Spooling;
+#endif
+#ifdef JOB_STATUS_RESTART
+  if (has_all_status_bits(status_flags, JOB_STATUS_RESTART))
+    return core::JobLifecyclePhase::Spooling;
+#endif
+
+  return core::JobLifecyclePhase::Unknown;
+}
+
+std::string describe_job_status(const std::uint32_t status_flags)
+{
+  if (status_flags == 0)
+  {
+    return "unknown";
+  }
+
+  std::string result;
+  for (const StatusName& status : kStatusNames)
+  {
+    if ((status_flags & status.flag) == status.flag)
+    {
+      if (!result.empty())
+      {
+        result += '|';
+      }
+      result += status.name;
+    }
+  }
+
+  if (result.empty())
+  {
+    result = "unknown(" + std::to_string(status_flags) + ")";
+  }
+
+  return result;
+}
+
+std::vector<JobSnapshotWithMetadata> enumerate_printer_jobs(const std::wstring& printer_name)
+{
+#ifdef _WIN32
+  PrinterHandle printer(printer_name);
+
+  DWORD bytes_needed = 0;
+  DWORD jobs_returned = 0;
+  constexpr DWORD kMaxJobsPerSnapshot = 1024;
+
+  const BOOL probe_result =
+    EnumJobsW(printer.get(), 0, kMaxJobsPerSnapshot, 2, nullptr, 0, &bytes_needed, &jobs_returned);
+  if (probe_result != FALSE)
+  {
+    return {};
+  }
+
+  const DWORD probe_error = GetLastError();
+  if (probe_error != ERROR_INSUFFICIENT_BUFFER)
+  {
+    if (probe_error == ERROR_SUCCESS || bytes_needed == 0)
+    {
+      return {};
+    }
+    throw std::runtime_error(format_win32_error("EnumJobsW", probe_error));
+  }
+
+  std::vector<BYTE> buffer(bytes_needed);
+  if (!EnumJobsW(
+        printer.get(),
+        0,
+        kMaxJobsPerSnapshot,
+        2,
+        buffer.data(),
+        static_cast<DWORD>(buffer.size()),
+        &bytes_needed,
+        &jobs_returned))
+  {
+    throw_last_error("EnumJobsW");
+  }
+
+  const auto* jobs = reinterpret_cast<const JOB_INFO_2W*>(buffer.data());
+  std::vector<JobSnapshotWithMetadata> snapshots;
+  snapshots.reserve(jobs_returned);
+  for (DWORD index = 0; index < jobs_returned; ++index)
+  {
+    snapshots.push_back(JobSnapshotWithMetadata{
+      .job = to_snapshot(jobs[index]),
+      .metadata = collector::extract_metadata(jobs[index]),
+    });
+  }
+
+  std::sort(snapshots.begin(), snapshots.end(), [](const JobSnapshotWithMetadata& left, const JobSnapshotWithMetadata& right) {
+    return left.job.job_id < right.job.job_id;
+  });
+
+  return snapshots;
+#else
+  (void)printer_name;
+  throw std::runtime_error("Win32 print job enumeration is only supported on Windows");
+#endif
+}
+
+// ── PrintWatcher implementation ─────────────────────────────────────────
+
+PrintWatcher::PrintWatcher(WatcherConfig config,
+                           JobSnapshotCallback job_callback,
+                           MetadataSnapshotCallback metadata_callback,
+                           LifecycleEventCallback lifecycle_callback)
+  : config_(std::move(config))
+  , job_callback_(std::move(job_callback))
+  , metadata_callback_(std::move(metadata_callback))
+  , lifecycle_callback_(std::move(lifecycle_callback))
+{
+  if (config_.printer_name.empty())
+  {
+    throw std::invalid_argument("printer_name is required");
+  }
+  if (!job_callback_)
+  {
+    throw std::invalid_argument("job_callback is required");
+  }
+}
+
+PrintWatcher::~PrintWatcher()
+{
+  stop();
+}
+
+void PrintWatcher::start()
+{
+  std::scoped_lock lock(lifecycle_mutex_);
+  if (running_)
+  {
+    return;
+  }
+
+  stop_requested_ = false;
+  set_last_error({});
+  running_ = true;
+  worker_ = std::thread(&PrintWatcher::run, this);
+}
+
+void PrintWatcher::stop() noexcept
+{
+  std::thread worker;
+  {
+    std::scoped_lock lock(lifecycle_mutex_);
+    stop_requested_ = true;
+    if (worker_.joinable())
+    {
+      worker = std::move(worker_);
+    }
+  }
+
+  if (worker.joinable())
+  {
+    worker.join();
+  }
+}
+
+bool PrintWatcher::running() const noexcept
+{
+  return running_;
+}
+
+std::string PrintWatcher::last_error() const
+{
+  std::scoped_lock lock(error_mutex_);
+  return last_error_;
+}
+
+std::vector<core::JobLifecycleSummary> PrintWatcher::lifecycle_summaries() const
+{
+  std::scoped_lock lock(summaries_mutex_);
+  std::vector<core::JobLifecycleSummary> result;
+  result.reserve(job_states_.size());
+  for (const auto& [id, state] : job_states_)
+  {
+    result.push_back(state.summary);
+  }
+
+  std::sort(result.begin(), result.end(), [](const core::JobLifecycleSummary& left, const core::JobLifecycleSummary& right) {
+    return left.job_id < right.job_id;
+  });
+  return result;
+}
+
+void PrintWatcher::run()
+{
+  std::unordered_map<std::uint32_t, std::string> emitted_signatures;
+  std::unordered_map<std::uint32_t, core::JobSnapshot> known_snapshots;
+
+  // ── Lifecycle tracking helpers ───────────────────────────────────────
+
+  const auto ensure_internal_state = [&](std::uint32_t job_id,
+                                         const std::string& user,
+                                         const std::string& document_name,
+                                         const std::string& printer_name,
+                                         const std::string& submit_time_utc) -> InternalJobState& {
+    auto& state = job_states_[job_id];
+    if (state.summary.job_id == 0)
+    {
+      state.summary.schema_version = 1;
+      state.summary.job_id = job_id;
+      state.summary.user = user;
+      state.summary.document_name = document_name;
+      state.summary.printer_name = printer_name;
+      state.summary.submit_time_utc = submit_time_utc;
+      state.summary.source = "winspool";
+      state.last_progress_time = std::chrono::steady_clock::now();
+    }
+    return state;
+  };
+
+  const auto emit_lifecycle_event = [&](InternalJobState& state,
+                                        core::JobLifecyclePhase phase,
+                                        const std::string& status_string,
+                                        int pages_printed,
+                                        int total_pages) {
+    // Skip if we already emitted a terminal event for this job.
+    if (state.summary.events.empty() && phase == core::JobLifecyclePhase::Unknown)
+    {
+      return;  // Don't emit Unknown as the very first event.
+    }
+
+    const core::JobLifecycleEvent event = make_lifecycle_event(
+      state.summary.job_id,
+      state.next_sequence,
+      phase,
+      status_string,
+      pages_printed,
+      total_pages);
+
+    state.current_phase = phase;
+    state.summary.events.push_back(event);
+    if (!state.summary.events.empty())
+    {
+      state.summary.last_status = status_string;
+    }
+    state.summary.final_phase = phase;
+    if (total_pages > 0)
+    {
+      state.summary.progress_percent = (pages_printed * 100) / total_pages;
+    }
+    else
+    {
+      state.summary.progress_percent = -1;
+    }
+    state.next_sequence++;
+
+    if (is_terminal_phase(phase))
+    {
+      state.last_progress_time = std::chrono::steady_clock::now();  // stop stall clock
+    }
+    else
+    {
+      state.last_progress_time = std::chrono::steady_clock::now();
+    }
+
+    if (lifecycle_callback_)
+    {
+      lifecycle_callback_(event);
+    }
+  };
+
+  const auto process_phase_transition = [&](const core::JobSnapshot& snapshot,
+                                            const core::MetadataSnapshot& metadata) {
+    const std::uint32_t job_id = snapshot.job_id;
+    if (job_id == 0) return;
+
+    InternalJobState& state = ensure_internal_state(
+      job_id, snapshot.user, snapshot.document_name,
+      snapshot.printer_name, snapshot.submit_time_utc);
+
+#ifdef _WIN32
+    // Determine phase from the status string by re-deriving flags.
+    // We need the raw status flags. Get them via a direct lookup.
+    // For now, classify using the status string as a hint.
+    // The watcher already gets raw flags from GetJobW but to_snapshot()
+    // discards them.  We'll rely on the phase classifier + status string.
+    core::JobLifecyclePhase new_phase = classify_phase(0, snapshot.status);
+    // Fallback: if classify_phase returned Unknown, try to infer from status string.
+    if (new_phase == core::JobLifecyclePhase::Unknown &&
+        !snapshot.status.empty() && snapshot.status != "unknown")
+    {
+      // Parse the status string for known substrings.
+      const std::string& s = snapshot.status;
+      if (s.find("error") != std::string::npos ||
+          s.find("offline") != std::string::npos ||
+          s.find("paperout") != std::string::npos)
+      {
+        new_phase = core::JobLifecyclePhase::Failed;
+      }
+      else if (s.find("deleted") != std::string::npos ||
+               s.find("deleting") != std::string::npos)
+      {
+        new_phase = core::JobLifecyclePhase::Cancelled;
+      }
+      else if (s.find("printed") != std::string::npos ||
+               s.find("complete") != std::string::npos ||
+               s.find("retained") != std::string::npos)
+      {
+        new_phase = core::JobLifecyclePhase::Completed;
+      }
+      else if (s.find("printing") != std::string::npos)
+      {
+        new_phase = core::JobLifecyclePhase::Printing;
+      }
+      else if (s.find("spooling") != std::string::npos ||
+               s.find("rendering") != std::string::npos ||
+               s.find("blocked") != std::string::npos ||
+               s.find("paused") != std::string::npos)
+      {
+        new_phase = core::JobLifecyclePhase::Spooling;
+      }
+      else if (s.find("notification_added") != std::string::npos)
+      {
+        new_phase = core::JobLifecyclePhase::Accepted;
+      }
+    }
+#else
+    core::JobLifecyclePhase new_phase = core::JobLifecyclePhase::Unknown;
+#endif
+
+    // If the phase hasn't changed (and it's not the first event), suppress duplicate.
+    if (new_phase == state.current_phase && !state.summary.events.empty())
+    {
+      // If pages_printed changed, emit a progress update even without a phase change.
+      int pages_printed_val = 0;
+      int total_pages_val = 0;
+      try { pages_printed_val = std::stoi(metadata.pages_printed.value); } catch (...) {}
+      try { total_pages_val = std::stoi(metadata.total_pages.value); } catch (...) {}
+
+      const int prev_total = state.summary.events.back().total_pages;
+      const int prev_printed = state.summary.events.back().pages_printed;
+      if (pages_printed_val != prev_printed || total_pages_val != prev_total)
+      {
+        // Progress changed — emit an update as the current phase.
+        emit_lifecycle_event(state, new_phase, snapshot.status, pages_printed_val, total_pages_val);
+      }
+      return;
+    }
+
+    // If this job is in a true terminal phase, don't emit more events.
+    // Stalled is NOT terminal — it can recover when real progress arrives.
+    if (is_terminal_phase(state.current_phase) && !state.summary.events.empty())
+    {
+      return;
+    }
+
+    int pages_printed_val = 0;
+    int total_pages_val = 0;
+    try { pages_printed_val = std::stoi(metadata.pages_printed.value); } catch (...) {}
+    try { total_pages_val = std::stoi(metadata.total_pages.value); } catch (...) {}
+
+    emit_lifecycle_event(state, new_phase, snapshot.status, pages_printed_val, total_pages_val);
+  };
+
+  // ── Snapshot emission (existing dedup logic) ──────────────────────────
+
+  const auto emit_snapshot = [&](const core::JobSnapshot& snapshot, const core::MetadataSnapshot& metadata) {
+    if (snapshot.job_id == 0)
+    {
+      return;
+    }
+
+    // Lifecycle tracking — fires before dedup so every phase transition is recorded.
+    process_phase_transition(snapshot, metadata);
+
+    const std::string signature = make_signature(snapshot);
+    auto existing = emitted_signatures.find(snapshot.job_id);
+    if (existing == emitted_signatures.end() || existing->second != signature)
+    {
+      emitted_signatures[snapshot.job_id] = signature;
+      known_snapshots[snapshot.job_id] = snapshot;
+      job_callback_(snapshot);
+      if (metadata_callback_)
+      {
+        metadata_callback_(metadata);
+      }
+    }
+  };
+
+  // Build a minimal metadata snapshot for notification-only fallback paths.
+  const auto make_metadata_stub = [](std::uint32_t job_id) {
+    core::MetadataSnapshot stub;
+    stub.schema_version = 1;
+    stub.job_id = job_id;
+    stub.total_pages = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.pages_printed = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.copies = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.duplex = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.color = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.paper_size = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.orientation = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.n_up = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.collate = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.print_quality = core::FieldValue{{}, core::FieldState::NotReported};
+    return stub;
+  };
+
+  const auto emit_changed_jobs = [&]() {
+    for (const JobSnapshotWithMetadata& entry : enumerate_printer_jobs(config_.printer_name))
+    {
+      emit_snapshot(entry.job, entry.metadata);
+    }
+  };
+
+  // ── Main loop ─────────────────────────────────────────────────────────
+
+  try
+  {
+#ifdef _WIN32
+    PrinterHandle printer(config_.printer_name);
+    ChangeNotificationHandle notification(printer.get());
+    const std::string configured_printer_name = to_utf8(config_.printer_name.c_str());
+
+    emit_changed_jobs();
+
+    auto last_stall_check = std::chrono::steady_clock::now();
+
+    while (!stop_requested_)
+    {
+      const DWORD wait_result =
+        WaitForSingleObject(notification.get(), static_cast<DWORD>(config_.wait_timeout.count()));
+      if (wait_result == WAIT_TIMEOUT)
+      {
+        // Periodic stall check on timeout.
+        tick_stall_detection();
+        continue;
+      }
+      if (wait_result != WAIT_OBJECT_0)
+      {
+        throw std::runtime_error(format_win32_error("WaitForSingleObject", GetLastError()));
+      }
+
+      DWORD change_flags = 0;
+      PPRINTER_NOTIFY_INFO raw_info = nullptr;
+      if (!FindNextPrinterChangeNotification(
+            notification.get(),
+            &change_flags,
+            nullptr,
+            reinterpret_cast<LPVOID*>(&raw_info)))
+      {
+        throw_last_error("FindNextPrinterChangeNotification");
+      }
+
+      NotifyInfoHandle info(raw_info);
+      const std::vector<JobNotificationSnapshot> job_notifications =
+        parse_job_notifications(info.get(), change_flags);
+
+      for (const JobNotificationSnapshot& job_notification : job_notifications)
+      {
+        if (const std::optional<JobSnapshotWithMetadata> current =
+              get_job_snapshot_by_id(printer.get(), job_notification.job_id);
+            current.has_value())
+        {
+          emit_snapshot(current->job, current->metadata);
+        }
+        else
+        {
+          const core::JobSnapshot stub_job = make_notification_only_snapshot(
+            configured_printer_name, job_notification, known_snapshots);
+          emit_snapshot(stub_job, make_metadata_stub(stub_job.job_id));
+        }
+      }
+
+      if (info.get() != nullptr && (info.get()->Flags & PRINTER_NOTIFY_INFO_DISCARDED) != 0)
+      {
+        PRINTER_NOTIFY_OPTIONS refresh_options{};
+        refresh_options.Version = 2;
+        refresh_options.Flags = PRINTER_NOTIFY_OPTIONS_REFRESH;
+        PPRINTER_NOTIFY_INFO refresh_raw_info = nullptr;
+        if (!FindNextPrinterChangeNotification(
+              notification.get(),
+              nullptr,
+              &refresh_options,
+              reinterpret_cast<LPVOID*>(&refresh_raw_info)))
+        {
+          throw_last_error("FindNextPrinterChangeNotification refresh");
+        }
+        NotifyInfoHandle refresh_info(refresh_raw_info);
+        const std::vector<JobNotificationSnapshot> refresh_notifications =
+          parse_job_notifications(refresh_info.get(), change_flags);
+        for (const JobNotificationSnapshot& job_notification : refresh_notifications)
+        {
+          if (const std::optional<JobSnapshotWithMetadata> current =
+                get_job_snapshot_by_id(printer.get(), job_notification.job_id);
+              current.has_value())
+          {
+            emit_snapshot(current->job, current->metadata);
+          }
+          else
+          {
+            const core::JobSnapshot stub_job = make_notification_only_snapshot(
+              configured_printer_name, job_notification, known_snapshots);
+            emit_snapshot(stub_job, make_metadata_stub(stub_job.job_id));
+          }
+        }
+      }
+
+      if (has_job_change_flags(change_flags))
+      {
+        emit_changed_jobs();
+      }
+
+      // Periodic stall check after processing notifications.
+      const auto now = std::chrono::steady_clock::now();
+      if (now - last_stall_check > std::chrono::seconds{5})
+      {
+        tick_stall_detection();
+        last_stall_check = now;
+      }
+    }
+#else
+    throw std::runtime_error("Win32 print watching is only supported on Windows");
+#endif
+  }
+  catch (const std::exception& error)
+  {
+    set_last_error(error.what());
+  }
+  catch (...)
+  {
+    set_last_error("Unknown print watcher error");
+  }
+
+  running_ = false;
+}
+
+void PrintWatcher::set_last_error(std::string error)
+{
+  std::scoped_lock lock(error_mutex_);
+  last_error_ = std::move(error);
+}
+
+void PrintWatcher::tick_stall_detection()
+{
+  if (config_.stall_timeout.count() <= 0)
+  {
+    return;
+  }
+
+  const auto now = std::chrono::steady_clock::now();
+
+  std::scoped_lock lock(summaries_mutex_);
+  for (auto& [job_id, state] : job_states_)
+  {
+    // Only check active (non-terminal) jobs.
+    if (is_terminal_phase(state.current_phase))
+    {
+      continue;
+    }
+
+    const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - state.last_progress_time);
+    if (elapsed >= config_.stall_timeout && state.current_phase != core::JobLifecyclePhase::Unknown)
+    {
+      // Emit stalled event.
+      if (lifecycle_callback_)
+      {
+        core::JobLifecycleEvent event = make_lifecycle_event(
+          job_id,
+          state.next_sequence,
+          core::JobLifecyclePhase::Stalled,
+          state.summary.last_status,
+          state.summary.progress_percent >= 0 ? state.summary.progress_percent : 0,
+          -1);
+        lifecycle_callback_(event);
+      }
+
+      // Mark as stalled so we don't re-emit.
+      state.current_phase = core::JobLifecyclePhase::Stalled;
+      state.summary.final_phase = core::JobLifecyclePhase::Stalled;
+    }
+  }
+}
+
+}  // namespace wpce::watcher

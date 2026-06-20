@@ -1,0 +1,8 @@
+BasedOnStyle: Microsoft
+IndentWidth: 2
+ColumnLimit: 120
+UseTab: Never
+BreakBeforeBraces: Allman
+AllowShortFunctionsOnASingleLine: Empty
+NamespaceIndentation: None
+

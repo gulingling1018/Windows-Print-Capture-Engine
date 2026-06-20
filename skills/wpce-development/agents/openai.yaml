@@ -1,0 +1,4 @@
+interface:
+  display_name: "WPCE Development"
+  short_description: "Implement WPCE C++20 modules with tests and Windows API care."
+  default_prompt: "Use $wpce-development to implement the next WPCE module according to the approved plan."

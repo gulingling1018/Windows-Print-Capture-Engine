@@ -1,0 +1,5 @@
+interface:
+  display_name: "WPCE QA"
+  short_description: "Verify WPCE print capture, stress, and stability."
+  default_prompt: "Use $wpce-qa to design verification for the current WPCE phase."
+

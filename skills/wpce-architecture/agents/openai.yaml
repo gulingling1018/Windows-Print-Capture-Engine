@@ -1,0 +1,5 @@
+interface:
+  display_name: "WPCE Architecture"
+  short_description: "Design WPCE architecture and print-pipeline tradeoffs."
+  default_prompt: "Use $wpce-architecture to review WPCE architecture feasibility and update the technical plan."
+

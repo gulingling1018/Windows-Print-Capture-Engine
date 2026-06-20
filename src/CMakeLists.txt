@@ -1,0 +1,89 @@
+add_library(wpce_core
+  collector/metadata_collector.cpp
+  common/build_info.cpp
+  core/data_contracts.cpp
+  storage/job_snapshot_writer.cpp
+  storage/json_serializer.cpp
+  storage/page_artifact_writer.cpp
+  storage/xml_serializer.cpp
+  watcher/print_watcher.cpp
+)
+
+target_include_directories(wpce_core
+  PUBLIC
+    ${PROJECT_SOURCE_DIR}/src
+    ${PROJECT_BINARY_DIR}/generated
+)
+
+target_compile_features(wpce_core PUBLIC cxx_std_20)
+
+if(WIN32)
+  target_compile_definitions(wpce_core PUBLIC WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_link_libraries(wpce_core PRIVATE Winspool.lib)
+endif()
+
+if(MSVC)
+  target_compile_options(wpce_core PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
+else()
+  target_compile_options(wpce_core PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+add_executable(wpce app/main.cpp)
+target_link_libraries(wpce PRIVATE wpce_core)
+
+if(MSVC)
+  target_compile_options(wpce PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
+else()
+  target_compile_options(wpce PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ── XPS Capture Filter DLL (Phase 3-4) ──────────────────────────────────
+
+add_library(wpce_xps_filter SHARED
+  filter/filter_entry.cpp
+  filter/filter_guid.cpp
+  filter/filter_pipeline.cpp
+  filter/print_ticket_extractor.cpp
+  filter/wpce_xps_filter.def
+)
+
+target_include_directories(wpce_xps_filter
+  PRIVATE
+    ${PROJECT_SOURCE_DIR}/src
+)
+
+target_compile_features(wpce_xps_filter PRIVATE cxx_std_20)
+
+if(WIN32)
+  target_compile_definitions(wpce_xps_filter PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_link_libraries(wpce_xps_filter PRIVATE wpce_core xpsprint.lib)
+endif()
+
+if(MSVC)
+  target_compile_options(wpce_xps_filter PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
+else()
+  target_compile_options(wpce_xps_filter PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+# ── Filter test harness ─────────────────────────────────────────────────
+
+add_executable(filter_test_harness
+  ${PROJECT_SOURCE_DIR}/tools/filter_test_harness.cpp
+)
+
+target_include_directories(filter_test_harness PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+)
+
+target_compile_features(filter_test_harness PRIVATE cxx_std_20)
+
+if(WIN32)
+  target_compile_definitions(filter_test_harness PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+  target_link_libraries(filter_test_harness PRIVATE xpsprint.lib)
+endif()
+
+if(MSVC)
+  target_compile_options(filter_test_harness PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
+else()
+  target_compile_options(filter_test_harness PRIVATE -Wall -Wextra -Wpedantic)
+endif()
