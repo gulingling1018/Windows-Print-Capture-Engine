@@ -4,12 +4,35 @@
 #include "storage/json_serializer.h"
 
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace wpce::storage
 {
 namespace
 {
+
+std::string safe_filename_token(std::string value)
+{
+  if (value.empty())
+  {
+    return "unknown-printer";
+  }
+
+  for (char& ch : value)
+  {
+    const bool keep =
+      (ch >= 'a' && ch <= 'z') ||
+      (ch >= 'A' && ch <= 'Z') ||
+      (ch >= '0' && ch <= '9') ||
+      ch == '-' || ch == '_';
+    if (!keep)
+    {
+      ch = '_';
+    }
+  }
+  return value;
+}
 
 void persist_payload_files(const PageArtifactWriterConfig& config, const PageArtifactPayload& payload)
 {
@@ -57,8 +80,10 @@ std::filesystem::path page_artifact_archive_path(
   const PageArtifactWriterConfig& config,
   const core::PageArtifactIndex& index)
 {
+  const std::string printer = safe_filename_token(index.printer_name);
   std::ostringstream name;
-  name << "page-j" << index.job_id
+  name << "page-" << printer
+       << "-j" << index.job_id
        << "-d" << index.document_sequence
        << "-p" << index.page_sequence << ".json";
   return config.output_directory / "pages" / name.str();

@@ -30,9 +30,7 @@ QFrame* makeStatCard(const QString& caption, const QString& icon, QLabel* value)
   header->addStretch();
 
   if (value->objectName().isEmpty())
-  {
     value->setObjectName(QStringLiteral("MetricValue"));
-  }
   value->setTextInteractionFlags(Qt::TextSelectableByMouse);
 
   layout->addLayout(header);
@@ -50,19 +48,19 @@ StatisticsPanel::StatisticsPanel(QWidget* parent) : QFrame(parent)
   layout->setContentsMargins(0, 0, 0, 0);
   layout->setSpacing(12);
 
-  jobCountValue_  = new QLabel(QStringLiteral("0"));
-  revenueValue_   = new QLabel(QStringLiteral("¥ 0.00"));
-  userCountValue_ = new QLabel(QStringLiteral("0"));
-  completionValue_ = new QLabel(QStringLiteral("0 / 0"));
+  jobCountValue_         = new QLabel(QStringLiteral("0"));
+  currentUserPriceValue_ = new QLabel(QStringLiteral("-"));
+  userCountValue_        = new QLabel(QStringLiteral("0"));
+  completionValue_       = new QLabel(QStringLiteral("0 / 0"));
 
   layout->addWidget(makeStatCard(QStringLiteral("今日作业"),
-                                  QStringLiteral("\xF0\x9F\x93\x84"), jobCountValue_));
-  layout->addWidget(makeStatCard(QStringLiteral("今日营收"),
-                                  QStringLiteral("\xF0\x9F\x92\xB0"), revenueValue_));
+                                  QStringLiteral("📄"), jobCountValue_));
+  layout->addWidget(makeStatCard(QStringLiteral("当前用户金额"),
+                                  QStringLiteral("💰"), currentUserPriceValue_));
   layout->addWidget(makeStatCard(QStringLiteral("活跃用户"),
-                                  QStringLiteral("\xF0\x9F\x91\xA5"), userCountValue_));
+                                  QStringLiteral("👥"), userCountValue_));
   layout->addWidget(makeStatCard(QStringLiteral("完成/进行中"),
-                                  QStringLiteral("\xE2\x9C\x85"), completionValue_));
+                                  QStringLiteral("✅"), completionValue_));
 }
 
 void StatisticsPanel::refresh(const UserTaskModel* taskModel)
@@ -70,20 +68,29 @@ void StatisticsPanel::refresh(const UserTaskModel* taskModel)
   if (taskModel == nullptr)
   {
     jobCountValue_->setText(QStringLiteral("0"));
-    revenueValue_->setText(QStringLiteral("¥ 0.00"));
     userCountValue_->setText(QStringLiteral("0"));
     completionValue_->setText(QStringLiteral("0 / 0"));
     return;
   }
 
   jobCountValue_->setText(QString::number(taskModel->todayJobCount()));
-  revenueValue_->setText(QStringLiteral("¥ %1").arg(taskModel->todayRevenue(), 0, 'f', 2));
 
   const int active  = taskModel->activeUserCount();
   const int completed = taskModel->completedTaskCount();
   const int total = active + completed;
   userCountValue_->setText(QString::number(total));
   completionValue_->setText(QStringLiteral("%1 / %2").arg(completed).arg(total));
+}
+
+void StatisticsPanel::setCurrentUserPrice(const QString& userName, double price)
+{
+  if (userName.isEmpty() || price <= 0.0)
+  {
+    currentUserPriceValue_->setText(QStringLiteral("-"));
+    return;
+  }
+  currentUserPriceValue_->setText(
+    QStringLiteral("%1  ¥%2").arg(userName).arg(price, 0, 'f', 2));
 }
 
 }  // namespace wpce::ui

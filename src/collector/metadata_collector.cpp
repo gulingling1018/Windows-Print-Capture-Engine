@@ -162,6 +162,24 @@ core::FieldValue make_unknown(std::int16_t raw_value)
   return core::FieldValue{std::to_string(raw_value), core::FieldState::Unknown};
 }
 
+std::string to_utf8(const wchar_t* value)
+{
+  if (value == nullptr || value[0] == L'\0')
+  {
+    return {};
+  }
+
+  const int size = WideCharToMultiByte(CP_UTF8, 0, value, -1, nullptr, 0, nullptr, nullptr);
+  if (size <= 1)
+  {
+    return {};
+  }
+
+  std::string result(static_cast<std::size_t>(size) - 1, '\0');
+  WideCharToMultiByte(CP_UTF8, 0, value, -1, result.data(), size, nullptr, nullptr);
+  return result;
+}
+
 bool has_dm_field(const DWORD dm_fields, const DWORD field_bit) noexcept
 {
   return (dm_fields & field_bit) != 0;
@@ -312,6 +330,42 @@ core::FieldValue extract_print_quality(const DEVMODEW& dm)
   return make_reported(std::string(name));
 }
 
+// ── Media type (DM_MEDIATYPE) — HP PCL6 / Canon UFR II common field ──
+
+std::string_view media_type_name(const DWORD dm_media_type) noexcept
+{
+  // DMMEDIA_* constants from wingdi.h.  Only the most common ones
+  // observed across HP, Canon, Brother, and Epson drivers.
+  switch (dm_media_type)
+  {
+    case DMMEDIA_STANDARD:      return "plain";
+    case DMMEDIA_TRANSPARENCY:  return "transparency";
+    case DMMEDIA_GLOSSY:        return "glossy";
+    default:
+    {
+      // Some drivers use custom media type IDs outside the standard enum.
+      if (dm_media_type > static_cast<DWORD>(DMMEDIA_USER))
+        return {};  // custom — report as Unknown with raw value
+      return {};
+    }
+  }
+}
+
+core::FieldValue extract_media_type(const DEVMODEW& dm)
+{
+  if (!has_dm_field(dm.dmFields, DM_MEDIATYPE))
+  {
+    return make_not_reported();
+  }
+  const std::string_view name = media_type_name(dm.dmMediaType);
+  if (name.empty())
+  {
+    // If the value is above DMMEDIA_USER, treat as vendor-specific.
+    return make_unknown(static_cast<std::int16_t>(dm.dmMediaType));
+  }
+  return make_reported(std::string(name));
+}
+
 }  // namespace
 
 // ── Public name mappers ──────────────────────────────────────────────────
@@ -335,9 +389,9 @@ std::string_view duplex_name(const std::int16_t dm_duplex) noexcept
     case DMDUP_SIMPLEX:
       return "simplex";
     case DMDUP_VERTICAL:
-      return "vertical";
+      return "long-edge (book)";
     case DMDUP_HORIZONTAL:
-      return "horizontal";
+      return "short-edge (calendar)";
     default:
       return {};
   }
@@ -415,12 +469,24 @@ std::string_view print_quality_name(const std::int16_t dm_print_quality) noexcep
       return "low";
     case DMRES_DRAFT:
       return "draft";
+    // Canon / Epson / Brother drivers often report positive DPI values
+    // (300, 600, 1200, 2400) instead of the DMRES_* categories.
+    // Common DPI values used by printer drivers — map to readable names.
+    case 300:
+      return "300 dpi";
+    case 600:
+      return "600 dpi";
+    case 1200:
+      return "1200 dpi";
+    case 2400:
+      return "2400 dpi";
+    case 4800:
+      return "4800 dpi";
     default:
     {
-      // dmPrintQuality can also be a positive DPI value.
+      // Any other positive value = custom DPI.
       if (dm_print_quality > 0)
       {
-        // Return empty to signal Unknown with raw value.
         return {};
       }
       return {};
@@ -436,6 +502,7 @@ core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
   core::MetadataSnapshot snapshot;
   snapshot.schema_version = 1;
   snapshot.job_id = job.JobId;
+  snapshot.printer_name = to_utf8(job.pPrinterName);
 
   // Job-level fields always available from JOB_INFO_2W.
   snapshot.total_pages = extract_total_pages(job);
@@ -453,6 +520,7 @@ core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
     snapshot.n_up = make_not_reported();
     snapshot.collate = make_not_reported();
     snapshot.print_quality = make_not_reported();
+    snapshot.media_type = make_not_reported();
     return snapshot;
   }
 
@@ -471,9 +539,11 @@ core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
   snapshot.n_up = extract_n_up(*dm);
   snapshot.collate = extract_collate(*dm);
   snapshot.print_quality = extract_print_quality(*dm);
+  snapshot.media_type = extract_media_type(*dm);
 
   return snapshot;
 }
+
 #endif
 
 }  // namespace wpce::collector

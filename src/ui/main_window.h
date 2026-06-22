@@ -1,28 +1,29 @@
 #pragma once
 
+#include "common/app_config.h"
+
+#include <QDateTime>
+#include <QHash>
 #include <QLabel>
 #include <QMainWindow>
 #include <QPushButton>
 #include <QSplitter>
 #include <QStatusBar>
-#include <QTableView>
 #include <QTimer>
+#include <QTreeView>
 
-class QComboBox;
 class QLineEdit;
-class QSortFilterProxyModel;
+class QResizeEvent;
 class QStackedWidget;
 
 namespace wpce::ui
 {
 
 class WatcherBridge;
-class JobTableModel;
+class UserGroupModel;
 class JobDetailPanel;
-class LifecycleTimeline;
-class StatisticsPanel;
+class ReceiptPreviewPanel;
 class UserTaskModel;
-class UserTaskPanel;
 
 class MainWindow : public QMainWindow
 {
@@ -32,13 +33,20 @@ class MainWindow : public QMainWindow
   explicit MainWindow(QWidget* parent = nullptr);
   ~MainWindow() override;
 
+ protected:
+  void resizeEvent(QResizeEvent* event) override;
+
  private slots:
   void onStartClicked();
   void onStopClicked();
   void onOpenOutputClicked();
-  void onTableSelectionChanged();
+  void onSettingsClicked();
+  void onCompleteClicked();
+  void onTreeSelectionChanged();
   void onPrinterSkipped(const QString& printerName);
-  void onJobCountChanged();
+  void onWatcherHeartbeat(const QString& printerName);
+  void onUserCompleted(const QString& userId);
+  void checkStalePrinters();
 
  private:
   void autoStart();
@@ -46,15 +54,24 @@ class MainWindow : public QMainWindow
   void updatePrinterLabel();
   void refreshSummaryCards();
   void refreshEmptyState();
-  void refreshSelectedJob();
-  void selectFirstVisibleRow();
-  void refreshTaskPanels();
+  void refreshSelectedDetail();
+  void refreshGroupRowSpans();
+  void selectFirstIncompleteUser();
+  void refreshReceiptPanel();
+  void applySearchFilter();
+  void scheduleWorkspaceRebalance();
+  void rebalanceWorkspaceSplitters();
+  void loadOrCreateConfig();
+  void applyConfig();
+  QString resolveOutputRoot() const;
+
+  common::AppConfig config_;
 
   WatcherBridge* bridge_ = nullptr;
 
   QLabel* sessionStateLabel_ = nullptr;
   QLabel* printerCountLabel_ = nullptr;
-  QLabel* jobCountLabel_ = nullptr;
+  QLabel* userCountLabel_ = nullptr;
   QLabel* outputDirLabel_ = nullptr;
   QLabel* resultCountLabel_ = nullptr;
   QLabel* emptyStateLabel_ = nullptr;
@@ -62,21 +79,27 @@ class MainWindow : public QMainWindow
   QPushButton* startBtn_ = nullptr;
   QPushButton* stopBtn_ = nullptr;
   QPushButton* openOutputBtn_ = nullptr;
+  QPushButton* settingsBtn_ = nullptr;
   QPushButton* clearFilterBtn_ = nullptr;
+  QPushButton* expandAllBtn_ = nullptr;
+  QPushButton* collapseAllBtn_ = nullptr;
+  QPushButton* completeUserBtn_ = nullptr;
 
   QLineEdit* searchEdit_ = nullptr;
-  QComboBox* phaseFilter_ = nullptr;
 
-  QTableView* tableView_ = nullptr;
+  QTreeView* treeView_ = nullptr;
   QStackedWidget* tableStack_ = nullptr;
-  JobTableModel* tableModel_ = nullptr;
-  QSortFilterProxyModel* jobProxy_ = nullptr;
+  UserGroupModel* groupModel_ = nullptr;
   JobDetailPanel* detailPanel_ = nullptr;
-  LifecycleTimeline* timeline_ = nullptr;
+  QSplitter* workspaceSplitter_ = nullptr;
+  QSplitter* verticalSplitter_ = nullptr;
+  bool splitterRebalancePending_ = false;
 
-  StatisticsPanel* statisticsPanel_ = nullptr;
   UserTaskModel* userTaskModel_ = nullptr;
-  UserTaskPanel* userTaskPanel_ = nullptr;
+  ReceiptPreviewPanel* receiptPanel_ = nullptr;
+
+  QHash<QString, QDateTime> printerHeartbeats_;
+  QTimer* heartbeatCheckTimer_ = nullptr;
 
   QString lastOutputDir_;
 };

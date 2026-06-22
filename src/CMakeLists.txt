@@ -1,14 +1,19 @@
 add_library(wpce_core
   collector/metadata_collector.cpp
+  common/app_config.cpp
   common/build_info.cpp
+  common/logger.cpp
   core/data_contracts.cpp
   core/perf_monitor.cpp
+  ipc/named_event.cpp
   storage/file_utils.cpp
   storage/job_snapshot_writer.cpp
   storage/json_serializer.cpp
   storage/page_artifact_writer.cpp
   storage/xml_serializer.cpp
   watcher/print_watcher.cpp
+  parser/print_ticket_parser.cpp
+  bridge/metadata_merger.cpp
 )
 
 target_include_directories(wpce_core

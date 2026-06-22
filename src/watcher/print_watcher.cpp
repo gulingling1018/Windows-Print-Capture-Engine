@@ -228,12 +228,16 @@ class ChangeNotificationHandle
   }
 
  private:
-  std::array<WORD, 5> job_fields_{
+  std::array<WORD, 9> job_fields_{
     JOB_NOTIFY_FIELD_PRINTER_NAME,
     JOB_NOTIFY_FIELD_USER_NAME,
     JOB_NOTIFY_FIELD_STATUS,
     JOB_NOTIFY_FIELD_DOCUMENT,
     JOB_NOTIFY_FIELD_SUBMITTED,
+    JOB_NOTIFY_FIELD_TOTAL_PAGES,
+    JOB_NOTIFY_FIELD_PAGES_PRINTED,
+    JOB_NOTIFY_FIELD_TOTAL_BYTES,
+    JOB_NOTIFY_FIELD_TIME,
   };
   PRINTER_NOTIFY_OPTIONS_TYPE job_notify_type_{};
   PRINTER_NOTIFY_OPTIONS options_{};
@@ -338,6 +342,7 @@ core::JobSnapshot to_snapshot(const JOB_INFO_2W& job)
     .printer_name = to_utf8(job.pPrinterName),
     .submit_time_utc = format_system_time_utc(job.Submitted),
     .status = describe_job_status(job.Status),
+    .raw_status_flags = job.Status,
     .source = "winspool",
   };
 }
@@ -363,7 +368,25 @@ std::optional<JobSnapshotWithMetadata> get_job_snapshot_by_id(HANDLE printer, co
   }
 
   const auto* job = reinterpret_cast<const JOB_INFO_2W*>(buffer.data());
-  return JobSnapshotWithMetadata{.job = to_snapshot(*job), .metadata = collector::extract_metadata(*job)};
+  core::MetadataSnapshot metadata = collector::extract_metadata(*job);
+
+  // NOTE: We intentionally do NOT call DocumentPropertiesW here.
+  // DocumentPropertiesW returns the printer's CURRENT DEFAULT DEVMODE,
+  // NOT the per-job settings that the application sent.  For v4 drivers
+  // (Windows 10/11 default), pDevMode is always NULL and all settings
+  // are carried via PrintTicket XML — which is captured by the XPS
+  // filter DLL (wpce_xps_filter) in the pipeline, not here.
+  //
+  // For GDI (Type 3) drivers, JOB_INFO_2W::pDevMode IS the correct
+  // per-job DEVMODE and extract_metadata() uses it directly.
+  //
+  // The only reliable approach for v4 drivers:
+  //   1. wpce_xps_filter.dll intercepts PrintTicket XML per job
+  //   2. The PrintTicket parser converts it to MetadataSnapshot
+  //   3. MetadataMerger combines filter data with spooler lifecycle data
+  // See src/parser/print_ticket_parser.h for details.
+
+  return JobSnapshotWithMetadata{.job = to_snapshot(*job), .metadata = std::move(metadata)};
 }
 
 struct JobNotificationSnapshot
@@ -375,6 +398,9 @@ struct JobNotificationSnapshot
   std::string submit_time_utc;
   std::string status;
   bool has_field_data{false};
+  std::int32_t pages_printed{-1};
+  std::int32_t total_pages{-1};
+  std::uint32_t total_bytes{0};
 };
 
 bool has_job_change_flags(const DWORD change_flags) noexcept
@@ -429,6 +455,20 @@ void apply_job_notification_field(JobNotificationSnapshot& snapshot, const PRINT
         const auto* submitted = static_cast<const SYSTEMTIME*>(data.NotifyData.Data.pBuf);
         snapshot.submit_time_utc = format_system_time_utc(*submitted);
       }
+      break;
+    case JOB_NOTIFY_FIELD_TOTAL_PAGES:
+      snapshot.total_pages = static_cast<std::int32_t>(data.NotifyData.adwData[0]);
+      break;
+    case JOB_NOTIFY_FIELD_PAGES_PRINTED:
+      snapshot.pages_printed = static_cast<std::int32_t>(data.NotifyData.adwData[0]);
+      break;
+    case JOB_NOTIFY_FIELD_TOTAL_BYTES:
+      snapshot.total_bytes = data.NotifyData.adwData[0];
+      break;
+    case JOB_NOTIFY_FIELD_TIME:
+      // JOB_NOTIFY_FIELD_TIME — stored in adwData as a SYSTEMTIME or FILETIME.
+      // We capture this information via the submitted field above; time is kept
+      // for diagnostic purposes only.
       break;
     default:
       break;
@@ -555,13 +595,6 @@ core::JobLifecycleEvent make_lifecycle_event(std::uint32_t job_id,
   return event;
 }
 
-bool is_active_phase(const core::JobLifecyclePhase phase) noexcept
-{
-  return phase == core::JobLifecyclePhase::Accepted ||
-         phase == core::JobLifecyclePhase::Spooling ||
-         phase == core::JobLifecyclePhase::Printing;
-}
-
 #endif
 
 }  // namespace
@@ -618,6 +651,18 @@ core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
     return core::JobLifecyclePhase::Completed;
 #endif
 
+  // ── Multi-flag completion: some brands report PRINTING|PRINTED ─────────
+  // HP LaserJet & many PCL6 drivers emit PRINTING | PRINTED simultaneously.
+  // Treat this as Completed to avoid missing the terminal transition on
+  // fast printers where the job disappears before the next notification cycle.
+#ifdef JOB_STATUS_PRINTING
+#ifdef JOB_STATUS_PRINTED
+  if (has_all_status_bits(status_flags, JOB_STATUS_PRINTING) &&
+      has_all_status_bits(status_flags, JOB_STATUS_PRINTED))
+    return core::JobLifecyclePhase::Completed;
+#endif
+#endif
+
   // Active / in-progress states.
 #ifdef JOB_STATUS_PRINTING
   if (has_all_status_bits(status_flags, JOB_STATUS_PRINTING))
@@ -630,6 +675,8 @@ core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
 #endif
 
 #ifdef JOB_STATUS_RENDERING_LOCALLY
+  // Epson ESC/P-R and Canon UFR II v4 drivers use RENDERING_LOCALLY
+  // instead of SPOOLING.  Treat as spooling-equivalent.
   if (has_all_status_bits(status_flags, JOB_STATUS_RENDERING_LOCALLY))
     return core::JobLifecyclePhase::Spooling;
 #endif
@@ -649,6 +696,21 @@ core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
 #endif
 
   return core::JobLifecyclePhase::Unknown;
+}
+
+bool should_preserve_transient_unknown_status(
+  const core::JobLifecyclePhase current_phase,
+  const bool has_prior_events) noexcept
+{
+  if (!has_prior_events)
+  {
+    return false;
+  }
+
+  return current_phase == core::JobLifecyclePhase::Accepted ||
+         current_phase == core::JobLifecyclePhase::Spooling ||
+         current_phase == core::JobLifecyclePhase::Printing ||
+         current_phase == core::JobLifecyclePhase::Stalled;
 }
 
 std::string describe_job_status(const std::uint32_t status_flags)
@@ -888,6 +950,15 @@ void PrintWatcher::run()
 {
   std::unordered_map<std::uint32_t, std::string> emitted_signatures;
   std::unordered_map<std::uint32_t, core::JobSnapshot> known_snapshots;
+  std::unordered_map<std::uint32_t, core::MetadataSnapshot> known_metadata;
+
+  // ── Logging helper ────────────────────────────────────────────────────
+  const auto log = [&](LogLevel level, std::string_view category, std::string message) {
+    if (config_.log_callback)
+    {
+      config_.log_callback(level, category, std::move(message));
+    }
+  };
 
   // ── Lifecycle tracking helpers ───────────────────────────────────────
 
@@ -992,6 +1063,15 @@ void PrintWatcher::run()
     if (is_terminal_phase(phase))
     {
       state.last_progress_time = std::chrono::steady_clock::now();  // stop stall clock
+
+      // Remove from dedup maps so that recycled JobIds don't collide with stale entries.
+      log(LogLevel::Debug, "cache",
+          "Job " + std::to_string(state.summary.job_id) +
+          ": terminal phase \"" + std::string(core::to_string(phase)) +
+          "\", removed from dedup maps");
+      emitted_signatures.erase(state.summary.job_id);
+      known_snapshots.erase(state.summary.job_id);
+      known_metadata.erase(state.summary.job_id);
     }
     else
     {
@@ -1014,12 +1094,10 @@ void PrintWatcher::run()
       snapshot.printer_name, snapshot.submit_time_utc);
 
 #ifdef _WIN32
-    // Determine phase from the status string by re-deriving flags.
-    // We need the raw status flags. Get them via a direct lookup.
-    // For now, classify using the status string as a hint.
-    // The watcher already gets raw flags from GetJobW but to_snapshot()
-    // discards them.  We'll rely on the phase classifier + status string.
-    core::JobLifecyclePhase new_phase = classify_phase(0, snapshot.status);
+    // Classify the phase using raw JOB_STATUS flags carried through the snapshot.
+    // The string-based fallback below handles cases where flags are zero (e.g.
+    // notification-only stubs from fast printers).
+    core::JobLifecyclePhase new_phase = classify_phase(snapshot.raw_status_flags, snapshot.status);
     // Fallback: if classify_phase returned Unknown, try to infer from status string.
     if (new_phase == core::JobLifecyclePhase::Unknown &&
         !snapshot.status.empty() && snapshot.status != "unknown")
@@ -1063,14 +1141,33 @@ void PrintWatcher::run()
     core::JobLifecyclePhase new_phase = core::JobLifecyclePhase::Unknown;
 #endif
 
-    // Some virtual and network-like printers briefly report zero status flags
-    // while the job is still queued. Preserve the last active phase so stall
-    // detection can fire instead of losing the job to an "unknown" terminal-ish
-    // state.
+    // ── Brand-specific: Kyocera / Ricoh / Sharp drivers ───────────────────
+    // These drivers often report zero status flags on the very first
+    // notification (or on the first EnumJobs scan).  Without this, the
+    // job's first event is suppressed at line 996-998 and no Accepted
+    // event fires — the job remains invisible until a later poll.
     if (new_phase == core::JobLifecyclePhase::Unknown &&
-        is_active_phase(state.current_phase) &&
-        !state.summary.events.empty())
+        state.summary.events.empty())
     {
+      log(LogLevel::Info, "phase",
+          "Job " + std::to_string(job_id) +
+          ": new job with status_flags=0 → emitting Accepted (brand compat)");
+      new_phase = core::JobLifecyclePhase::Accepted;
+    }
+
+    // Some virtual and network-like printers briefly report zero status flags
+    // while the job is already running or stalled. Preserve the last observed
+    // non-terminal phase so a weak "unknown" update does not erase the useful
+    // lifecycle state.
+    if (new_phase == core::JobLifecyclePhase::Unknown &&
+        should_preserve_transient_unknown_status(
+          state.current_phase, !state.summary.events.empty()))
+    {
+      log(LogLevel::Debug, "phase",
+          "Job " + std::to_string(job_id) +
+          ": preserving last observed phase \"" +
+          std::string(core::to_string(state.current_phase)) +
+          "\" (raw_status_flags=0)");
       new_phase = state.current_phase;
     }
 
@@ -1088,6 +1185,12 @@ void PrintWatcher::run()
       if (pages_printed_val != prev_printed || total_pages_val != prev_total)
       {
         // Progress changed — emit an update as the current phase.
+        log(LogLevel::Debug, "phase",
+            "Job " + std::to_string(job_id) +
+            ": progress changed " + std::to_string(prev_printed) + "/" +
+            std::to_string(prev_total) + " -> " +
+            std::to_string(pages_printed_val) + "/" +
+            std::to_string(total_pages_val) + ", emitting update");
         emit_lifecycle_event(state, new_phase, snapshot.status, pages_printed_val, total_pages_val);
       }
       return;
@@ -1097,7 +1200,26 @@ void PrintWatcher::run()
     // Stalled is NOT terminal — it can recover when real progress arrives.
     if (is_terminal_phase(state.current_phase) && !state.summary.events.empty())
     {
+      log(LogLevel::Debug, "phase",
+          "Job " + std::to_string(job_id) +
+          ": already terminal \"" +
+          std::string(core::to_string(state.current_phase)) +
+          "\", suppressing new event");
       return;
+    }
+
+    // Log phase transition for non-duplicate, non-terminal events.
+    {
+      std::ostringstream phase_detail;
+      phase_detail << "Job " << job_id << ": 0x"
+                   << std::hex << snapshot.raw_status_flags << std::dec
+                   << " -> \"" << core::to_string(new_phase) << "\"";
+      if (new_phase != state.current_phase && state.current_phase != core::JobLifecyclePhase::Unknown)
+      {
+        phase_detail << " (transition from \"" << core::to_string(state.current_phase) << "\")";
+      }
+      log(new_phase == core::JobLifecyclePhase::Unknown ? LogLevel::Warn : LogLevel::Info,
+          "phase", phase_detail.str());
     }
 
     int pages_printed_val = 0;
@@ -1108,7 +1230,7 @@ void PrintWatcher::run()
     emit_lifecycle_event(state, new_phase, snapshot.status, pages_printed_val, total_pages_val);
   };
 
-  // ── Snapshot emission (existing dedup logic) ──────────────────────────
+  // ── Snapshot emission ─────────────────────────────────────────────────
 
   const auto emit_snapshot = [&](const core::JobSnapshot& snapshot, const core::MetadataSnapshot& metadata) {
     if (snapshot.job_id == 0)
@@ -1123,23 +1245,55 @@ void PrintWatcher::run()
     auto existing = emitted_signatures.find(snapshot.job_id);
     if (existing == emitted_signatures.end() || existing->second != signature)
     {
+      if (existing != emitted_signatures.end())
+      {
+        log(LogLevel::Debug, "dedup",
+            "Job " + std::to_string(snapshot.job_id) +
+            ": signature changed, emitting snapshot");
+      }
       emitted_signatures[snapshot.job_id] = signature;
       known_snapshots[snapshot.job_id] = snapshot;
+      known_metadata[snapshot.job_id] = metadata;   // cache for GetJobW-failure recovery
       job_callback_(snapshot);
       if (metadata_callback_)
       {
         metadata_callback_(metadata);
       }
     }
+    else if (metadata_callback_)
+    {
+      // Metadata (pages_printed, copies, color, paper, etc.) can change
+      // even when the job-level signature is unchanged.  Always forward
+      // fresh metadata so the UI reflects the latest driver state.
+      known_metadata[snapshot.job_id] = metadata;   // refresh cache
+      metadata_callback_(metadata);
+    }
   };
 
   // Build a minimal metadata snapshot for notification-only fallback paths.
-  const auto make_metadata_stub = [](std::uint32_t job_id) {
+  // When notification-carried page counts are available they are used;
+  // otherwise fields are marked NotReported.
+  const auto make_metadata_stub = [](std::uint32_t job_id,
+                                      const JobNotificationSnapshot& notification) {
     core::MetadataSnapshot stub;
     stub.schema_version = 1;
     stub.job_id = job_id;
-    stub.total_pages = core::FieldValue{{}, core::FieldState::NotReported};
-    stub.pages_printed = core::FieldValue{{}, core::FieldState::NotReported};
+    if (notification.total_pages >= 0)
+    {
+      stub.total_pages = core::FieldValue{std::to_string(notification.total_pages), core::FieldState::Reported};
+    }
+    else
+    {
+      stub.total_pages = core::FieldValue{{}, core::FieldState::NotReported};
+    }
+    if (notification.pages_printed >= 0)
+    {
+      stub.pages_printed = core::FieldValue{std::to_string(notification.pages_printed), core::FieldState::Reported};
+    }
+    else
+    {
+      stub.pages_printed = core::FieldValue{{}, core::FieldState::NotReported};
+    }
     stub.copies = core::FieldValue{{}, core::FieldState::NotReported};
     stub.duplex = core::FieldValue{{}, core::FieldState::NotReported};
     stub.color = core::FieldValue{{}, core::FieldState::NotReported};
@@ -1148,11 +1302,19 @@ void PrintWatcher::run()
     stub.n_up = core::FieldValue{{}, core::FieldState::NotReported};
     stub.collate = core::FieldValue{{}, core::FieldState::NotReported};
     stub.print_quality = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.media_type = core::FieldValue{{}, core::FieldState::NotReported};
+    stub.page_range = core::FieldValue{{}, core::FieldState::NotReported};
     return stub;
   };
 
   const auto emit_changed_jobs = [&]() {
-    for (const JobSnapshotWithMetadata& entry : enumerate_printer_jobs(config_.printer_name))
+    const auto jobs = enumerate_printer_jobs(config_.printer_name);
+    if (!jobs.empty())
+    {
+      log(LogLevel::Debug, "rescan",
+          "EnumJobs returned " + std::to_string(jobs.size()) + " job(s)");
+    }
+    for (const JobSnapshotWithMetadata& entry : jobs)
     {
       emit_snapshot(entry.job, entry.metadata);
     }
@@ -1165,14 +1327,32 @@ void PrintWatcher::run()
 #ifdef _WIN32
     PrinterHandle printer(config_.printer_name);
     ChangeNotificationHandle notification(printer.get());
-    const std::string configured_printer_name = to_utf8(config_.printer_name.c_str());
+    const std::string configured_printer_name = to_utf8(const_cast<LPWSTR>(config_.printer_name.c_str()));
+
+    log(LogLevel::Info, "init",
+        "Printer \"" + configured_printer_name + "\" opened, change notification registered");
 
     emit_changed_jobs();
 
     auto last_stall_check = std::chrono::steady_clock::now();
+    auto last_rescan = std::chrono::steady_clock::now();
 
     while (!stop_requested_)
     {
+      // ── Periodic full rescan — safety net for spoolers that drop notifications ──
+      if (config_.rescan_interval.count() > 0)
+      {
+        const auto now = std::chrono::steady_clock::now();
+        if (now - last_rescan > config_.rescan_interval)
+        {
+          log(LogLevel::Info, "rescan",
+              "Periodic rescan triggered (interval=" +
+              std::to_string(config_.rescan_interval.count()) + "s)");
+          emit_changed_jobs();
+          last_rescan = now;
+        }
+      }
+
       const DWORD wait_result =
         WaitForSingleObject(notification.get(), static_cast<DWORD>(config_.wait_timeout.count()));
       if (wait_result == WAIT_TIMEOUT)
@@ -1204,24 +1384,87 @@ void PrintWatcher::run()
       const std::vector<JobNotificationSnapshot> job_notifications =
         parse_job_notifications(info.get(), change_flags);
 
+      if (!job_notifications.empty())
+      {
+        std::ostringstream notify_detail;
+        notify_detail << "Notification fired, change_flags=0x"
+                      << std::hex << change_flags << std::dec
+                      << ", " << job_notifications.size() << " job(s)";
+        log(LogLevel::Debug, "notify", notify_detail.str());
+      }
+
       for (const JobNotificationSnapshot& job_notification : job_notifications)
       {
         if (const std::optional<JobSnapshotWithMetadata> current =
               get_job_snapshot_by_id(printer.get(), job_notification.job_id);
             current.has_value())
         {
+          log(LogLevel::Debug, "getjob",
+              "Job " + std::to_string(job_notification.job_id) +
+              ": fetched JOB_INFO_2W (status=" + current->job.status +
+              ", pages=" + current->metadata.pages_printed.value + "/" +
+              current->metadata.total_pages.value + ")");
           emit_snapshot(current->job, current->metadata);
         }
         else
         {
+          const bool had_known = known_snapshots.find(job_notification.job_id) != known_snapshots.end();
+          log(LogLevel::Debug, "getjob",
+              "Job " + std::to_string(job_notification.job_id) +
+              ": GetJobW failed, using notification-only stub (known_snapshot=" +
+              (had_known ? "yes" : "no") + ")");
+
+          // ── Recover from metadata cache ─────────────────────────────
+          // When GetJobW fails (job already deleted from spooler), we
+          // lose pDevMode.  Recover previously-cached DEVMODE fields so
+          // the UI does not flash all-N/A then recover on the next
+          // PrintTicket merge.
+          auto metadata = make_metadata_stub(job_notification.job_id, job_notification);
+          {
+            auto cached = known_metadata.find(job_notification.job_id);
+            if (cached != known_metadata.end())
+            {
+              // Overlay cached field values — notification carries
+              // pages_printed / total_pages which are fresher.
+              auto copy_if_reported = [&](core::FieldValue& dst,
+                                          const core::FieldValue& src) {
+                if (src.state == core::FieldState::Reported &&
+                    dst.state != core::FieldState::Reported)
+                  dst = src;
+              };
+              copy_if_reported(metadata.copies,         cached->second.copies);
+              copy_if_reported(metadata.duplex,         cached->second.duplex);
+              copy_if_reported(metadata.color,          cached->second.color);
+              copy_if_reported(metadata.paper_size,     cached->second.paper_size);
+              copy_if_reported(metadata.orientation,    cached->second.orientation);
+              copy_if_reported(metadata.n_up,           cached->second.n_up);
+              copy_if_reported(metadata.collate,        cached->second.collate);
+              copy_if_reported(metadata.print_quality,  cached->second.print_quality);
+              copy_if_reported(metadata.media_type,     cached->second.media_type);
+              copy_if_reported(metadata.page_range,      cached->second.page_range);
+              if (!cached->second.dm_fields_hex.empty())
+                metadata.dm_fields_hex = cached->second.dm_fields_hex;
+
+              log(LogLevel::Debug, "getjob",
+                  "Job " + std::to_string(job_notification.job_id) +
+                  ": recovered " + std::to_string(
+                    (metadata.copies.state == core::FieldState::Reported ? 1 : 0) +
+                    (metadata.duplex.state == core::FieldState::Reported ? 1 : 0) +
+                    (metadata.color.state  == core::FieldState::Reported ? 1 : 0)) +
+                  " field(s) from metadata cache");
+            }
+          }
+
           const core::JobSnapshot stub_job = make_notification_only_snapshot(
             configured_printer_name, job_notification, known_snapshots);
-          emit_snapshot(stub_job, make_metadata_stub(stub_job.job_id));
+          emit_snapshot(stub_job, std::move(metadata));
         }
       }
 
       if (info.get() != nullptr && (info.get()->Flags & PRINTER_NOTIFY_INFO_DISCARDED) != 0)
       {
+        log(LogLevel::Warn, "notify",
+            "PRINTER_NOTIFY_INFO_DISCARDED flag set — requesting full refresh");
         PRINTER_NOTIFY_OPTIONS refresh_options{};
         refresh_options.Version = 2;
         refresh_options.Flags = PRINTER_NOTIFY_OPTIONS_REFRESH;
@@ -1247,9 +1490,26 @@ void PrintWatcher::run()
           }
           else
           {
+            auto refresh_meta = make_metadata_stub(job_notification.job_id, job_notification);
+            // Recover from metadata cache (same logic as the main path above).
+            if (auto cached = known_metadata.find(job_notification.job_id);
+                cached != known_metadata.end())
+            {
+              if (refresh_meta.copies.state != core::FieldState::Reported && cached->second.copies.state == core::FieldState::Reported) refresh_meta.copies = cached->second.copies;
+              if (refresh_meta.duplex.state != core::FieldState::Reported && cached->second.duplex.state == core::FieldState::Reported) refresh_meta.duplex = cached->second.duplex;
+              if (refresh_meta.color.state  != core::FieldState::Reported && cached->second.color.state  == core::FieldState::Reported) refresh_meta.color  = cached->second.color;
+              if (refresh_meta.paper_size.state != core::FieldState::Reported && cached->second.paper_size.state == core::FieldState::Reported) refresh_meta.paper_size = cached->second.paper_size;
+              if (refresh_meta.orientation.state != core::FieldState::Reported && cached->second.orientation.state == core::FieldState::Reported) refresh_meta.orientation = cached->second.orientation;
+              if (refresh_meta.n_up.state     != core::FieldState::Reported && cached->second.n_up.state     == core::FieldState::Reported) refresh_meta.n_up     = cached->second.n_up;
+              if (refresh_meta.collate.state  != core::FieldState::Reported && cached->second.collate.state  == core::FieldState::Reported) refresh_meta.collate  = cached->second.collate;
+              if (refresh_meta.print_quality.state != core::FieldState::Reported && cached->second.print_quality.state == core::FieldState::Reported) refresh_meta.print_quality = cached->second.print_quality;
+              if (refresh_meta.media_type.state != core::FieldState::Reported && cached->second.media_type.state == core::FieldState::Reported) refresh_meta.media_type = cached->second.media_type;
+              if (refresh_meta.page_range.state  != core::FieldState::Reported && cached->second.page_range.state  == core::FieldState::Reported) refresh_meta.page_range  = cached->second.page_range;
+              if (!cached->second.dm_fields_hex.empty()) refresh_meta.dm_fields_hex = cached->second.dm_fields_hex;
+            }
             const core::JobSnapshot stub_job = make_notification_only_snapshot(
               configured_printer_name, job_notification, known_snapshots);
-            emit_snapshot(stub_job, make_metadata_stub(stub_job.job_id));
+            emit_snapshot(stub_job, std::move(refresh_meta));
           }
         }
       }
@@ -1280,10 +1540,32 @@ void PrintWatcher::run()
   catch (const std::exception& error)
   {
     set_last_error(error.what());
+    if (config_.log_callback)
+    {
+      config_.log_callback(LogLevel::Error, "init",
+        "Watcher error: " + std::string(error.what()));
+    }
   }
   catch (...)
   {
     set_last_error("Unknown print watcher error");
+    if (config_.log_callback)
+    {
+      config_.log_callback(LogLevel::Error, "init", "Watcher error: unknown exception");
+    }
+  }
+
+  if (config_.log_callback)
+  {
+    std::string exit_msg = "Watcher thread exiting (stop_requested=";
+    exit_msg += (stop_requested_ ? "yes" : "no");
+    const std::string err = last_error();
+    if (!err.empty())
+    {
+      exit_msg += ", error=" + err;
+    }
+    exit_msg += ")";
+    config_.log_callback(LogLevel::Info, "init", exit_msg);
   }
 
   running_ = false;
@@ -1320,6 +1602,15 @@ void PrintWatcher::tick_stall_detection()
     const auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - state.last_progress_time);
     if (elapsed >= config_.stall_timeout && state.current_phase != core::JobLifecyclePhase::Unknown)
     {
+      if (config_.log_callback)
+      {
+        config_.log_callback(LogLevel::Warn, "stall",
+          "Job " + std::to_string(job_id) + ": stalled in phase \"" +
+          std::string(core::to_string(state.current_phase)) + "\" after " +
+          std::to_string(elapsed.count()) + "s (timeout=" +
+          std::to_string(config_.stall_timeout.count()) + "s)");
+      }
+
       const int pages_printed = state.summary.events.empty()
         ? 0
         : state.summary.events.back().pages_printed;

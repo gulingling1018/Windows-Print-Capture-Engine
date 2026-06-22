@@ -1,4 +1,6 @@
+#include "bridge/metadata_merger.h"
 #include "collector/metadata_collector.h"
+#include "common/app_config.h"
 #include "core/data_contracts.h"
 #include "storage/job_snapshot_writer.h"
 #include "storage/json_serializer.h"
@@ -70,6 +72,7 @@ TEST(Serialization, MetadataState)
 {
   wpce::core::MetadataSnapshot snapshot;
   snapshot.job_id = 42;
+  snapshot.printer_name = "Microsoft Print to PDF";
   snapshot.total_pages = {.value = "5", .state = wpce::core::FieldState::Reported};
   snapshot.pages_printed = {.value = "0", .state = wpce::core::FieldState::Reported};
   snapshot.copies = {.value = "1", .state = wpce::core::FieldState::Reported};
@@ -83,6 +86,7 @@ TEST(Serialization, MetadataState)
   snapshot.dm_fields_hex = "0x0007ffff";
 
   const std::string json = wpce::storage::to_json(snapshot);
+  expect_contains(json, "\"printer_name\": \"Microsoft Print to PDF\"");
   expect_contains(json, "\"total_pages\": { \"value\": \"5\", \"state\": \"reported\" }");
   expect_contains(json, "\"duplex\": { \"value\": \"\", \"state\": \"unsupported\" }");
   expect_contains(json, "\"n_up\": { \"value\": \"2-up\", \"state\": \"reported\" }");
@@ -93,11 +97,54 @@ TEST(Serialization, MetadataState)
   expect_contains(xml, "<duplex state=\"unsupported\"></duplex>");
 }
 
+TEST(Serialization, PrintTicketMetadataLoadPreservesState)
+{
+  const std::filesystem::path directory = make_test_directory("pt-metadata");
+  std::filesystem::create_directories(directory);
+  const std::filesystem::path path = directory / "job-Test_Printer-42-pt-metadata.json";
+
+  const std::string json =
+    "{\n"
+    "  \"schema_version\": 1,\n"
+    "  \"job_id\": 42,\n"
+    "  \"printer_name\": \"\\\\\\\\server\\\\Test Printer\",\n"
+    "  \"total_pages\": { \"value\": \"\", \"state\": \"unknown\" },\n"
+    "  \"pages_printed\": { \"value\": \"\", \"state\": \"unknown\" },\n"
+    "  \"copies\": { \"value\": \"2\", \"state\": \"reported\" },\n"
+    "  \"duplex\": { \"value\": \"long-edge (book)\", \"state\": \"reported\" },\n"
+    "  \"color\": { \"value\": \"\", \"state\": \"unknown\" },\n"
+    "  \"paper_size\": { \"value\": \"A4\", \"state\": \"reported\" },\n"
+    "  \"orientation\": { \"value\": \"portrait\", \"state\": \"reported\" },\n"
+    "  \"n_up\": { \"value\": \"\", \"state\": \"unknown\" },\n"
+    "  \"collate\": { \"value\": \"collated\", \"state\": \"reported\" },\n"
+    "  \"print_quality\": { \"value\": \"\", \"state\": \"unknown\" },\n"
+    "  \"media_type\": { \"value\": \"\", \"state\": \"unknown\" },\n"
+    "  \"dm_fields_hex\": \"PrintTicket\"\n"
+    "}\n";
+
+  {
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    out << json;
+  }
+
+  wpce::core::MetadataSnapshot loaded;
+  ASSERT_TRUE(wpce::bridge::load_pt_metadata(path, loaded));
+  EXPECT_EQ(42u, loaded.job_id);
+  EXPECT_EQ("\\\\server\\Test Printer", loaded.printer_name);
+  EXPECT_EQ(wpce::core::FieldState::Reported, loaded.duplex.state);
+  EXPECT_EQ("long-edge (book)", loaded.duplex.value);
+  EXPECT_EQ(wpce::core::FieldState::Unknown, loaded.color.state);
+  EXPECT_EQ("PrintTicket", loaded.dm_fields_hex);
+
+  std::filesystem::remove_all(directory);
+}
+
 TEST(Serialization, PageArtifactIndex)
 {
   const wpce::core::PageArtifactIndex index{
     .schema_version = 1,
     .job_id = 42,
+    .printer_name = "Microsoft Print to PDF",
     .document_sequence = 1,
     .page_sequence = 2,
     .job_print_ticket = "job.pt.xml",
@@ -108,6 +155,7 @@ TEST(Serialization, PageArtifactIndex)
   };
 
   const std::string json = wpce::storage::to_json(index);
+  expect_contains(json, "\"printer_name\": \"Microsoft Print to PDF\"");
   expect_contains(json, "\"page_sequence\": 2");
   expect_contains(json, "\"fixed_page\": \"page-002.fpage\"");
 
@@ -236,6 +284,53 @@ TEST(Watcher, PhaseClassification)
   EXPECT_EQ("failed", wpce::core::to_string(Phase::Failed));
   EXPECT_EQ("cancelled", wpce::core::to_string(Phase::Cancelled));
   EXPECT_EQ("stalled", wpce::core::to_string(Phase::Stalled));
+}
+
+TEST(Watcher, PreservesTransientUnknownForNonTerminalPhases)
+{
+  using Phase = wpce::core::JobLifecyclePhase;
+  using wpce::watcher::should_preserve_transient_unknown_status;
+
+  EXPECT_FALSE(should_preserve_transient_unknown_status(Phase::Spooling, false));
+
+  EXPECT_TRUE(should_preserve_transient_unknown_status(Phase::Accepted, true));
+  EXPECT_TRUE(should_preserve_transient_unknown_status(Phase::Spooling, true));
+  EXPECT_TRUE(should_preserve_transient_unknown_status(Phase::Printing, true));
+  EXPECT_TRUE(should_preserve_transient_unknown_status(Phase::Stalled, true));
+
+  EXPECT_FALSE(should_preserve_transient_unknown_status(Phase::Unknown, true));
+  EXPECT_FALSE(should_preserve_transient_unknown_status(Phase::Completed, true));
+  EXPECT_FALSE(should_preserve_transient_unknown_status(Phase::Failed, true));
+  EXPECT_FALSE(should_preserve_transient_unknown_status(Phase::Cancelled, true));
+}
+
+TEST(AppConfig, SavesAndLoadsVolumeDiscounts)
+{
+  const auto dir = make_test_directory("app-config");
+  const auto path = dir / "wpce_config.json";
+  std::filesystem::create_directories(dir);
+
+  auto config = wpce::common::AppConfig::defaults();
+  ASSERT_TRUE(config.save_to_json(path));
+
+  const std::string json = read_file(path);
+  expect_contains(json, "\"volume_discounts\":[");
+  expect_contains(json, "{\"min_pages\":100,\"discount\":0.95},{\"min_pages\":500");
+
+  auto loaded = wpce::common::AppConfig::defaults();
+  loaded.pricing.volume_discounts.clear();
+  ASSERT_TRUE(loaded.load_from_json(path));
+
+  ASSERT_EQ(3u, loaded.pricing.volume_discounts.size());
+  EXPECT_EQ(100, loaded.pricing.volume_discounts.at(0).min_pages);
+  EXPECT_DOUBLE_EQ(0.95, loaded.pricing.volume_discounts.at(0).discount);
+  EXPECT_EQ(500, loaded.pricing.volume_discounts.at(1).min_pages);
+  EXPECT_DOUBLE_EQ(0.90, loaded.pricing.volume_discounts.at(1).discount);
+  EXPECT_EQ(1000, loaded.pricing.volume_discounts.at(2).min_pages);
+  EXPECT_DOUBLE_EQ(0.85, loaded.pricing.volume_discounts.at(2).discount);
+
+  std::error_code ignored;
+  std::filesystem::remove_all(dir, ignored);
 }
 
 // ── Storage tests ────────────────────────────────────────────────────────

@@ -17,6 +17,21 @@
 namespace wpce::watcher
 {
 
+// ── Diagnostic logging ──────────────────────────────────────────────────
+
+enum class LogLevel
+{
+  Debug,   // Fine-grained: per-field notification content, signature comparisons
+  Info,    // Key events: printer opened, phase transitions, rescan triggered
+  Warn,    // Potential problems: GetJobW failed, notification discarded, stall
+  Error,   // Fatal: printer open failed, notification handle creation failed
+};
+
+/// Callback for diagnostic log messages from the watcher pipeline.
+/// Receives: severity, short category tag ("init"/"notify"/"phase"/…), message.
+/// Thread-safe: only called from the watcher worker thread.
+using LogCallback = std::function<void(LogLevel level, std::string_view category, std::string message)>;
+
 struct WatcherConfig
 {
   std::wstring printer_name;
@@ -27,6 +42,17 @@ struct WatcherConfig
   /// Max time a job may remain in spooling or printing before it is
   /// reported as stalled.  Zero disables stall detection.
   std::chrono::seconds stall_timeout{0};
+
+  /// Periodic full rescan interval.  Fires regardless of notification
+  /// activity, serving as a safety net for printer drivers that drop
+  /// or coalesce spooler change notifications.  Zero disables.
+  /// Default 5 s — fast enough for laser printer safety net, long
+  /// enough to avoid excessive spooler load.
+  std::chrono::seconds rescan_interval{5};
+
+  /// Optional diagnostic logger.  When set, the watcher emits structured
+  /// log messages at every decision point.  No-op when empty.
+  LogCallback log_callback;
 };
 
 using JobSnapshotCallback = std::function<void(const core::JobSnapshot&)>;
@@ -47,6 +73,11 @@ std::string describe_job_status(std::uint32_t status_flags);
 /// Map raw JOB_STATUS flags to a high-level lifecycle phase.
 core::JobLifecyclePhase classify_phase(std::uint32_t status_flags,
                                        const std::string& status_string) noexcept;
+
+/// Whether a transient zero-status/unknown update should keep the last known
+/// phase instead of replacing it with Unknown.
+bool should_preserve_transient_unknown_status(core::JobLifecyclePhase current_phase,
+                                              bool has_prior_events) noexcept;
 
 /// Enumerate current print jobs with both job-level and metadata snapshots.
 std::vector<JobSnapshotWithMetadata> enumerate_printer_jobs(const std::wstring& printer_name);

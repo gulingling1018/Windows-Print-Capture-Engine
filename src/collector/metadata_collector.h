@@ -50,6 +50,7 @@ std::string_view print_quality_name(std::int16_t dm_print_quality) noexcept;
 /// to FieldState::Unknown with the raw integer stored as the value.
 /// The raw dmFields bitmask is stored as hex in dm_fields_hex.
 core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job);
+
 #endif
 
 }  // namespace wpce::collector

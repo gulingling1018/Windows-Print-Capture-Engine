@@ -1,22 +1,33 @@
 set(UI_HEADERS
+  job_table_model.h
+  user_group_model.h
+  user_group_delegate.h
+  completion_dialog.h
   document_link_delegate.h
   grip_splitter.h
+  settings_dialog.h
+  receipt_preview_panel.h
 )
 
 set(UI_SOURCES
   main.cpp
   main_window.cpp
+  user_group_model.cpp
+  completion_dialog.cpp
   job_table_model.cpp
   job_detail_panel.cpp
-  lifecycle_timeline.cpp
   watcher_bridge.cpp
-  statistics_panel.cpp
   user_task_model.cpp
-  user_task_panel.cpp
+  receipt_preview_panel.cpp
+  settings_dialog.cpp
   ${UI_HEADERS}
 )
 
-add_executable(wpce_ui WIN32 ${UI_SOURCES})
+set(UI_RESOURCES
+  wpce_ui.rc
+)
+
+add_executable(wpce_ui WIN32 ${UI_SOURCES} ${UI_RESOURCES})
 
 target_include_directories(wpce_ui PRIVATE
   ${PROJECT_SOURCE_DIR}/src
@@ -39,4 +50,25 @@ if(MSVC)
   target_compile_options(wpce_ui PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
 else()
   target_compile_options(wpce_ui PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+if(WIN32)
+  get_target_property(_wpce_qmake_executable Qt6::qmake IMPORTED_LOCATION)
+  get_filename_component(_wpce_qt_bin_dir "${_wpce_qmake_executable}" DIRECTORY)
+
+  find_program(WPCE_WINDEPLOYQT_EXECUTABLE
+    NAMES windeployqt
+    HINTS "${_wpce_qt_bin_dir}"
+    REQUIRED
+  )
+
+  add_custom_command(TARGET wpce_ui POST_BUILD
+    COMMAND "${WPCE_WINDEPLOYQT_EXECUTABLE}"
+            "$<$<CONFIG:Debug>:--debug>$<$<NOT:$<CONFIG:Debug>>:--release>"
+            --no-translations
+            --dir "$<TARGET_FILE_DIR:wpce_ui>"
+            "$<TARGET_FILE:wpce_ui>"
+    COMMENT "Deploying Qt runtime libraries for wpce_ui"
+    VERBATIM
+  )
 endif()

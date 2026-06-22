@@ -47,6 +47,11 @@ class XpsCaptureFilter final : public IPrintPipelineFilter
 
   HRESULT STDMETHODCALLTYPE ShutdownOperation() override;
 
+  // Windows 10 SDK IPrintPipelineFilter only has the three methods above.
+  // PauseOperation/ResumeOperation are not part of the standard vtable —
+  // they were added in IPrintPipelineFilterV2 (WDK-only extended interface)
+  // which the spooler does not call for a basic pass-through filter.
+
   // ── Accessors (for test harness) ──────────────────────────────────────
 
   /// Collected PrintTicket XML strings, indexed by level.

@@ -3,6 +3,7 @@
 #include <QAbstractItemView>
 #include <QFont>
 #include <QFrame>
+#include <QSizePolicy>
 #include <QVBoxLayout>
 
 namespace wpce::ui
@@ -58,6 +59,8 @@ QString LifecycleTimeline::phaseDisplayName(const core::JobLifecyclePhase phase)
 LifecycleTimeline::LifecycleTimeline(QWidget* parent) : QWidget(parent)
 {
   setObjectName(QStringLiteral("TimelinePanel"));
+  setMinimumWidth(0);
+  setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
 
   auto* root = new QVBoxLayout(this);
   root->setContentsMargins(16, 16, 16, 16);
@@ -65,6 +68,8 @@ LifecycleTimeline::LifecycleTimeline(QWidget* parent) : QWidget(parent)
 
   header_ = new QLabel(QStringLiteral("生命周期"));
   header_->setObjectName(QStringLiteral("PanelHeader"));
+  header_->setMinimumWidth(0);
+  header_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
   root->addWidget(header_);
 
   auto* divider = new QFrame();
@@ -74,8 +79,11 @@ LifecycleTimeline::LifecycleTimeline(QWidget* parent) : QWidget(parent)
 
   list_ = new QListWidget();
   list_->setObjectName(QStringLiteral("TimelineList"));
+  list_->setMinimumWidth(0);
+  list_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
   list_->setFrameShape(QFrame::NoFrame);
   list_->setSelectionMode(QAbstractItemView::NoSelection);
+  list_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
   list_->setVerticalScrollMode(QAbstractItemView::ScrollPerPixel);
   QFont font(QStringLiteral("Cascadia Mono"));
   font.setStyleHint(QFont::Monospace);

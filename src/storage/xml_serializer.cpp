@@ -91,11 +91,20 @@ std::string to_xml(const core::MetadataSnapshot& snapshot)
   output << "<metadata_snapshot>\n";
   append_xml_element(output, "schema_version", snapshot.schema_version);
   append_xml_element(output, "job_id", snapshot.job_id);
+  append_xml_element(output, "printer_name", snapshot.printer_name);
+  append_field_value(output, "total_pages", snapshot.total_pages);
+  append_field_value(output, "pages_printed", snapshot.pages_printed);
   append_field_value(output, "copies", snapshot.copies);
   append_field_value(output, "duplex", snapshot.duplex);
   append_field_value(output, "color", snapshot.color);
   append_field_value(output, "paper_size", snapshot.paper_size);
   append_field_value(output, "orientation", snapshot.orientation);
+  append_field_value(output, "n_up", snapshot.n_up);
+  append_field_value(output, "collate", snapshot.collate);
+  append_field_value(output, "print_quality", snapshot.print_quality);
+  append_field_value(output, "media_type", snapshot.media_type);
+  append_field_value(output, "page_range", snapshot.page_range);
+  append_xml_element(output, "dm_fields_hex", snapshot.dm_fields_hex);
   output << "</metadata_snapshot>\n";
   return output.str();
 }
@@ -106,6 +115,7 @@ std::string to_xml(const core::PageArtifactIndex& index)
   output << "<page_artifact_index>\n";
   append_xml_element(output, "schema_version", index.schema_version);
   append_xml_element(output, "job_id", index.job_id);
+  append_xml_element(output, "printer_name", index.printer_name);
   append_xml_element(output, "document_sequence", index.document_sequence);
   append_xml_element(output, "page_sequence", index.page_sequence);
   append_xml_element(output, "job_print_ticket", index.job_print_ticket);
@@ -118,4 +128,3 @@ std::string to_xml(const core::PageArtifactIndex& index)
 }
 
 }  // namespace wpce::storage
-

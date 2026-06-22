@@ -127,6 +127,8 @@ std::string to_json(const core::MetadataSnapshot& snapshot)
   output << ",\n  ";
   append_json_property(output, "job_id", snapshot.job_id);
   output << ",\n  ";
+  append_json_property(output, "printer_name", snapshot.printer_name);
+  output << ",\n  ";
   append_field_value(output, "total_pages", snapshot.total_pages);
   output << ",\n  ";
   append_field_value(output, "pages_printed", snapshot.pages_printed);
@@ -146,6 +148,10 @@ std::string to_json(const core::MetadataSnapshot& snapshot)
   append_field_value(output, "collate", snapshot.collate);
   output << ",\n  ";
   append_field_value(output, "print_quality", snapshot.print_quality);
+  output << ",\n  ";
+  append_field_value(output, "media_type", snapshot.media_type);
+  output << ",\n  ";
+  append_field_value(output, "page_range", snapshot.page_range);
   output << ",\n  ";
   append_json_property(output, "dm_fields_hex", snapshot.dm_fields_hex);
   output << "\n}\n";
@@ -271,6 +277,8 @@ std::string to_json(const core::PageArtifactIndex& index)
   output << ",\n  ";
   append_json_property(output, "job_id", index.job_id);
   output << ",\n  ";
+  append_json_property(output, "printer_name", index.printer_name);
+  output << ",\n  ";
   append_json_property(output, "document_sequence", index.document_sequence);
   output << ",\n  ";
   append_json_property(output, "page_sequence", index.page_sequence);
@@ -289,4 +297,3 @@ std::string to_json(const core::PageArtifactIndex& index)
 }
 
 }  // namespace wpce::storage
-

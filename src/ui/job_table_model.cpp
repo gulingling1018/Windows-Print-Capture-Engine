@@ -4,6 +4,7 @@
 
 #include <QBrush>
 #include <QColor>
+#include <QDateTime>
 #include <QFont>
 
 #include <algorithm>
@@ -102,10 +103,16 @@ QVariant sortValueForColumn(const JobRowData& data, const int column)
       return phaseDisplayName(data.phase);
     case JobTableModel::ColProgress:
       return progressPercent(data);
-    case JobTableModel::ColTotalPages:
+    case JobTableModel::ColPages:
       return data.totalPages;
     case JobTableModel::ColCopies:
       return reportedValueOrDash(data.metadata.copies);
+    case JobTableModel::ColColor:
+      return reportedValueOrDash(data.metadata.color);
+    case JobTableModel::ColDuplex:
+      return reportedValueOrDash(data.metadata.duplex);
+    case JobTableModel::ColPaper:
+      return reportedValueOrDash(data.metadata.paper_size);
     case JobTableModel::ColPrinter:
       return QString::fromStdString(data.job.printer_name).toCaseFolded();
     case JobTableModel::ColPrice:
@@ -207,6 +214,13 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
     return userTextColor(userId);
   }
 
+  if (role == FreshnessSecsRole)
+  {
+    if (!data.lastUpdated.isValid())
+      return -1;
+    return static_cast<int>(data.lastUpdated.secsTo(QDateTime::currentDateTimeUtc()));
+  }
+
   if (role == Qt::BackgroundRole)
   {
     return QBrush(subtleUserTint(userId));
@@ -219,8 +233,11 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
       case ColJobId:
       case ColPhase:
       case ColProgress:
-      case ColTotalPages:
+      case ColPages:
       case ColCopies:
+      case ColColor:
+      case ColDuplex:
+      case ColPaper:
         return Qt::AlignCenter;
       case ColPrice:
         return static_cast<int>(Qt::AlignRight | Qt::AlignVCenter);
@@ -248,11 +265,41 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
 
   if (role == Qt::ToolTipRole)
   {
-    return QStringLiteral("Job ID %1\n文档: %2\n用户: %3\n打印机: %4")
-      .arg(data.job.job_id)
-      .arg(QString::fromStdString(data.job.document_name))
-      .arg(userId)
-      .arg(QString::fromStdString(data.job.printer_name));
+    auto tipField = [&](const char* name, const core::FieldValue& fv) -> QString {
+      if (fv.state == core::FieldState::Reported && !fv.value.empty())
+        return QStringLiteral("%1: %2").arg(QLatin1StringView(name), QString::fromStdString(fv.value));
+      return {};
+    };
+    QStringList tips;
+    tips << QStringLiteral("Job ID: %1").arg(data.job.job_id);
+    tips << QStringLiteral("文档: %1").arg(QString::fromStdString(data.job.document_name));
+    tips << QStringLiteral("用户: %1").arg(userId);
+    tips << QStringLiteral("打印机: %1").arg(QString::fromStdString(data.job.printer_name));
+    tips << QStringLiteral("阶段: %1").arg(phaseDisplayName(data.phase));
+    // Inline metadata snapshot — saves a click to see params.
+    tips << tipField("页数", data.metadata.total_pages);
+    tips << tipField("已打印", data.metadata.pages_printed);
+    tips << tipField("份数", data.metadata.copies);
+    tips << tipField("双面", data.metadata.duplex);
+    tips << tipField("颜色", data.metadata.color);
+    tips << tipField("纸张", data.metadata.paper_size);
+    tips << tipField("方向", data.metadata.orientation);
+    tips << tipField("N-up", data.metadata.n_up);
+    tips << tipField("介质", data.metadata.media_type);
+    if (data.price > 0) tips << QStringLiteral("费用: ¥%1").arg(data.price, 0, 'f', 2);
+    // Freshness indicator — helps users spot stale rows.
+    if (data.lastUpdated.isValid())
+    {
+      const int age = static_cast<int>(data.lastUpdated.secsTo(QDateTime::currentDateTimeUtc()));
+      if (age < 5)
+        tips << QStringLiteral("更新: 刚刚");
+      else if (age < 120)
+        tips << QStringLiteral("更新: %1 秒前").arg(age);
+      else
+        tips << QStringLiteral("更新: %1 分钟前").arg(age / 60);
+    }
+    tips.removeAll({});
+    return tips.join('\n');
   }
 
   if (role != Qt::DisplayRole && role != Qt::EditRole)
@@ -286,10 +333,35 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
       }
       return QStringLiteral("-");
     }
-    case ColTotalPages:
+    case ColPages:
       return reportedValueOrDash(data.metadata.total_pages);
     case ColCopies:
       return reportedValueOrDash(data.metadata.copies);
+    case ColColor:
+    {
+      if (data.metadata.color.state == core::FieldState::Reported)
+      {
+        const auto& v = data.metadata.color.value;
+        if (v == "color")      return QStringLiteral("⚫ 彩");
+        if (v == "monochrome") return QStringLiteral("⚪ 单");
+        return QString::fromStdString(v);
+      }
+      return QStringLiteral("-");
+    }
+    case ColDuplex:
+    {
+      if (data.metadata.duplex.state == core::FieldState::Reported)
+      {
+        const auto& v = data.metadata.duplex.value;
+        if (v == "simplex")                return QStringLiteral("单面");
+        if (v == "long-edge (book)")       return QStringLiteral("长边");
+        if (v == "short-edge (calendar)")  return QStringLiteral("短边");
+        return QString::fromStdString(v);
+      }
+      return QStringLiteral("-");
+    }
+    case ColPaper:
+      return reportedValueOrDash(data.metadata.paper_size);
     case ColPrinter:
       return QString::fromStdString(data.job.printer_name);
     case ColPrice:
@@ -322,10 +394,16 @@ QVariant JobTableModel::headerData(const int section,
       return QStringLiteral("阶段");
     case ColProgress:
       return QStringLiteral("进度");
-    case ColTotalPages:
+    case ColPages:
       return QStringLiteral("页数");
     case ColCopies:
       return QStringLiteral("份数");
+    case ColColor:
+      return QStringLiteral("颜色");
+    case ColDuplex:
+      return QStringLiteral("双面");
+    case ColPaper:
+      return QStringLiteral("纸张");
     case ColPrinter:
       return QStringLiteral("打印机");
     case ColPrice:
@@ -390,7 +468,9 @@ void JobTableModel::onJobSnapshot(core::JobSnapshot snapshot)
     }
     else
     {
-      jobs_[jobId].job = std::move(snapshot);
+      auto& row = jobs_[jobId];
+      row.job = std::move(snapshot);
+      row.lastUpdated = QDateTime::currentDateTimeUtc();
       dirtyRows_.insert(modelRow);
     }
   }
@@ -402,6 +482,7 @@ void JobTableModel::onJobSnapshot(core::JobSnapshot snapshot)
       std::scoped_lock lock(dataMutex_);
       auto& row = jobs_[jobId];
       row.job = std::move(snapshot);
+      row.lastUpdated = QDateTime::currentDateTimeUtc();
       jobOrder_.append(jobId);
     }
     endInsertRows();
@@ -420,37 +501,55 @@ void JobTableModel::onMetadata(core::MetadataSnapshot metadata)
     return;
   }
 
+  // Phase 1 — check if a placeholder row is needed, under lock.
+  bool needsInsert = false;
+  int newRow = -1;
+  {
+    std::scoped_lock lock(dataMutex_);
+    if (jobs_.find(metadata.job_id) == jobs_.end())
+    {
+      newRow = static_cast<int>(jobOrder_.size());
+      needsInsert = true;
+    }
+  }
+
+  // Phase 2 — notify Qt BEFORE the data changes.
+  if (needsInsert)
+  {
+    beginInsertRows(QModelIndex(), newRow, newRow);
+  }
+
+  // Phase 3 — commit the metadata update + optional row creation.
   {
     std::scoped_lock lock(dataMutex_);
 
-    auto& row = jobs_[metadata.job_id];
+    auto it = jobs_.find(metadata.job_id);
+    if (it == jobs_.end())
+    {
+      it = jobs_.insert(metadata.job_id, JobRowData{});
+      jobOrder_.append(metadata.job_id);
+    }
+
+    auto& row = it.value();
     row.metadata = std::move(metadata);
+    row.lastUpdated = QDateTime::currentDateTimeUtc();
 
-    try
-    {
-      row.totalPages = std::stoi(row.metadata.total_pages.value);
-    }
-    catch (...)
-    {
-      row.totalPages = 0;
-    }
+    try { row.totalPages = std::stoi(row.metadata.total_pages.value); }
+    catch (...) { row.totalPages = 0; }
 
-    try
-    {
-      row.pagesPrinted = std::stoi(row.metadata.pages_printed.value);
-    }
-    catch (...)
-    {
-      row.pagesPrinted = 0;
-    }
+    try { row.pagesPrinted = std::stoi(row.metadata.pages_printed.value); }
+    catch (...) { row.pagesPrinted = 0; }
 
     row.price = calculate_job_cost(row.metadata, PricingConfig{});
 
     const int modelRow = jobOrder_.indexOf(row.metadata.job_id);
-    if (modelRow >= 0)
-    {
-      dirtyRows_.insert(modelRow);
-    }
+    if (modelRow >= 0) { dirtyRows_.insert(modelRow); }
+  }
+
+  // Phase 4 — end the insertion if we started one.
+  if (needsInsert)
+  {
+    endInsertRows();
   }
 
   if (!flushTimer_->isActive())
@@ -473,12 +572,22 @@ void JobTableModel::onLifecycleEvent(core::JobLifecycleEvent event)
 
     auto& row = jobs_[jobId];
     row.phase = event.phase;
+    row.lastUpdated = QDateTime::currentDateTimeUtc();
 
     if (event.total_pages > 0)
     {
       row.totalPages = event.total_pages;
+      // Sync back to metadata so the detail panel reflects the latest values.
+      row.metadata.total_pages =
+        core::FieldValue{std::to_string(event.total_pages), core::FieldState::Reported};
     }
     row.pagesPrinted = event.pages_printed;
+    // Sync back to metadata so the detail panel reflects the latest values.
+    row.metadata.pages_printed =
+      core::FieldValue{std::to_string(event.pages_printed), core::FieldState::Reported};
+
+    row.price = calculate_job_cost(row.metadata, PricingConfig{});
+
     row.lifecycleEvents.push_back(std::move(event));
 
     const int modelRow = jobOrder_.indexOf(jobId);

@@ -177,15 +177,67 @@ class DocumentLinkDelegate final : public QStyledItemDelegate
         break;
       }
 
-      // ── ColTotalPages / ColCopies — centred number ─────────────
-      case JobTableModel::ColTotalPages:
+      // ── ColPages / ColCopies / ColDuplex / ColPaper — centred ──
+      case JobTableModel::ColPages:
       case JobTableModel::ColCopies:
+      case JobTableModel::ColPaper:
       {
         painter->setPen(normalText);
         QFont f = opt.font;
         f.setPointSize(9);
         painter->setFont(f);
         painter->drawText(textRect, Qt::AlignCenter, text);
+        break;
+      }
+
+      // ── ColColor — colour dot + label ─────────────────────────
+      case JobTableModel::ColColor:
+      {
+        // Draw a small colour-indicator dot before the text.
+        const bool isColor = text.contains(QStringLiteral("彩"));
+        const bool isMono  = text.contains(QStringLiteral("单"));
+        const int dotSize = 8;
+        QRect dot = textRect;
+        dot.setWidth(dotSize);
+        dot.setHeight(dotSize);
+        dot.moveCenter(QPoint(textRect.left() + 12, textRect.center().y()));
+
+        painter->setPen(Qt::NoPen);
+        if (isColor) {
+          painter->setBrush(QColor(0xdc, 0x26, 0x26));  // red dot for color
+        } else if (isMono) {
+          painter->setBrush(QColor(0x64, 0x74, 0x8b));  // gray dot for mono
+        } else {
+          painter->setBrush(QColor(0x94, 0xa3, 0xb8));  // light gray for unknown
+        }
+        painter->drawEllipse(dot);
+
+        painter->setPen(normalText);
+        QFont f = opt.font;
+        f.setPointSize(9);
+        painter->setFont(f);
+        // Shift text right past the dot.
+        QRect labelRect = textRect;
+        labelRect.setLeft(dot.right() + 4);
+        painter->drawText(labelRect, Qt::AlignVCenter | Qt::AlignLeft, text);
+        break;
+      }
+
+      // ── ColDuplex — icon + label ──────────────────────────────
+      case JobTableModel::ColDuplex:
+      {
+        painter->setPen(mutedText);
+        QFont f = opt.font;
+        f.setPointSize(9);
+        painter->setFont(f);
+        if (text.isEmpty() || text == QStringLiteral("-"))
+        {
+          painter->drawText(textRect, Qt::AlignCenter, text);
+        }
+        else
+        {
+          painter->drawText(textRect, Qt::AlignCenter, text);
+        }
         break;
       }
 

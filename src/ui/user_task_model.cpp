@@ -5,7 +5,12 @@
 #include <QBrush>
 #include <QColor>
 #include <QDateTime>
+#include <QFile>
 #include <QFont>
+#include <QJsonArray>
+#include <QJsonDocument>
+#include <QJsonObject>
+#include <QJsonValue>
 
 namespace wpce::ui
 {
@@ -25,7 +30,16 @@ void UserTask::recomputeTotals()
 
 // ── UserTaskModel ───────────────────────────────────────────────────
 
-UserTaskModel::UserTaskModel(QObject* parent) : QAbstractTableModel(parent) {}
+UserTaskModel::UserTaskModel(QObject* parent) : QAbstractTableModel(parent)
+{
+  defaultPricing_ = common::PricingConfig{};
+  pricing_ = &defaultPricing_;
+
+  // Debounced auto-save: fire 2 s after the last change.
+  autoSaveTimer_.setSingleShot(true);
+  autoSaveTimer_.setInterval(2000);
+  connect(&autoSaveTimer_, &QTimer::timeout, this, &UserTaskModel::flushSave);
+}
 
 int UserTaskModel::rowCount(const QModelIndex& parent) const
 {
@@ -188,6 +202,219 @@ int UserTaskModel::completedTaskCount() const
   return count;
 }
 
+// ── Persistence ─────────────────────────────────────────────────────
+
+QJsonObject UserTaskModel::toJson() const
+{
+  QJsonObject root;
+  QJsonArray taskArray;
+  for (const auto& task : tasks_)
+  {
+    QJsonObject tj;
+    tj[QStringLiteral("taskId")] = task.taskId;
+    tj[QStringLiteral("userId")] = task.userId;
+    tj[QStringLiteral("date")] = task.date.toString(Qt::ISODate);
+    tj[QStringLiteral("completed")] = task.completed;
+    tj[QStringLiteral("totalPages")] = task.totalPages;
+    tj[QStringLiteral("totalPrice")] = task.totalPrice;
+
+    QJsonArray jobIdArray;
+    for (auto jid : task.jobIds)
+    {
+      jobIdArray.append(static_cast<int>(jid));
+    }
+    tj[QStringLiteral("jobIds")] = jobIdArray;
+
+    QJsonObject costObj;
+    for (auto it = task.jobCosts.cbegin(); it != task.jobCosts.cend(); ++it)
+    {
+      QJsonObject entry;
+      entry[QStringLiteral("pages")] = it->pages;
+      entry[QStringLiteral("price")] = it->price;
+      costObj[QString::number(it.key())] = entry;
+    }
+    tj[QStringLiteral("jobCosts")] = costObj;
+
+    taskArray.append(tj);
+  }
+  root[QStringLiteral("tasks")] = taskArray;
+
+  // Save counter state so IDs don't reset across restarts.
+  root[QStringLiteral("dailyTaskCounter")] = dailyTaskCounter_;
+  if (lastTaskDate_.isValid())
+  {
+    root[QStringLiteral("lastTaskDate")] = lastTaskDate_.toString(Qt::ISODate);
+  }
+
+  return root;
+}
+
+bool UserTaskModel::fromJson(const QJsonObject& json)
+{
+  clear();
+
+  const QJsonArray taskArray = json[QStringLiteral("tasks")].toArray();
+
+  // Pass 1: restore task list.
+  for (const QJsonValue& val : taskArray)
+  {
+    const QJsonObject tj = val.toObject();
+
+    UserTask task;
+    task.taskId   = tj[QStringLiteral("taskId")].toString();
+    task.userId   = tj[QStringLiteral("userId")].toString();
+    task.date     = QDate::fromString(tj[QStringLiteral("date")].toString(), Qt::ISODate);
+    task.completed = tj[QStringLiteral("completed")].toBool();
+    task.totalPages = tj[QStringLiteral("totalPages")].toInt();
+    task.totalPrice = tj[QStringLiteral("totalPrice")].toDouble();
+
+    const QJsonArray jids = tj[QStringLiteral("jobIds")].toArray();
+    for (const QJsonValue& jv : jids)
+    {
+      task.jobIds.push_back(static_cast<std::uint32_t>(jv.toInt()));
+    }
+
+    const QJsonObject costObj = tj[QStringLiteral("jobCosts")].toObject();
+    for (auto cit = costObj.constBegin(); cit != costObj.constEnd(); ++cit)
+    {
+      const std::uint32_t jid = static_cast<std::uint32_t>(cit.key().toUInt());
+      const QJsonObject entry = cit.value().toObject();
+      JobCostEntry cost;
+      cost.pages = entry[QStringLiteral("pages")].toInt();
+      cost.price = entry[QStringLiteral("price")].toDouble();
+      task.jobCosts[jid] = cost;
+    }
+
+    const int row = static_cast<int>(tasks_.size());
+    tasks_.push_back(std::move(task));
+
+    // Build active index.
+    if (!tasks_.back().completed)
+    {
+      activeTaskIndex_[tasks_.back().userId] = row;
+    }
+    // Build job→task mapping.
+    for (auto jid : tasks_.back().jobIds)
+    {
+      jobToTaskRow_[jid] = row;
+    }
+  }
+
+  // Restore counter.
+  dailyTaskCounter_ = json[QStringLiteral("dailyTaskCounter")].toInt(0);
+  const QString dateStr = json[QStringLiteral("lastTaskDate")].toString();
+  if (!dateStr.isEmpty())
+  {
+    lastTaskDate_ = QDate::fromString(dateStr, Qt::ISODate);
+  }
+
+  if (!tasks_.empty())
+  {
+    beginInsertRows(QModelIndex(), 0, static_cast<int>(tasks_.size()) - 1);
+    endInsertRows();
+  }
+
+  return true;
+}
+
+bool UserTaskModel::saveToJson(const QString& filePath) const
+{
+  const QJsonObject json = toJson();
+  QJsonDocument doc(json);
+  const QByteArray data = doc.toJson(QJsonDocument::Indented);
+
+  // Atomic write via temp + rename.
+  const QString tempPath = filePath + QStringLiteral(".tmp");
+  {
+    QFile file(tempPath);
+    if (!file.open(QIODevice::WriteOnly | QIODevice::Truncate))
+    {
+      return false;
+    }
+    if (file.write(data) != data.size())
+    {
+      file.close();
+      QFile::remove(tempPath);
+      return false;
+    }
+    file.close();
+  }
+
+  // Rename.
+  QFile::remove(filePath);
+  if (!QFile::rename(tempPath, filePath))
+  {
+    // Fallback: copy + remove.
+    if (!QFile::copy(tempPath, filePath))
+    {
+      QFile::remove(tempPath);
+      return false;
+    }
+    QFile::remove(tempPath);
+  }
+  return true;
+}
+
+bool UserTaskModel::loadFromJson(const QString& filePath)
+{
+  QFile file(filePath);
+  if (!file.open(QIODevice::ReadOnly))
+  {
+    return false;
+  }
+
+  const QByteArray data = file.readAll();
+  file.close();
+
+  QJsonParseError parseError;
+  const QJsonDocument doc = QJsonDocument::fromJson(data, &parseError);
+  if (parseError.error != QJsonParseError::NoError)
+  {
+    return false;
+  }
+
+  return fromJson(doc.object());
+}
+
+void UserTaskModel::setPricingConfig(const common::PricingConfig* pricing)
+{
+  if (pricing != nullptr)
+  {
+    pricing_ = pricing;
+  }
+  else
+  {
+    defaultPricing_ = common::PricingConfig{};
+    pricing_ = &defaultPricing_;
+  }
+}
+
+void UserTaskModel::setAutoSavePath(const QString& filePath)
+{
+  autoSavePath_ = filePath;
+}
+
+QString UserTaskModel::autoSavePath() const
+{
+  return autoSavePath_;
+}
+
+void UserTaskModel::scheduleAutoSave()
+{
+  if (!autoSavePath_.isEmpty())
+  {
+    dirty_ = true;
+    autoSaveTimer_.start();
+  }
+}
+
+void UserTaskModel::flushSave()
+{
+  if (!dirty_ || autoSavePath_.isEmpty()) return;
+  dirty_ = false;
+  (void)saveToJson(autoSavePath_);
+}
+
 // ── Slots ──────────────────────────────────────────────────────────
 
 void UserTaskModel::onJobSnapshot(core::JobSnapshot snapshot)
@@ -209,6 +436,7 @@ void UserTaskModel::onJobSnapshot(core::JobSnapshot snapshot)
       task.jobIds.push_back(jobId);
       emit dataChanged(index(jobMapIt.value(), ColJobCount),
                        index(jobMapIt.value(), ColJobCount));
+      scheduleAutoSave();
     }
     return;
   }
@@ -224,22 +452,31 @@ void UserTaskModel::onJobSnapshot(core::JobSnapshot snapshot)
       jobToTaskRow_[jobId] = activeIt.value();
       emit dataChanged(index(activeIt.value(), ColJobCount),
                        index(activeIt.value(), ColStatus));
+      scheduleAutoSave();
       return;
     }
   }
 
-  // Create new task.
-  const int newRow = static_cast<int>(tasks_.size());
-  beginInsertRows(QModelIndex(), newRow, newRow);
+  // Create new task — always at the top so newest billing items are visible first.
+  beginInsertRows(QModelIndex(), 0, 0);
+
+  // Shift existing row indices up by one to make room at row 0.
+  for (auto it = activeTaskIndex_.begin(); it != activeTaskIndex_.end(); ++it)
+    ++(it.value());
+  for (auto it = jobToTaskRow_.begin(); it != jobToTaskRow_.end(); ++it)
+    ++(it.value());
+
   UserTask newTask;
   newTask.taskId = generateTaskId(today);
   newTask.userId = userId;
   newTask.date = today;
   newTask.jobIds.push_back(jobId);
-  tasks_.push_back(std::move(newTask));
-  activeTaskIndex_[userId] = newRow;
-  jobToTaskRow_[jobId] = newRow;
+  tasks_.insert(tasks_.begin(), std::move(newTask));
+  activeTaskIndex_[userId] = 0;
+  jobToTaskRow_[jobId] = 0;
   endInsertRows();
+
+  scheduleAutoSave();
 }
 
 void UserTaskModel::onMetadata(core::MetadataSnapshot metadata)
@@ -258,12 +495,18 @@ void UserTaskModel::onMetadata(core::MetadataSnapshot metadata)
 
   JobCostEntry entry;
   entry.pages = pages > 0 ? pages : 1;
-  entry.price = calculate_job_cost(metadata, PricingConfig{});
+
+  // Use the configured pricing (live from AppConfig), or built-in defaults.
+  const PricingConfig& pc = pricing_ ? *pricing_ : defaultPricing_;
+  entry.price = calculate_job_cost(metadata, pc);
+
   task.jobCosts[jobId] = entry;
   task.recomputeTotals();
 
   const int row = jobMapIt.value();
   emit dataChanged(index(row, ColTotalPages), index(row, ColPrice));
+
+  scheduleAutoSave();
 }
 
 void UserTaskModel::onLifecycleEvent(core::JobLifecycleEvent event)
@@ -289,10 +532,18 @@ void UserTaskModel::completeUserTask(const QString& userId)
   }
   activeTaskIndex_.erase(it);
   emit dataChanged(index(row, 0), index(row, ColumnCount - 1));
+
+  scheduleAutoSave();
 }
 
 void UserTaskModel::clear()
 {
+  // Flush any pending save before clearing.
+  if (dirty_ && !autoSavePath_.isEmpty())
+  {
+    flushSave();
+  }
+
   beginResetModel();
   tasks_.clear();
   activeTaskIndex_.clear();
@@ -300,6 +551,7 @@ void UserTaskModel::clear()
   dailyTaskCounter_ = 0;
   lastTaskDate_ = QDate();
   endResetModel();
+  dirty_ = false;
 }
 
 // ── Private ────────────────────────────────────────────────────────

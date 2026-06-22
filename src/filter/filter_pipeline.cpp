@@ -3,6 +3,10 @@
 
 #include "filter/filter_pipeline.h"
 #include "filter/print_ticket_extractor.h"
+#include "ipc/named_event.h"
+#include "parser/print_ticket_parser.h"
+#include "storage/file_utils.h"
+#include "storage/json_serializer.h"
 #include "storage/page_artifact_writer.h"
 
 #include <filterpipeline.h>
@@ -13,6 +17,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <iomanip>
 #include <sstream>
 #include <string>
@@ -47,6 +52,28 @@ void persist_pending_payloads(const std::vector<storage::PageArtifactPayload>& p
   }
 
   writer.stop();
+}
+
+std::string safe_filename_token(std::string value)
+{
+  if (value.empty())
+  {
+    return "unknown-printer";
+  }
+
+  for (char& ch : value)
+  {
+    const bool keep =
+      (ch >= 'a' && ch <= 'z') ||
+      (ch >= 'A' && ch <= 'Z') ||
+      (ch >= '0' && ch <= '9') ||
+      ch == '-' || ch == '_';
+    if (!keep)
+    {
+      ch = '_';
+    }
+  }
+  return value;
 }
 
 }  // namespace
@@ -249,6 +276,52 @@ HRESULT STDMETHODCALLTYPE XpsCaptureFilter::StartOperation()
           if (!current_job_pt.empty())
           {
             log_pt_capture("Job", current_job_pt);
+
+            // ── Parse PrintTicket → MetadataSnapshot ──────────────────
+            // This extracts the ACTUAL per-job print settings (colour,
+            // duplex, paper, N-up, copies, etc.) from the PrintTicket
+            // XML that flows through the XPS pipeline — the only
+            // authoritative source for v4 drivers.
+            core::MetadataSnapshot pt_meta;
+            pt_meta.schema_version = 1;
+            pt_meta.job_id = job_id_;
+            pt_meta.printer_name = printer_name_;
+            parser::parse_print_ticket_xml(current_job_pt, pt_meta);
+
+            // ── Persist parsed metadata atomically ───────────────────────
+            // The Bridge thread scans the output directory every ~3 s.
+            // A direct write without temp+rename risks the Bridge
+            // reading a truncated file → silent metadata loss.
+            // write_text_file_atomic uses temp-file + MoveFileExW
+            // with MOVEFILE_REPLACE_EXISTING so the metadata file
+            // appears only when fully written.
+            if (!output_directory_.empty())
+            {
+              const std::string printer_token = safe_filename_token(printer_name_);
+              std::filesystem::path meta_path = output_directory_
+                / ("job-" + printer_token + "-" + std::to_string(job_id_) + "-pt-metadata.json");
+              try
+              {
+                const std::string json = storage::to_json(pt_meta);
+                storage::write_text_file_atomic(json, meta_path);
+
+                // ── Signal the UI process ──────────────────────────
+                // The atomic file write above guarantees the file is
+                // complete before we signal.  The watcher side wakes
+                // up and immediately scans for new PT metadata files.
+                try
+                {
+                  ipc::NamedEvent ready_event(
+                    ipc::kPTMetadataReadyEventName, ipc::EventRole::Creator);
+                  if (ready_event.valid())
+                  {
+                    ready_event.signal();
+                  }
+                }
+                catch (...) { /* IPC best-effort, never fail print */ }
+              }
+              catch (...) { /* best-effort — don't fail print job */ }
+            }
           }
           pt->Release();
         }
@@ -316,29 +389,34 @@ HRESULT STDMETHODCALLTYPE XpsCaptureFilter::StartOperation()
         core::PageArtifactIndex index;
         index.schema_version = 1;
         index.job_id = job_id_;
+        index.printer_name = printer_name_;
         index.document_sequence = document_sequence;
         index.page_sequence = page_sequence;
         index.source = "xps-filter";
+        const std::string printer_token = safe_filename_token(printer_name_);
 
         // Set file references (actual files written later in Phase 4a).
         {
           std::ostringstream oss;
-          oss << "job.pt.xml";
+          oss << "job-" << printer_token << '-' << job_id_ << ".pt.xml";
           index.job_print_ticket = oss.str();
         }
         {
           std::ostringstream oss;
-          oss << "document-" << std::setfill('0') << std::setw(3) << document_sequence << ".pt.xml";
+          oss << "job-" << printer_token << '-' << job_id_
+              << "-document-" << std::setfill('0') << std::setw(3) << document_sequence << ".pt.xml";
           index.document_print_ticket = oss.str();
         }
         {
           std::ostringstream oss;
-          oss << "page-" << std::setfill('0') << std::setw(3) << page_sequence << ".pt.xml";
+          oss << "job-" << printer_token << '-' << job_id_
+              << "-page-" << std::setfill('0') << std::setw(3) << page_sequence << ".pt.xml";
           index.page_print_ticket = oss.str();
         }
         {
           std::ostringstream oss;
-          oss << "page-" << std::setfill('0') << std::setw(3) << page_sequence << ".fpage";
+          oss << "job-" << printer_token << '-' << job_id_
+              << "-page-" << std::setfill('0') << std::setw(3) << page_sequence << ".fpage";
           index.fixed_page = oss.str();
         }
 

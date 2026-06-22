@@ -3,6 +3,7 @@
 #include "core/data_contracts.h"
 
 #include <QAbstractTableModel>
+#include <QDateTime>
 #include <QMap>
 #include <QSet>
 #include <QString>
@@ -25,6 +26,7 @@ struct JobRowData
   int totalPages{0};
   int pagesPrinted{0};
   double price{0.0};
+  QDateTime lastUpdated;   // UTC — when the row data last changed
   std::vector<core::JobLifecycleEvent> lifecycleEvents;
 };
 
@@ -41,8 +43,11 @@ class JobTableModel : public QAbstractTableModel
     ColPrinter,
     ColPhase,
     ColProgress,
-    ColTotalPages,
+    ColPages,
     ColCopies,
+    ColColor,
+    ColDuplex,
+    ColPaper,
     ColPrice,
     ColSubmitTime,
     ColumnCount
@@ -56,7 +61,8 @@ class JobTableModel : public QAbstractTableModel
     UserIdRole,          // QString — user identity for color coding
     DocumentPathRole,    // QString — full path to the document file
     RowColorRole,        // QColor — per-user background tint
-    RowTextColorRole     // QColor — per-user foreground
+    RowTextColorRole,    // QColor — per-user foreground
+    FreshnessSecsRole    // int — seconds since last data update
   };
 
   explicit JobTableModel(QObject* parent = nullptr);

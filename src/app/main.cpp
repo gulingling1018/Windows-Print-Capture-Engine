@@ -10,6 +10,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstddef>
+#include <cstdio>
 #include <exception>
 #include <filesystem>
 #include <fstream>
@@ -23,6 +24,7 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#include <shellapi.h>
 #endif
 
 namespace
@@ -123,7 +125,7 @@ void print_usage()
             << "  wpce --sample-xml\n"
             << "  wpce --write-sample-job <output-dir>\n"
             << "  wpce --list-jobs <printer-name>\n"
-            << "  wpce --watch-printer <printer-name> [output-dir] [--stall-timeout <seconds>] [--duration <seconds>] [--perf-log <file>]\n";
+            << "  wpce --watch-printer <printer-name> [output-dir] [--stall-timeout <seconds>] [--duration <seconds>] [--verbose] [--perf-log <file>]\n";
 }
 
 #ifdef _WIN32
@@ -286,6 +288,7 @@ int watch_printer(const std::string_view printer_name,
                   const std::filesystem::path& output_directory,
                   const std::chrono::seconds stall_timeout,
                   const std::chrono::seconds duration_limit,
+                  const bool verbose = false,
                   const std::string& perf_log_path = {})
 {
   try
@@ -365,10 +368,36 @@ int watch_printer(const std::string_view printer_name,
 
     // ── Build watcher config ────────────────────────────────────────────
 
+    wpce::watcher::LogCallback log_callback;
+    if (verbose)
+    {
+      log_callback = [](wpce::watcher::LogLevel level,
+                        std::string_view category,
+                        std::string message) {
+        const char* level_str = "?";
+        switch (level)
+        {
+          case wpce::watcher::LogLevel::Debug: level_str = "DEBUG"; break;
+          case wpce::watcher::LogLevel::Info:  level_str = "INFO "; break;
+          case wpce::watcher::LogLevel::Warn:  level_str = "WARN "; break;
+          case wpce::watcher::LogLevel::Error: level_str = "ERROR"; break;
+        }
+        SYSTEMTIME st{};
+        GetSystemTime(&st);
+        std::fprintf(stderr, "[%02d:%02d:%02d] [%s] [%.*s] %s\n",
+                     st.wHour, st.wMinute, st.wSecond,
+                     level_str,
+                     static_cast<int>(category.size()), category.data(),
+                     message.c_str());
+        std::fflush(stderr);
+      };
+    }
+
     wpce::watcher::WatcherConfig watcher_config{
       .printer_name = widen_utf8(printer_name),
       .wait_timeout = std::chrono::milliseconds{250},
       .stall_timeout = stall_timeout,
+      .log_callback = std::move(log_callback),
     };
 
     wpce::watcher::PrintWatcher watcher(
@@ -510,8 +539,61 @@ int watch_printer(const std::string_view printer_name,
 
 // ── main ──────────────────────────────────────────────────────────────────
 
-int main(const int argc, char* argv[])
+#ifdef _WIN32
+/// Convert wide arguments from GetCommandLineW to UTF-8, bypassing the
+/// ANSI code-page conversion that the MSVC runtime applies to main()'s
+/// argv[].  This is essential for Chinese / CJK printer names on Windows
+/// where the system locale is GBK (CP 936) but our code uses UTF-8.
+std::vector<std::string> make_utf8_argv()
 {
+  std::vector<std::string> result;
+  int argc = 0;
+  LPWSTR* wargv = CommandLineToArgvW(GetCommandLineW(), &argc);
+  if (wargv == nullptr || argc <= 0) return result;
+
+  result.reserve(static_cast<std::size_t>(argc));
+  for (int i = 0; i < argc; ++i)
+  {
+    const wchar_t* warg = wargv[i];
+    if (warg == nullptr || warg[0] == L'\0')
+    {
+      result.emplace_back();
+      continue;
+    }
+    const int len = WideCharToMultiByte(CP_UTF8, 0, warg, -1,
+                                        nullptr, 0, nullptr, nullptr);
+    if (len <= 1)
+    {
+      result.emplace_back();
+      continue;
+    }
+    std::string utf8(static_cast<std::size_t>(len) - 1, '\0');
+    WideCharToMultiByte(CP_UTF8, 0, warg, -1, utf8.data(), len,
+                        nullptr, nullptr);
+    result.push_back(std::move(utf8));
+  }
+  LocalFree(wargv);
+  return result;
+}
+#endif
+
+int main(const int argc_original, char* argv_original[])
+{
+#ifdef _WIN32
+  (void)argc_original;
+  (void)argv_original;
+  const std::vector<std::string> args_utf8 = make_utf8_argv();
+  const int argc = static_cast<int>(args_utf8.size());
+  // Build a pointer array for indexed access matching argv[] convention.
+  std::vector<const char*> argv_ptrs;
+  argv_ptrs.reserve(args_utf8.size());
+  for (const auto& a : args_utf8) argv_ptrs.push_back(a.c_str());
+  const char* const* argv = argv_ptrs.data();
+#else
+  // Non-Windows: use the standard main() arguments directly.
+  const int argc = argc_original;
+  char* const* argv = argv_original;
+#endif
   configure_console_encoding();
 
   const std::string_view command = argc > 1 ? argv[1] : "";
@@ -565,6 +647,7 @@ int main(const int argc, char* argv[])
     std::filesystem::path output_directory = argc > 3 && argv[3][0] != '-' ? argv[3] : "wpce-output";
     std::chrono::seconds stall_timeout{0};
     std::chrono::seconds duration_limit{0};
+    bool verbose = false;
     std::string perf_log_path;
 
     // Parse optional flags.
@@ -579,13 +662,17 @@ int main(const int argc, char* argv[])
       {
         try { duration_limit = std::chrono::seconds{std::stoll(argv[i + 1])}; } catch (...) {}
       }
+      if (arg == "--verbose")
+      {
+        verbose = true;
+      }
       if (arg == "--perf-log" && i + 1 < argc)
       {
         perf_log_path = argv[i + 1];
       }
     }
 
-    return watch_printer(argv[2], output_directory, stall_timeout, duration_limit, perf_log_path);
+    return watch_printer(argv[2], output_directory, stall_timeout, duration_limit, verbose, perf_log_path);
   }
 
   print_usage();

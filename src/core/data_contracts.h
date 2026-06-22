@@ -34,6 +34,7 @@ struct JobSnapshot
   std::string printer_name;
   std::string submit_time_utc;
   std::string status;
+  std::uint32_t raw_status_flags{0};
   std::string source{"winspool"};
 };
 
@@ -41,6 +42,7 @@ struct MetadataSnapshot
 {
   std::int32_t schema_version{1};
   std::uint32_t job_id{0};
+  std::string printer_name;
   FieldValue total_pages;
   FieldValue pages_printed;
   FieldValue copies;
@@ -51,9 +53,17 @@ struct MetadataSnapshot
   FieldValue n_up;            // Pages-per-sheet (1=normal, 2/4/6/9/16=N-up)
   FieldValue collate;         // Whether copies are collated
   FieldValue print_quality;   // DPI resolution category
+  FieldValue media_type;      // Media (plain, glossy, transparency, etc.)
+
+  /// Page range selected by the user in the print dialog (e.g. "1-3,5,7-9").
+  /// Empty when the whole document is printed or the driver does not expose it.
+  /// Captured from the PrintTicket's psk:PageRange ParameterInit.
+  FieldValue page_range;
 
   /// Hex dump of dmFields bitmask for diagnostics.
   /// e.g. "0x0007635f" allows checking which fields the driver reports.
+  /// Set to the literal "PrintTicket" when this snapshot's authoritative
+  /// source is the XPS PrintTicket XML (v4 drivers) rather than DEVMODE.
   std::string dm_fields_hex;
 };
 
@@ -61,6 +71,7 @@ struct PageArtifactIndex
 {
   std::int32_t schema_version{1};
   std::uint32_t job_id{0};
+  std::string printer_name;
   std::int32_t document_sequence{0};
   std::int32_t page_sequence{0};
   std::string job_print_ticket;
@@ -140,4 +151,3 @@ struct JobLifecycleSummary
 };
 
 }  // namespace wpce::core
-
