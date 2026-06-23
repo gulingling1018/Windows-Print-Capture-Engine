@@ -11,6 +11,7 @@
 
 #pragma once
 
+#include "common/app_config.h"
 #include "core/data_contracts.h"
 #include "ui/job_table_model.h"       // for JobRowData
 
@@ -41,6 +42,8 @@ struct UserGroupSummary
   int colorPages = 0;         // colour-flagged pages on default paper
   int specialPaperPages = 0;  // non-A4/B5 pages total
   int jobCount = 0;           // number of child jobs
+  int pendingCount = 0;       // jobs with price_pending == true
+  double totalPrice = 0.0;    // aggregated total_price from child jobs
   QStringList specialItems;   // human-readable list, e.g. "彩色 3页", "A3 2页"
   QDateTime earliestJobTime;  // for group sort ordering
 };
@@ -98,9 +101,13 @@ class UserGroupModel : public QAbstractItemModel
     RowTextColorRole    = Qt::UserRole + 7,  // QColor foreground
     GroupCompletedRole  = Qt::UserRole + 8,  // bool
     FreshnessSecsRole   = Qt::UserRole + 9,  // int seconds since update
+    PricePendingRole    = Qt::UserRole + 10, // bool — job needs manual pricing
+    PendingReasonRole   = Qt::UserRole + 11, // QString — "color" | "unmatched_rule" | ...
   };
 
   explicit UserGroupModel(QObject* parent = nullptr);
+
+  void setPricingConfig(const common::PricingConfig* config) { pricingConfig_ = config; }
 
   // ── QAbstractItemModel overrides ────────────────────────────────────
   QModelIndex index(int row, int column,
@@ -157,6 +164,7 @@ class UserGroupModel : public QAbstractItemModel
   QSet<GroupNode*> dirtyNodes_;             // pending flush
   QTimer* flushTimer_ = nullptr;
   mutable std::mutex dataMutex_;
+  const common::PricingConfig* pricingConfig_ = nullptr;
 };
 
 }  // namespace wpce::ui

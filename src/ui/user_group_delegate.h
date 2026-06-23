@@ -2,8 +2,7 @@
 /// Custom delegate for the user-group tree view.
 ///
 /// Two paint modes:
-///   Group row (depth 0) — expand/collapse chevron, user avatar + pill,
-///     summary stats (pages, duplex, colour, special items), status badge.
+///   Group row (depth 0) — summary stats (pages, duplex, colour, special items), status badge.
 ///   Job row (depth 1)  — per-job columns: document link, phase badge,
 ///     progress bar, page count, colour dot, duplex, paper, time.
 ///
@@ -56,7 +55,7 @@ class UserGroupDelegate : public QStyledItemDelegate
     const bool isGroup = index.data(UserGroupModel::GroupTypeRole).toString() == QStringLiteral("group");
     auto sz = QStyledItemDelegate::sizeHint(option, index);
     if (isGroup)
-      sz.setHeight(58);   // group card with avatar + stats
+      sz.setHeight(64);   // group card with stats (no avatar)
     else
       sz.setHeight(34);   // standard job row
     return sz;
@@ -66,9 +65,15 @@ class UserGroupDelegate : public QStyledItemDelegate
   void documentClicked(const QModelIndex& index);
 
  private:
+  // ── Colour constants for selected state ───────────────────────────
+  // Selected background is light grey (#f1f5f9).  All text must stay
+  // dark enough to be readable on this background.
+  static QColor selNormalText() { return QColor(0x0f, 0x17, 0x2a); }
+  static QColor selMutedText()  { return QColor(0x33, 0x41, 0x55); }
+  static QColor selDocBlue()    { return QColor(0x1e, 0x40, 0xaf); }
+  static QColor selBg()         { return QColor(0xf1, 0xf5, 0xf9); }
+
   // ── Group row painting ────────────────────────────────────────────
-  // Layout:  [▼ chevron] [avatar] [user name pill] [summary stats …] [status badge]
-  //           ← branch area (24px) →  ←────── content area ──────────→
 
   void paintEmptyGroupCell(QPainter* painter, const QStyleOptionViewItem& option,
                            const QModelIndex& index) const
@@ -76,6 +81,12 @@ class UserGroupDelegate : public QStyledItemDelegate
     QStyleOptionViewItem opt = option;
     initStyleOption(&opt, index);
     opt.text.clear();
+    const bool selected = opt.state & QStyle::State_Selected;
+    if (selected)
+    {
+      opt.palette.setColor(QPalette::Highlight, selBg());
+      opt.palette.setColor(QPalette::HighlightedText, selNormalText());
+    }
     QStyle* style = opt.widget ? opt.widget->style() : QApplication::style();
     style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
   }
@@ -86,9 +97,15 @@ class UserGroupDelegate : public QStyledItemDelegate
     QStyleOptionViewItem opt = option;
     initStyleOption(&opt, index);
     opt.text.clear();
+    const bool selected = opt.state & QStyle::State_Selected;
+    if (selected)
+    {
+      opt.palette.setColor(QPalette::Highlight, selBg());
+      opt.palette.setColor(QPalette::HighlightedText, selNormalText());
+    }
     QStyle* style = opt.widget ? opt.widget->style() : QApplication::style();
 
-    // Background.
+    // Background (uses modified palette when selected).
     style->drawControl(QStyle::CE_ItemViewItem, &opt, painter, opt.widget);
 
     painter->save();
@@ -96,10 +113,7 @@ class UserGroupDelegate : public QStyledItemDelegate
 
     const QRect r = opt.rect;
     const QString userId = index.data(UserGroupModel::UserIdRole).toString();
-    const QColor userColor = index.data(UserGroupModel::RowColorRole).value<QColor>();
-    const QColor textColor = index.data(UserGroupModel::RowTextColorRole).value<QColor>();
     const bool completed = index.data(UserGroupModel::GroupCompletedRole).toBool();
-    const bool selected = opt.state & QStyle::State_Selected;
 
     // Read summary data from siblings.
     const QString jobCountStr  = index.siblingAtColumn(UserGroupModel::ColProgress).data(Qt::DisplayRole).toString();
@@ -109,51 +123,21 @@ class UserGroupDelegate : public QStyledItemDelegate
     const QString duplexSheets = index.siblingAtColumn(UserGroupModel::ColDuplex).data(Qt::DisplayRole).toString();
 
     // ── Content area ──────────────────────────────────────────────────
-    // The tree view has setRootIsDecorated(true), which draws the native
-    // expand/collapse chevron in the branch area to the left of
-    // opt.rect.  We intentionally do NOT draw our own chevron here —
-    // doing so produces a confusing double-chevron and breaks the
-    // native click-to-toggle interaction.  opt.rect already starts
-    // after the branch indicator, so only a small padding is added.
-    const int contentX = r.left() + 8;
-    const int contentW = r.right() - contentX - 6;
-    const int cy = r.top() + 7;
-
-    // ── Avatar circle ─────────────────────────────────────────────────
-    const int avaSz = 28;
-    const QRect avaRect(contentX, cy - 1, avaSz, avaSz);
-    const QString initial = userId.isEmpty() ? QStringLiteral("?")
-      : userId.at(0).toUpper();
-
-    QColor avaBg = selected
-      ? userColor.lighter(120)
-      : QColor(userColor.red() * 3 / 5 + 102,
-               userColor.green() * 3 / 5 + 102,
-               userColor.blue() * 3 / 5 + 102);
-    painter->setPen(Qt::NoPen);
-    painter->setBrush(avaBg);
-    painter->drawEllipse(avaRect);
-
-    QFont avaFont;
-    avaFont.setPointSize(12);
-    avaFont.setWeight(QFont::Bold);
-    painter->setFont(avaFont);
-    painter->setPen(textColor);
-    painter->drawText(avaRect, Qt::AlignCenter, initial);
+    const int contentX = r.left() + 10;
+    const int contentW = r.right() - contentX - 10;
+    const int line1Y = r.top() + 8;
 
     // ── User name ─────────────────────────────────────────────────────
-    const int nameX = avaRect.right() + 10;
     QFont nameFont;
     nameFont.setPointSize(11);
     nameFont.setWeight(QFont::DemiBold);
     painter->setFont(nameFont);
-    painter->setPen(selected ? QApplication::palette().highlightedText().color()
-                             : QColor(0x0f, 0x17, 0x2a));
-    QRect nameRect(nameX, cy - 1, 140, 16);
+    painter->setPen(selected ? selNormalText() : QColor(0x0f, 0x17, 0x2a));
+    QRect nameRect(contentX, line1Y, contentW - 80, 18);
     painter->drawText(nameRect, Qt::AlignLeft | Qt::AlignVCenter,
-                      opt.fontMetrics.elidedText(userId, Qt::ElideRight, 140));
+                      opt.fontMetrics.elidedText(userId, Qt::ElideRight, contentW - 80));
 
-    // ── Status badge (右上) ───────────────────────────────────────────
+    // ── Status badge (top-right) ──────────────────────────────────────
     const QString statusText = completed ? QStringLiteral("已结算") : QStringLiteral("进行中");
     const QColor statusBg = completed
       ? QColor(0xdc, 0xfc, 0xe7) : QColor(0xdb, 0xea, 0xfe);
@@ -180,43 +164,42 @@ class UserGroupDelegate : public QStyledItemDelegate
     }
 
     // ── Summary stats (line 2) ───────────────────────────────────────
-    const int line2Y = avaRect.bottom() + 5;
-    const int line2X = contentX + 6;
+    const int line2Y = line1Y + 20;
+    const int line2X = contentX;
     QFont sumFont;
     sumFont.setPointSize(9);
     painter->setFont(sumFont);
-    QColor mutedText = selected ? QColor(0xc0, 0xcb, 0xd8) : QColor(0x64, 0x74, 0x8b);
+    QColor mutedText = selected ? selMutedText() : QColor(0x64, 0x74, 0x8b);
 
     QStringList stats;
     if (!jobCountStr.isEmpty())
-      stats.append(QStringLiteral(" ") + jobCountStr);  // 📄 emoji fallback
+      stats.append(jobCountStr);
     if (!totalPages.isEmpty() && totalPages != QStringLiteral("0"))
-      stats.append(QStringLiteral(" ") + totalPages + QStringLiteral(" 页"));
+      stats.append(totalPages + QStringLiteral(" 页"));
     if (!duplexSheets.isEmpty() && duplexSheets != QStringLiteral("0"))
       stats.append(QStringLiteral("双面 ") + duplexSheets + QStringLiteral(" 张"));
     if (!colorPages.isEmpty())
       stats.append(colorPages);
 
-    // Stats icons as simple Unicode.
-    QString statText = stats.join(QStringLiteral("    "));
+    QString statText = stats.join(QStringLiteral("  |  "));
     if (!statText.isEmpty())
     {
       painter->setPen(mutedText);
-      painter->drawText(line2X, line2Y, contentW, 14,
-                        Qt::AlignLeft, statText);
+      painter->drawText(line2X, line2Y, contentW, 16,
+                        Qt::AlignLeft | Qt::AlignVCenter, statText);
     }
 
     // ── Special items line ────────────────────────────────────────────
     if (!specItems.isEmpty())
     {
-      const int line3Y = line2Y + 15;
+      const int line3Y = line2Y + 18;
       QFont specFont;
       specFont.setPointSize(8);
       painter->setFont(specFont);
-      painter->setPen(selected ? QColor(0xfd, 0xba, 0x74) : QColor(0xb4, 0x53, 0x09));
-      painter->drawText(line2X, line3Y, contentW, 12,
-                        Qt::AlignLeft,
-                        QStringLiteral("⚡ ") + specItems);
+      painter->setPen(selected ? QColor(0x92, 0x40, 0x0e) : QColor(0xb4, 0x53, 0x09));
+      painter->drawText(line2X, line3Y, contentW, 14,
+                        Qt::AlignLeft | Qt::AlignVCenter,
+                        specItems);
     }
 
     painter->restore();
@@ -230,6 +213,12 @@ class UserGroupDelegate : public QStyledItemDelegate
     QStyleOptionViewItem opt = option;
     initStyleOption(&opt, index);
     opt.text.clear();
+    const bool selected = opt.state & QStyle::State_Selected;
+    if (selected)
+    {
+      opt.palette.setColor(QPalette::Highlight, selBg());
+      opt.palette.setColor(QPalette::HighlightedText, selNormalText());
+    }
 
     const int col = index.column();
     QStyle* style = opt.widget ? opt.widget->style() : QApplication::style();
@@ -241,25 +230,49 @@ class UserGroupDelegate : public QStyledItemDelegate
     QRect textRect = style->subElementRect(QStyle::SE_ItemViewItemText, &opt, opt.widget);
     textRect.adjust(4, 0, -4, 0);
 
-    const bool selected = opt.state & QStyle::State_Selected;
-    const QColor normalText = selected
-      ? QApplication::palette().highlightedText().color()
-      : QColor(0x1e, 0x29, 0x3b);
-    const QColor muted = selected ? QColor(0xc0, 0xcb, 0xd8) : QColor(0x64, 0x74, 0x8b);
+    const bool pricePending = index.data(UserGroupModel::PricePendingRole).toBool();
+    const QColor normalText = selected ? selNormalText() : QColor(0x1e, 0x29, 0x3b);
+    const QColor muted      = selected ? selMutedText()  : QColor(0x64, 0x74, 0x8b);
     const QString text = index.data(Qt::DisplayRole).toString();
+
+    // ── Price-pending warning stripe ────────────────────────────────
+    if (pricePending && col != UserGroupModel::ColName)
+    {
+      const int stripeW = 3;
+      QRect stripe(textRect.left() - 2, opt.rect.top() + 4, stripeW,
+                   opt.rect.height() - 8);
+      painter->setPen(Qt::NoPen);
+      painter->setBrush(QColor(0xf5, 0x9e, 0x0b)); // amber-500
+      painter->drawRoundedRect(stripe, 1, 1);
+      textRect.adjust(4, 0, 0, 0);
+    }
 
     if (col == UserGroupModel::ColName)
     {
-      // ── Document name + printer hint ──────────────────────────────
+      // ── Document name ─────────────────────────────────────────────
       QFont f;
       f.setPointSize(9);
       f.setWeight(QFont::DemiBold);
       painter->setFont(f);
-      painter->setPen(selected ? QColor(0x93, 0xc5, 0xfd) : QColor(0x25, 0x63, 0xeb));
-      QRect docRect(textRect.left(), textRect.top(),
-                    textRect.width(), textRect.height());
+      painter->setPen(selected ? selDocBlue() : QColor(0x25, 0x63, 0xeb));
+
+      int offsetX = 0;
+      if (pricePending)
+      {
+        // Warning dot before document name.
+        const int dotSize = 8;
+        painter->setPen(Qt::NoPen);
+        painter->setBrush(QColor(0xf5, 0x9e, 0x0b));
+        painter->drawEllipse(QPointF(textRect.left() + dotSize / 2.0,
+                                     textRect.center().y()),
+                             dotSize / 2.0, dotSize / 2.0);
+        offsetX = dotSize + 6;
+      }
+
+      QRect docRect(textRect.left() + offsetX, textRect.top(),
+                    textRect.width() - offsetX, textRect.height());
       painter->drawText(docRect, Qt::AlignVCenter | Qt::AlignLeft,
-                        opt.fontMetrics.elidedText(text, Qt::ElideRight, textRect.width()));
+                        opt.fontMetrics.elidedText(text, Qt::ElideRight, docRect.width()));
     }
     else if (col == UserGroupModel::ColPhase)
     {
@@ -269,7 +282,9 @@ class UserGroupDelegate : public QStyledItemDelegate
       f.setPointSize(8);
       f.setWeight(QFont::DemiBold);
       painter->setFont(f);
-      painter->setPen(selected ? QApplication::palette().highlightedText().color() : pc);
+      // Phase colour is kept even when selected so the operator can still
+      // quickly spot printing / failed / completed states.
+      painter->setPen(pc);
       painter->drawText(textRect, Qt::AlignCenter, text);
     }
     else if (col == UserGroupModel::ColProgress)
@@ -311,7 +326,7 @@ class UserGroupDelegate : public QStyledItemDelegate
 
       QColor dotC = QColor(0x94, 0xa3, 0xb8);
       if (text.contains(QStringLiteral("彩"))) dotC = QColor(0xdc, 0x26, 0x26);
-      else if (text.contains(QStringLiteral("单"))) dotC = QColor(0x64, 0x74, 0x8b);
+      else if (text.contains(QStringLiteral("黑"))) dotC = QColor(0x1e, 0x29, 0x3b);
 
       painter->setPen(Qt::NoPen);
       painter->setBrush(dotC);

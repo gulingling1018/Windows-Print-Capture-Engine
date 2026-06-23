@@ -62,6 +62,81 @@ endif()
 
 gtest_discover_tests(wpce_parser_tests DISCOVERY_TIMEOUT 30)
 
+# ── Pricing engine tests ───────────────────────────────────────────────────
+
+add_executable(wpce_pricing_engine_tests pricing_engine_tests.cpp)
+
+target_link_libraries(wpce_pricing_engine_tests PRIVATE wpce_core GTest::gtest GTest::gtest_main)
+
+target_include_directories(wpce_pricing_engine_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_BINARY_DIR}/generated
+)
+
+target_compile_features(wpce_pricing_engine_tests PRIVATE cxx_std_20)
+
+if(WIN32)
+  target_compile_definitions(wpce_pricing_engine_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+endif()
+
+if(MSVC)
+  target_compile_options(wpce_pricing_engine_tests PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
+else()
+  target_compile_options(wpce_pricing_engine_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+gtest_discover_tests(wpce_pricing_engine_tests DISCOVERY_TIMEOUT 30)
+
+# ── Settlement bridge tests ────────────────────────────────────────────────
+
+add_executable(wpce_settlement_tests settlement_bridge_tests.cpp)
+
+target_link_libraries(wpce_settlement_tests PRIVATE wpce_core GTest::gtest GTest::gtest_main)
+
+target_include_directories(wpce_settlement_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_BINARY_DIR}/generated
+)
+
+target_compile_features(wpce_settlement_tests PRIVATE cxx_std_20)
+
+if(WIN32)
+  target_compile_definitions(wpce_settlement_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+endif()
+
+if(MSVC)
+  target_compile_options(wpce_settlement_tests PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
+else()
+  target_compile_options(wpce_settlement_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+gtest_discover_tests(wpce_settlement_tests DISCOVERY_TIMEOUT 30)
+
+# ── Counter store tests ─────────────────────────────────────────────────
+
+add_executable(wpce_counter_store_tests counter_store_tests.cpp)
+
+target_link_libraries(wpce_counter_store_tests PRIVATE wpce_core GTest::gtest GTest::gtest_main)
+
+target_include_directories(wpce_counter_store_tests PRIVATE
+  ${PROJECT_SOURCE_DIR}/src
+  ${PROJECT_BINARY_DIR}/generated
+)
+
+target_compile_features(wpce_counter_store_tests PRIVATE cxx_std_20)
+
+if(WIN32)
+  target_compile_definitions(wpce_counter_store_tests PRIVATE WIN32_LEAN_AND_MEAN NOMINMAX UNICODE _UNICODE)
+endif()
+
+if(MSVC)
+  target_compile_options(wpce_counter_store_tests PRIVATE /W4 /permissive- /EHsc /utf-8 /Zc:__cplusplus)
+else()
+  target_compile_options(wpce_counter_store_tests PRIVATE -Wall -Wextra -Wpedantic)
+endif()
+
+gtest_discover_tests(wpce_counter_store_tests DISCOVERY_TIMEOUT 30)
+
 # ── Stress tests (non-GoogleTest) ────────────────────────────────────────
 
 if(TARGET wpce_stress_test)

@@ -2,6 +2,7 @@
 /// User-centric grouped tree model implementation.
 
 #include "ui/user_group_model.h"
+#include "common/pricing_engine.h"
 #include "ui/pricing_config.h"
 #include "ui/user_color_palette.h"
 
@@ -19,6 +20,16 @@ namespace
 {
 
 // ── Helpers ──────────────────────────────────────────────────────────
+
+QString formatDisplayTime(const QString& isoTime)
+{
+  QDateTime dt = QDateTime::fromString(isoTime, Qt::ISODate);
+  if (!dt.isValid())
+    dt = QDateTime::fromString(isoTime, QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+  if (dt.isValid())
+    return dt.toString(QStringLiteral("HH:mm_yyyy/M/d"));
+  return isoTime;
+}
 
 QString phaseDisplayName(core::JobLifecyclePhase phase) noexcept
 {
@@ -204,13 +215,21 @@ QVariant UserGroupModel::data(const QModelIndex& index, int role) const
         {
           case ColName:       return userId.isEmpty() ? QStringLiteral("?") : userId;
           case ColPhase:      return node->completed ? QStringLiteral("已结算") : QStringLiteral("进行中");
-          case ColProgress:   return QStringLiteral("%1 作业").arg(s.jobCount);
+          case ColProgress:
+          {
+            QString txt = QStringLiteral("%1 作业").arg(s.jobCount);
+            if (s.totalPrice > 0.0)
+              txt += QStringLiteral(" · ¥%1").arg(QString::number(s.totalPrice, 'f', 2));
+            if (s.pendingCount > 0)
+              txt += QStringLiteral(" · %1项待定价").arg(s.pendingCount);
+            return txt;
+          }
           case ColPages:      return QString::number(s.simplexPages + s.duplexPages + s.specialPaperPages);
           case ColColor:      return s.colorPages > 0 ? QStringLiteral("彩色 %1页").arg(s.colorPages) : QString();
           case ColDuplex:     return s.duplexSheets > 0 ? QString::number(s.duplexSheets) : QString();
           case ColPaper:      return s.specialItems.join(QStringLiteral(", "));
           case ColSubmitTime: return s.earliestJobTime.isValid()
-            ? s.earliestJobTime.toString(QStringLiteral("HH:mm:ss")) : QString();
+            ? s.earliestJobTime.toString(QStringLiteral("HH:mm_yyyy/M/d")) : QString();
           default:            return {};
         }
       }
@@ -248,6 +267,10 @@ QVariant UserGroupModel::data(const QModelIndex& index, int role) const
       }
       case FreshnessSecsRole:
         return -1;  // group rows aggregate — no single freshness
+      case PricePendingRole:
+        return s.pendingCount > 0;
+      case PendingReasonRole:
+        return s.pendingCount > 0 ? QStringLiteral("pending") : QString();
       default:
         return {};
     }
@@ -281,8 +304,8 @@ QVariant UserGroupModel::data(const QModelIndex& index, int role) const
             if (jd.metadata.color.state == core::FieldState::Reported)
             {
               const auto& v = jd.metadata.color.value;
-              if (v == "color")      return QStringLiteral("⚫ 彩");
-              if (v == "monochrome") return QStringLiteral("⚪ 单");
+              if (v == "color")      return QStringLiteral("彩");
+              if (v == "monochrome") return QStringLiteral("黑");
               return QString::fromStdString(v);
             }
             return QStringLiteral("-");
@@ -300,7 +323,7 @@ QVariant UserGroupModel::data(const QModelIndex& index, int role) const
             return QStringLiteral("-");
           }
           case ColPaper:      return reportedValueOrDash(jd.metadata.paper_size);
-          case ColSubmitTime: return QString::fromStdString(jd.job.submit_time_utc);
+          case ColSubmitTime: return formatDisplayTime(QString::fromStdString(jd.job.submit_time_utc));
           default:            return {};
         }
       }
@@ -342,6 +365,10 @@ QVariant UserGroupModel::data(const QModelIndex& index, int role) const
         if (!jd.lastUpdated.isValid()) return -1;
         return static_cast<int>(jd.lastUpdated.secsTo(QDateTime::currentDateTimeUtc()));
       }
+      case PricePendingRole:
+        return jd.pricing.price_pending;
+      case PendingReasonRole:
+        return QString::fromStdString(jd.pricing.pending_reason);
       default:
         return {};
     }
@@ -361,7 +388,7 @@ QVariant UserGroupModel::headerData(int section, Qt::Orientation orientation,
     case ColProgress:   return QStringLiteral("进度");
     case ColPages:      return QStringLiteral("页数");
     case ColColor:      return QStringLiteral("颜色");
-    case ColDuplex:     return QStringLiteral("双面");
+    case ColDuplex:     return QStringLiteral("单|双面");
     case ColPaper:      return QStringLiteral("纸张");
     case ColSubmitTime: return QStringLiteral("时间");
     default:            return {};
@@ -523,6 +550,11 @@ void UserGroupModel::onMetadata(core::MetadataSnapshot metadata)
     try { row.pagesPrinted = std::stoi(row.metadata.pages_printed.value); }
     catch (...) { row.pagesPrinted = 0; }
 
+    row.pricing = common::compute_job_pricing(row.metadata,
+        pricingConfig_ ? *pricingConfig_ : PricingConfig{},
+        common::PrinterProfileConfig{});
+    row.price = row.pricing.total_price;
+
     // Recompute the parent group's summary.
     if (jobNode->parent != nullptr)
     {
@@ -560,6 +592,11 @@ void UserGroupModel::onLifecycleEvent(core::JobLifecycleEvent event)
     row.pagesPrinted = event.pages_printed;
     row.metadata.pages_printed =
       core::FieldValue{std::to_string(event.pages_printed), core::FieldState::Reported};
+
+    row.pricing = common::compute_job_pricing(row.metadata,
+        pricingConfig_ ? *pricingConfig_ : PricingConfig{},
+        common::PrinterProfileConfig{});
+    row.price = row.pricing.total_price;
 
     row.lifecycleEvents.push_back(std::move(event));
 
@@ -766,6 +803,11 @@ void UserGroupModel::recomputeGroupSummary(GroupNode* group)
         s.specialPaperPages += effectivePages;
       }
     }
+
+    // Aggregate pricing.
+    s.totalPrice += child->jobData.pricing.total_price;
+    if (child->jobData.pricing.price_pending)
+      ++s.pendingCount;
 
     // Track earliest job time.
     QDateTime t = QDateTime::fromString(

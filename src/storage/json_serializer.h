@@ -14,6 +14,10 @@ std::string to_json(const core::MetadataSnapshot& snapshot);
 std::string to_json(const core::JobLifecycleEvent& event);
 std::string to_json(const core::JobLifecycleSummary& summary);
 std::string to_json(const core::PageArtifactIndex& index);
+std::string to_json(const core::PricingRule& rule);
+std::string to_json(const core::JobPricingEntry& entry);
+std::string to_json(const core::SettlementOrder& order);
+std::string to_json(const core::SheetBreakdown& breakdown);
 
 }  // namespace wpce::storage
 

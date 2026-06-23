@@ -24,7 +24,10 @@ struct JobCostLine
   QString colorMode;
   QString duplexMode;
   QString paperSize;
+  QString fileExtension;
   double price = 0.0;
+  bool pricePending = false;
+  QString pendingReason;
 };
 
 class CompletionDialog : public QDialog
@@ -40,10 +43,14 @@ class CompletionDialog : public QDialog
   /// Returns true if the operator confirmed settlement.
   bool confirmed() const { return confirmed_; }
 
+  /// Returns the final prices entered by the operator (index matches input lines).
+  std::vector<double> finalPrices() const;
+
  private:
   void buildUi(const QString& userId,
                const std::vector<JobCostLine>& lines,
                const PricingConfig& pricing);
+  void recalcTotal();
 
   bool confirmed_ = false;
   QTableWidget* table_ = nullptr;

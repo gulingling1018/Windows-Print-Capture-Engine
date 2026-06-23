@@ -14,9 +14,10 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 set(CMAKE_CXX_EXTENSIONS OFF)
 
-# Enable AUTOMOC for Qt meta-object compilation.
+# Enable AUTOMOC and AUTORCC for Qt meta-object and resource compilation.
 if(WPCE_BUILD_UI)
   set(CMAKE_AUTOMOC ON)
+  set(CMAKE_AUTORCC ON)
 endif()
 
 configure_file(

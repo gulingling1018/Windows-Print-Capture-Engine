@@ -27,6 +27,16 @@ QString fromView(std::string_view value)
   return QString::fromUtf8(value.data(), static_cast<qsizetype>(value.size()));
 }
 
+QString formatDisplayTime(const QString& isoTime)
+{
+  QDateTime dt = QDateTime::fromString(isoTime, Qt::ISODate);
+  if (!dt.isValid())
+    dt = QDateTime::fromString(isoTime, QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+  if (dt.isValid())
+    return dt.toString(QStringLiteral("HH:mm_yyyy/M/d"));
+  return isoTime;
+}
+
 QString stateLabel(core::FieldState state)
 {
   switch (state)
@@ -374,12 +384,17 @@ void JobDetailPanel::clear()
 }
 
 void JobDetailPanel::showJob(const core::JobSnapshot& job,
-                              const core::MetadataSnapshot& metadata)
+                              const core::MetadataSnapshot& metadata,
+                              const core::JobPricingEntry& pricing)
 {
   cachedJob_ = job;
   cachedMetadata_ = metadata;
+  cachedPricing_ = pricing;
   showingJob_ = true;
   cachedKeyParamCols_ = (width() >= 360) ? 2 : 1;
+
+  const int savedScroll = (scroll_ && scroll_->verticalScrollBar())
+                            ? scroll_->verticalScrollBar()->value() : 0;
 
   clearLayout(root_);
 
@@ -420,7 +435,7 @@ void JobDetailPanel::showJob(const core::JobSnapshot& job,
     {QStringLiteral("总页数"), &metadata.total_pages},
     {QStringLiteral("已打印"), &metadata.pages_printed},
     {QStringLiteral("份数"),   &metadata.copies},
-    {QStringLiteral("双面"),   &metadata.duplex},
+    {QStringLiteral("单|双面"), &metadata.duplex},
     {QStringLiteral("颜色"),   &metadata.color},
     {QStringLiteral("纸张"),   &metadata.paper_size},
   }, cachedKeyParamCols_));
@@ -438,7 +453,7 @@ void JobDetailPanel::showJob(const core::JobSnapshot& job,
   root_->addWidget(makePlainRow(QStringLiteral("打印机"),
     QString::fromStdString(job.printer_name)));
   root_->addWidget(makePlainRow(QStringLiteral("提交时间"),
-    QString::fromStdString(job.submit_time_utc)));
+    formatDisplayTime(QString::fromStdString(job.submit_time_utc))));
   root_->addWidget(makePlainRow(QStringLiteral("状态"),
     QString::fromStdString(job.status)));
 
@@ -463,6 +478,82 @@ void JobDetailPanel::showJob(const core::JobSnapshot& job,
     root_->addWidget(srcRow);
   }
 
+  // ── Pricing breakdown ──────────────────────────────────────────────
+  auto* pricingSection = new CollapsibleSection(QStringLiteral("定价明细"));
+  pricingSection->setExpanded(true);
+  {
+    auto* pricingWrap = new QWidget();
+    pricingWrap->setObjectName(QStringLiteral("ParamGrid"));
+    auto* pricingLayout = new QVBoxLayout(pricingWrap);
+    pricingLayout->setContentsMargins(0, 0, 0, 0);
+    pricingLayout->setSpacing(6);
+
+    if (pricing.job_id != 0)
+    {
+      auto addPriceRow = [&](const QString& name, const QString& value, const QColor& color) {
+        auto* row = new QFrame();
+        row->setObjectName(QStringLiteral("FieldRow"));
+        auto* layout = new QHBoxLayout(row);
+        layout->setContentsMargins(10, 4, 10, 4);
+        layout->setSpacing(10);
+        auto* nameL = new QLabel(name);
+        nameL->setObjectName(QStringLiteral("FieldName"));
+        auto* valL = new QLabel(value);
+        valL->setObjectName(QStringLiteral("MonoValue"));
+        valL->setStyleSheet(QStringLiteral("color: %1;").arg(color.name()));
+        QFont vf(QStringLiteral("Cascadia Mono"));
+        vf.setStyleHint(QFont::Monospace);
+        vf.setPointSize(10);
+        vf.setWeight(QFont::DemiBold);
+        valL->setFont(vf);
+        layout->addWidget(nameL);
+        layout->addWidget(valL, 1);
+        pricingLayout->addWidget(row);
+      };
+
+      addPriceRow(QStringLiteral("物理纸张"),
+        QStringLiteral("%1 张 (双面完整 %2 + 尾页单面 %3)")
+          .arg(pricing.effective_sheets)
+          .arg(pricing.duplex_full_sheets)
+          .arg(pricing.simplex_tail_pages),
+        QColor(0x0f, 0x17, 0x2a));
+
+      if (!pricing.matched_rule_id.empty())
+        addPriceRow(QStringLiteral("命中规则"),
+          QString::fromStdString(pricing.matched_rule_id), QColor(0x25, 0x63, 0xeb));
+
+      addPriceRow(QStringLiteral("基价"),
+        QStringLiteral("¥%1").arg(QString::number(pricing.base_price, 'f', 2)),
+        QColor(0x0f, 0x17, 0x2a));
+
+      if (pricing.price_pending)
+      {
+        QString reason;
+        if (pricing.pending_reason == "color")
+          reason = QStringLiteral("彩色待定价");
+        else if (pricing.pending_reason == "unmatched_rule")
+          reason = QStringLiteral("未匹配规则");
+        else
+          reason = QStringLiteral("待定价");
+        addPriceRow(QStringLiteral("状态"), reason, QColor(0xdc, 0x26, 0x26));
+      }
+      else
+      {
+        addPriceRow(QStringLiteral("总价"),
+          QStringLiteral("¥%1").arg(QString::number(pricing.total_price, 'f', 2)),
+          QColor(0x16, 0x65, 0x34));
+      }
+    }
+    else
+    {
+      auto* hint = new QLabel(QStringLiteral("尚未计算定价"));
+      hint->setObjectName(QStringLiteral("MutedText"));
+      pricingLayout->addWidget(hint);
+    }
+    pricingSection->setContent(pricingWrap);
+  }
+  root_->addWidget(pricingSection);
+
   root_->addSpacing(4);
 
   // ── Print parameters — grouped in collapsible sections ─────────────
@@ -481,7 +572,7 @@ void JobDetailPanel::showJob(const core::JobSnapshot& job,
   auto* layoutSection = new CollapsibleSection(QStringLiteral("版面参数"));
   layoutSection->setExpanded(true);
   layoutSection->setContent(makeParamGrid({
-    {QStringLiteral("双面"), &metadata.duplex},
+    {QStringLiteral("单|双面"), &metadata.duplex},
     {QStringLiteral("纸张"), &metadata.paper_size},
     {QStringLiteral("方向"), &metadata.orientation},
   }));
@@ -506,7 +597,9 @@ void JobDetailPanel::showJob(const core::JobSnapshot& job,
   }
 
   root_->addStretch();
-  resetScroll();
+
+  if (scroll_ && scroll_->verticalScrollBar())
+    scroll_->verticalScrollBar()->setValue(savedScroll);
 }
 
 void JobDetailPanel::showGroupSummary(const QString& userId,
@@ -514,6 +607,9 @@ void JobDetailPanel::showGroupSummary(const QString& userId,
                                        int activeJobCount,
                                        bool completed)
 {
+  const int savedScroll = (scroll_ && scroll_->verticalScrollBar())
+                            ? scroll_->verticalScrollBar()->value() : 0;
+
   clearLayout(root_);
 
   // ── Title ──────────────────────────────────────────────────────────
@@ -569,6 +665,53 @@ void JobDetailPanel::showGroupSummary(const QString& userId,
   addStat(QStringLiteral("📐"), QStringLiteral("特殊纸张"), summary.specialPaperPages);
   addStat(QStringLiteral("📋"), QStringLiteral("作业数"), summary.jobCount);
 
+  // Total price row.
+  {
+    auto* priceRow = new QHBoxLayout();
+    auto* pico = new QLabel(QStringLiteral("💰"));
+    pico->setFixedWidth(24);
+    pico->setObjectName(QStringLiteral("StatIcon"));
+    auto* plab = new QLabel(QStringLiteral("预估金额"));
+    plab->setObjectName(QStringLiteral("MutedText"));
+    auto* pnum = new QLabel(QStringLiteral("¥%1").arg(QString::number(summary.totalPrice, 'f', 2)));
+    pnum->setObjectName(QStringLiteral("MetricValue"));
+    QFont pf;
+    pf.setWeight(QFont::DemiBold);
+    pf.setPointSize(14);
+    pnum->setFont(pf);
+    if (summary.pendingCount > 0)
+      pnum->setStyleSheet(QStringLiteral("color: #f59e0b;"));
+    else
+      pnum->setStyleSheet(QStringLiteral("color: #16a34a;"));
+    priceRow->addWidget(pico);
+    priceRow->addWidget(plab);
+    priceRow->addStretch();
+    priceRow->addWidget(pnum);
+    cardLayout->addLayout(priceRow);
+  }
+
+  // Pending count warning.
+  if (summary.pendingCount > 0)
+  {
+    auto* pendingRow = new QHBoxLayout();
+    auto* pico = new QLabel(QStringLiteral("⚠"));
+    pico->setFixedWidth(24);
+    pico->setObjectName(QStringLiteral("StatIcon"));
+    auto* plab = new QLabel(QStringLiteral("待定价作业"));
+    plab->setObjectName(QStringLiteral("MutedText"));
+    auto* pnum = new QLabel(QString::number(summary.pendingCount));
+    pnum->setStyleSheet(QStringLiteral("color: #dc2626;"));
+    QFont pf;
+    pf.setWeight(QFont::DemiBold);
+    pf.setPointSize(14);
+    pnum->setFont(pf);
+    pendingRow->addWidget(pico);
+    pendingRow->addWidget(plab);
+    pendingRow->addStretch();
+    pendingRow->addWidget(pnum);
+    cardLayout->addLayout(pendingRow);
+  }
+
   // Active jobs indicator.
   if (activeJobCount > 0)
   {
@@ -621,23 +764,21 @@ void JobDetailPanel::showGroupSummary(const QString& userId,
     root_->addSpacing(4);
     auto* timeLabel = new QLabel(
       QStringLiteral("最早作业: ") +
-      summary.earliestJobTime.toString(QStringLiteral("yyyy-MM-dd HH:mm:ss")));
+      summary.earliestJobTime.toString(QStringLiteral("HH:mm_yyyy/M/d")));
     timeLabel->setObjectName(QStringLiteral("MutedText"));
     root_->addWidget(timeLabel);
   }
 
   root_->addStretch();
-  resetScroll();
+
+  if (scroll_ && scroll_->verticalScrollBar())
+    scroll_->verticalScrollBar()->setValue(savedScroll);
 }
 
 void JobDetailPanel::resetScroll()
 {
-  if (scroll_ == nullptr) return;
-
-  QTimer::singleShot(0, scroll_, [this]() {
-    if (scroll_ != nullptr && scroll_->verticalScrollBar() != nullptr)
-      scroll_->verticalScrollBar()->setValue(0);
-  });
+  if (scroll_ == nullptr || scroll_->verticalScrollBar() == nullptr) return;
+  scroll_->verticalScrollBar()->setValue(0);
 }
 
 void JobDetailPanel::clearLayout(QLayout* layout)
@@ -657,7 +798,11 @@ void JobDetailPanel::clearLayout(QLayout* layout)
 void JobDetailPanel::rebuildJobLayout()
 {
   if (!showingJob_) return;
-  showJob(cachedJob_, cachedMetadata_);
+  const int savedScroll = (scroll_ && scroll_->verticalScrollBar())
+                            ? scroll_->verticalScrollBar()->value() : 0;
+  showJob(cachedJob_, cachedMetadata_, cachedPricing_);
+  if (scroll_ && scroll_->verticalScrollBar())
+    scroll_->verticalScrollBar()->setValue(savedScroll);
 }
 
 void JobDetailPanel::resizeEvent(QResizeEvent* event)

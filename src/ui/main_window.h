@@ -20,10 +20,12 @@ namespace wpce::ui
 {
 
 class WatcherBridge;
-class UserGroupModel;
+class BillingBatchModel;
+class BillingService;
+class HistoryExplorerDialog;
 class JobDetailPanel;
 class ReceiptPreviewPanel;
-class UserTaskModel;
+class QuickSettleDialog;
 
 class MainWindow : public QMainWindow
 {
@@ -45,7 +47,7 @@ class MainWindow : public QMainWindow
   void onTreeSelectionChanged();
   void onPrinterSkipped(const QString& printerName);
   void onWatcherHeartbeat(const QString& printerName);
-  void onUserCompleted(const QString& userId);
+  void onBatchSettled(const QString& orderId, const QString& batchId);
   void checkStalePrinters();
 
  private:
@@ -56,18 +58,22 @@ class MainWindow : public QMainWindow
   void refreshEmptyState();
   void refreshSelectedDetail();
   void refreshGroupRowSpans();
-  void selectFirstIncompleteUser();
+  void selectNextRelevantBatch();
   void refreshReceiptPanel();
   void applySearchFilter();
   void scheduleWorkspaceRebalance();
   void rebalanceWorkspaceSplitters();
   void loadOrCreateConfig();
   void applyConfig();
+  void detectPrintersIfNeeded();
   QString resolveOutputRoot() const;
+  QString resolveStateDir() const;
 
   common::AppConfig config_;
 
   WatcherBridge* bridge_ = nullptr;
+  BillingService* billingService_ = nullptr;
+  BillingBatchModel* batchModel_ = nullptr;
 
   QLabel* sessionStateLabel_ = nullptr;
   QLabel* printerCountLabel_ = nullptr;
@@ -84,19 +90,20 @@ class MainWindow : public QMainWindow
   QPushButton* expandAllBtn_ = nullptr;
   QPushButton* collapseAllBtn_ = nullptr;
   QPushButton* completeUserBtn_ = nullptr;
+  QPushButton* quickSettleBtn_ = nullptr;
 
   QLineEdit* searchEdit_ = nullptr;
 
   QTreeView* treeView_ = nullptr;
   QStackedWidget* tableStack_ = nullptr;
-  UserGroupModel* groupModel_ = nullptr;
   JobDetailPanel* detailPanel_ = nullptr;
   QSplitter* workspaceSplitter_ = nullptr;
   QSplitter* verticalSplitter_ = nullptr;
   bool splitterRebalancePending_ = false;
 
-  UserTaskModel* userTaskModel_ = nullptr;
   ReceiptPreviewPanel* receiptPanel_ = nullptr;
+  QuickSettleDialog* quickSettleDialog_ = nullptr;
+  HistoryExplorerDialog* historyDialog_ = nullptr;
 
   QHash<QString, QDateTime> printerHeartbeats_;
   QTimer* heartbeatCheckTimer_ = nullptr;

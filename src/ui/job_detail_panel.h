@@ -25,7 +25,8 @@ class JobDetailPanel : public QWidget
   explicit JobDetailPanel(QWidget* parent = nullptr);
 
   /// Show per-job detail (individual print job).
-  void showJob(const core::JobSnapshot& job, const core::MetadataSnapshot& metadata);
+  void showJob(const core::JobSnapshot& job, const core::MetadataSnapshot& metadata,
+               const core::JobPricingEntry& pricing = {});
 
   /// Show user-group summary (aggregated stats).
   void showGroupSummary(const QString& userId, const UserGroupSummary& summary,
@@ -50,6 +51,7 @@ class JobDetailPanel : public QWidget
   bool showingJob_ = false;
   core::JobSnapshot cachedJob_;
   core::MetadataSnapshot cachedMetadata_;
+  core::JobPricingEntry cachedPricing_;
   int cachedKeyParamCols_ = 2;
 };
 

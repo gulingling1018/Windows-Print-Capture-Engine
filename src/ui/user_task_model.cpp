@@ -1,4 +1,5 @@
 #include "ui/user_task_model.h"
+#include "common/pricing_engine.h"
 #include "ui/pricing_config.h"
 #include "ui/user_color_palette.h"
 
@@ -498,7 +499,8 @@ void UserTaskModel::onMetadata(core::MetadataSnapshot metadata)
 
   // Use the configured pricing (live from AppConfig), or built-in defaults.
   const PricingConfig& pc = pricing_ ? *pricing_ : defaultPricing_;
-  entry.price = calculate_job_cost(metadata, pc);
+  auto pricing = common::compute_job_pricing(metadata, pc, common::PrinterProfileConfig{});
+  entry.price = pricing.total_price;
 
   task.jobCosts[jobId] = entry;
   task.recomputeTotals();

@@ -21,7 +21,7 @@ class ReceiptCard : public QFrame
                        const QString& firstDoc, const QString& lastDoc,
                        int totalPages, double totalPrice,
                        const QColor& userColor, QWidget* parent = nullptr,
-                       bool completed = false);
+                       bool completed = false, bool hasPending = false);
 
  signals:
   void settleClicked(const QString& userId);
@@ -49,7 +49,8 @@ class ReceiptPreviewPanel : public QWidget
   void addCard(const QString& taskId, const QString& userId,
                const QString& firstDoc, const QString& lastDoc,
                int totalPages, double totalPrice,
-               const QColor& userColor, bool completed = false);
+               const QColor& userColor, bool completed = false,
+               bool hasPending = false);
 
   /// True when at least one card is present.
   [[nodiscard]] bool hasCards() const;

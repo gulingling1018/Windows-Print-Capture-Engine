@@ -1,4 +1,5 @@
 #include "ui/job_table_model.h"
+#include "common/pricing_engine.h"
 #include "ui/pricing_config.h"
 #include "ui/user_color_palette.h"
 
@@ -16,6 +17,16 @@ namespace wpce::ui
 
 namespace
 {
+
+QString formatDisplayTime(const QString& isoTime)
+{
+  QDateTime dt = QDateTime::fromString(isoTime, Qt::ISODate);
+  if (!dt.isValid())
+    dt = QDateTime::fromString(isoTime, QStringLiteral("yyyy-MM-dd HH:mm:ss"));
+  if (dt.isValid())
+    return dt.toString(QStringLiteral("HH:mm_yyyy/M/d"));
+  return isoTime;
+}
 
 QString fromView(const std::string_view value)
 {
@@ -342,8 +353,8 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
       if (data.metadata.color.state == core::FieldState::Reported)
       {
         const auto& v = data.metadata.color.value;
-        if (v == "color")      return QStringLiteral("⚫ 彩");
-        if (v == "monochrome") return QStringLiteral("⚪ 单");
+        if (v == "color")      return QStringLiteral("彩");
+        if (v == "monochrome") return QStringLiteral("黑");
         return QString::fromStdString(v);
       }
       return QStringLiteral("-");
@@ -367,7 +378,7 @@ QVariant JobTableModel::data(const QModelIndex& index, const int role) const
     case ColPrice:
       return data.price > 0.0 ? QString::number(data.price, 'f', 2) : QStringLiteral("-");
     case ColSubmitTime:
-      return QString::fromStdString(data.job.submit_time_utc);
+      return formatDisplayTime(QString::fromStdString(data.job.submit_time_utc));
     default:
       return {};
   }
@@ -401,7 +412,7 @@ QVariant JobTableModel::headerData(const int section,
     case ColColor:
       return QStringLiteral("颜色");
     case ColDuplex:
-      return QStringLiteral("双面");
+      return QStringLiteral("单|双面");
     case ColPaper:
       return QStringLiteral("纸张");
     case ColPrinter:
@@ -540,7 +551,8 @@ void JobTableModel::onMetadata(core::MetadataSnapshot metadata)
     try { row.pagesPrinted = std::stoi(row.metadata.pages_printed.value); }
     catch (...) { row.pagesPrinted = 0; }
 
-    row.price = calculate_job_cost(row.metadata, PricingConfig{});
+    row.pricing = common::compute_job_pricing(row.metadata, PricingConfig{}, common::PrinterProfileConfig{});
+    row.price = row.pricing.total_price;
 
     const int modelRow = jobOrder_.indexOf(row.metadata.job_id);
     if (modelRow >= 0) { dirtyRows_.insert(modelRow); }
@@ -586,7 +598,8 @@ void JobTableModel::onLifecycleEvent(core::JobLifecycleEvent event)
     row.metadata.pages_printed =
       core::FieldValue{std::to_string(event.pages_printed), core::FieldState::Reported};
 
-    row.price = calculate_job_cost(row.metadata, PricingConfig{});
+    row.pricing = common::compute_job_pricing(row.metadata, PricingConfig{}, common::PrinterProfileConfig{});
+    row.price = row.pricing.total_price;
 
     row.lifecycleEvents.push_back(std::move(event));
 

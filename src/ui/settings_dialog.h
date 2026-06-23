@@ -3,6 +3,7 @@
 #include "common/app_config.h"
 
 #include <QCheckBox>
+#include <QComboBox>
 #include <QDialog>
 #include <QDoubleSpinBox>
 #include <QLineEdit>
@@ -31,9 +32,11 @@ class SettingsDialog : public QDialog
  private:
   void buildMerchantTab();
   void buildPricingTab();
+  void buildPrinterTab();
   void buildStorageTab();
   void loadFromConfig();
   void storeToConfig();
+  void reloadPrinterList();
 
   common::AppConfig& config_;
 
@@ -45,12 +48,12 @@ class SettingsDialog : public QDialog
   QLineEdit* merchantAddress_ = nullptr;
 
   // ── Pricing tab ──
-  QDoubleSpinBox* simplexPrice_ = nullptr;
-  QDoubleSpinBox* duplexPrice_ = nullptr;
-  QDoubleSpinBox* colorSurcharge_ = nullptr;
-  QDoubleSpinBox* largePaperSurcharge_ = nullptr;
-  QDoubleSpinBox* highQualitySurcharge_ = nullptr;
-  QTableWidget* volumeDiscountTable_ = nullptr;
+  QCheckBox* colorPricePending_ = nullptr;
+  QTableWidget* pricingRulesTable_ = nullptr;
+
+  // ── Printer tab ──
+  QTableWidget* printerTable_ = nullptr;
+  QPushButton* detectPrintersBtn_ = nullptr;
 
   // ── Storage tab ──
   QLineEdit* outputRoot_ = nullptr;

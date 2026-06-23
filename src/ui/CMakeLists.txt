@@ -7,6 +7,9 @@ set(UI_HEADERS
   grip_splitter.h
   settings_dialog.h
   receipt_preview_panel.h
+  quick_settle_dialog.h
+  billing_batch_model.h
+  history_explorer_dialog.h
 )
 
 set(UI_SOURCES
@@ -20,6 +23,10 @@ set(UI_SOURCES
   user_task_model.cpp
   receipt_preview_panel.cpp
   settings_dialog.cpp
+  quick_settle_dialog.cpp
+  billing_batch_model.cpp
+  history_explorer_dialog.cpp
+  ../billing/billing_service.cpp
   ${UI_HEADERS}
 )
 
@@ -27,7 +34,11 @@ set(UI_RESOURCES
   wpce_ui.rc
 )
 
-add_executable(wpce_ui WIN32 ${UI_SOURCES} ${UI_RESOURCES})
+set(UI_QRC
+  wpce_theme.qrc
+)
+
+add_executable(wpce_ui WIN32 ${UI_SOURCES} ${UI_RESOURCES} ${UI_QRC})
 
 target_include_directories(wpce_ui PRIVATE
   ${PROJECT_SOURCE_DIR}/src

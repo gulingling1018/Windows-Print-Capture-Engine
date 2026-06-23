@@ -1,5 +1,8 @@
 #include "ui/settings_dialog.h"
 
+#include "common/pricing_engine.h"
+#include "common/printer_profile.h"
+
 #include <QComboBox>
 #include <QDialogButtonBox>
 #include <QFileDialog>
@@ -29,6 +32,7 @@ SettingsDialog::SettingsDialog(common::AppConfig& config, QWidget* parent)
 
   buildMerchantTab();
   buildPricingTab();
+  buildPrinterTab();
   buildStorageTab();
 
   root->addWidget(tabs_);
@@ -89,6 +93,31 @@ void SettingsDialog::buildMerchantTab()
 
 // ── Pricing tab ────────────────────────────────────────────────────────────
 
+namespace
+{
+
+QStringList splitDimension(const QString& text)
+{
+  if (text.trimmed() == QStringLiteral("全部")) return {};
+  return text.split('|', Qt::SkipEmptyParts);
+}
+
+QString mapDuplex(const QString& text)
+{
+  if (text.trimmed() == QStringLiteral("单面")) return QStringLiteral("simplex");
+  if (text.trimmed() == QStringLiteral("双面")) return QStringLiteral("duplex");
+  return {};
+}
+
+QString mapColor(const QString& text)
+{
+  if (text.trimmed() == QStringLiteral("黑白")) return QStringLiteral("monochrome");
+  if (text.trimmed() == QStringLiteral("彩色")) return QStringLiteral("color");
+  return {};
+}
+
+}  // namespace
+
 void SettingsDialog::buildPricingTab()
 {
   auto* page = new QWidget();
@@ -96,103 +125,167 @@ void SettingsDialog::buildPricingTab()
   layout->setContentsMargins(16, 16, 16, 16);
   layout->setSpacing(14);
 
-  // ── Base prices ──────────────────────────────────────────────────────
-  auto* baseGroup = new QGroupBox(QStringLiteral("基础价格 (元)"));
-  auto* baseForm = new QFormLayout(baseGroup);
-  baseForm->setSpacing(8);
+  // ── Colour auto-pricing toggle ─────────────────────────────────────
+  colorPricePending_ = new QCheckBox(QStringLiteral("彩色作业不自动定价，需操作员手动填写"));
+  layout->addWidget(colorPricePending_);
 
-  simplexPrice_ = new QDoubleSpinBox();
-  simplexPrice_->setRange(0.00, 999.99);
-  simplexPrice_->setDecimals(2);
-  simplexPrice_->setSingleStep(0.05);
-  simplexPrice_->setSuffix(QStringLiteral(" 元/页"));
-  baseForm->addRow(QStringLiteral("单面打印："), simplexPrice_);
+  // ── Pricing rules matrix ───────────────────────────────────────────
+  auto* rulesGroup = new QGroupBox(QStringLiteral("定价规则矩阵 (支持 A4|B5 多值)"));
+  auto* rulesLayout = new QVBoxLayout(rulesGroup);
 
-  duplexPrice_ = new QDoubleSpinBox();
-  duplexPrice_->setRange(0.00, 999.99);
-  duplexPrice_->setDecimals(2);
-  duplexPrice_->setSingleStep(0.05);
-  duplexPrice_->setSuffix(QStringLiteral(" 元/张"));
-  baseForm->addRow(QStringLiteral("双面打印："), duplexPrice_);
+  pricingRulesTable_ = new QTableWidget(0, 5);
+  pricingRulesTable_->setHorizontalHeaderLabels({
+    QStringLiteral("纸张"), QStringLiteral("单|双面"),
+    QStringLiteral("颜色"), QStringLiteral("文件类型"),
+    QStringLiteral("单价(元/张)") });
+  pricingRulesTable_->horizontalHeader()->setStretchLastSection(true);
+  pricingRulesTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
+  pricingRulesTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::Interactive);
+  pricingRulesTable_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::Interactive);
+  pricingRulesTable_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::Interactive);
+  pricingRulesTable_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::Interactive);
+  pricingRulesTable_->setColumnWidth(0, 90);
+  pricingRulesTable_->setColumnWidth(1, 80);
+  pricingRulesTable_->setColumnWidth(2, 80);
+  pricingRulesTable_->setColumnWidth(3, 90);
+  pricingRulesTable_->setColumnWidth(4, 100);
+  pricingRulesTable_->verticalHeader()->hide();
+  pricingRulesTable_->setAlternatingRowColors(true);
+  pricingRulesTable_->setStyleSheet(QStringLiteral(
+    "QTableWidget { border: 1px solid #e2e8f0; border-radius: 6px; }"
+    "QTableWidget::item { padding: 5px 8px; }"));
 
-  layout->addWidget(baseGroup);
+  rulesLayout->addWidget(pricingRulesTable_);
 
-  // ── Surcharges ───────────────────────────────────────────────────────
-  auto* surchGroup = new QGroupBox(QStringLiteral("附加费 (元/页)"));
-  auto* surchForm = new QFormLayout(surchGroup);
-  surchForm->setSpacing(8);
+  // ── Add-rule row with combos (idiot-proof) ─────────────────────────
+  auto* addRow = new QFrame();
+  addRow->setStyleSheet(QStringLiteral(
+    "QFrame { background: #f8fafc; border: 1px solid #e2e8f0; border-radius: 6px; }"));
+  auto* addLayout = new QHBoxLayout(addRow);
+  addLayout->setContentsMargins(10, 8, 10, 8);
+  addLayout->setSpacing(8);
 
-  colorSurcharge_ = new QDoubleSpinBox();
-  colorSurcharge_->setRange(0.00, 999.99);
-  colorSurcharge_->setDecimals(2);
-  colorSurcharge_->setSingleStep(0.10);
-  colorSurcharge_->setSuffix(QStringLiteral(" 元/页"));
-  surchForm->addRow(QStringLiteral("彩色附加："), colorSurcharge_);
+  auto* paperCombo = new QComboBox();
+  paperCombo->setEditable(true);
+  paperCombo->addItems({QStringLiteral("A4|B5"), QStringLiteral("A4"), QStringLiteral("B5"),
+                        QStringLiteral("A3"), QStringLiteral("Letter"), QStringLiteral("Legal"),
+                        QStringLiteral("全部")});
+  paperCombo->setCurrentText(QStringLiteral("A4|B5"));
+  paperCombo->setMinimumWidth(80);
 
-  largePaperSurcharge_ = new QDoubleSpinBox();
-  largePaperSurcharge_->setRange(0.00, 999.99);
-  largePaperSurcharge_->setDecimals(2);
-  largePaperSurcharge_->setSingleStep(0.10);
-  largePaperSurcharge_->setSuffix(QStringLiteral(" 元/页"));
-  surchForm->addRow(QStringLiteral("大幅面附加(A3+)："), largePaperSurcharge_);
+  auto* duplexCombo = new QComboBox();
+  duplexCombo->addItems({QStringLiteral("单面"), QStringLiteral("双面"), QStringLiteral("全部")});
+  duplexCombo->setMinimumWidth(70);
 
-  highQualitySurcharge_ = new QDoubleSpinBox();
-  highQualitySurcharge_->setRange(0.00, 999.99);
-  highQualitySurcharge_->setDecimals(2);
-  highQualitySurcharge_->setSingleStep(0.05);
-  highQualitySurcharge_->setSuffix(QStringLiteral(" 元/页"));
-  surchForm->addRow(QStringLiteral("高质量附加："), highQualitySurcharge_);
+  auto* colorCombo = new QComboBox();
+  colorCombo->addItems({QStringLiteral("黑白"), QStringLiteral("彩色"), QStringLiteral("全部")});
+  colorCombo->setMinimumWidth(70);
 
-  layout->addWidget(surchGroup);
+  auto* extCombo = new QComboBox();
+  extCombo->setEditable(true);
+  extCombo->addItems({QStringLiteral("全部"), QStringLiteral("pdf"), QStringLiteral("doc"),
+                      QStringLiteral("docx"), QStringLiteral("dwg"),
+                      QStringLiteral("ppt"), QStringLiteral("pptx")});
+  extCombo->setCurrentText(QStringLiteral("全部"));
+  extCombo->setMinimumWidth(80);
 
-  // ── Volume discounts ─────────────────────────────────────────────────
-  auto* volGroup = new QGroupBox(QStringLiteral("批量折扣"));
-  auto* volLayout = new QVBoxLayout(volGroup);
+  auto* priceSpin = new QDoubleSpinBox();
+  priceSpin->setRange(0.00, 999.99);
+  priceSpin->setDecimals(2);
+  priceSpin->setSingleStep(0.05);
+  priceSpin->setValue(0.15);
+  priceSpin->setMinimumWidth(80);
 
-  volumeDiscountTable_ = new QTableWidget(0, 2);
-  volumeDiscountTable_->setHorizontalHeaderLabels({QStringLiteral("最低页数"), QStringLiteral("折扣率")});
-  volumeDiscountTable_->horizontalHeader()->setStretchLastSection(true);
-  volumeDiscountTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Interactive);
-  volumeDiscountTable_->setColumnWidth(0, 130);
-  volumeDiscountTable_->verticalHeader()->hide();
-  volumeDiscountTable_->setAlternatingRowColors(true);
+  auto* addRuleBtn = new QPushButton(QStringLiteral("+ 添加"));
+  addRuleBtn->setCursor(Qt::PointingHandCursor);
+  addRuleBtn->setStyleSheet(QStringLiteral(
+    "QPushButton { background: #2563eb; color: white; border: none; border-radius: 5px;"
+    "  padding: 5px 14px; font-weight: 600; font-size: 12px; }"
+    "QPushButton:hover { background: #1d4ed8; }"));
 
-  auto* volBtnRow = new QHBoxLayout();
-  auto* addTierBtn = new QPushButton(QStringLiteral("+ 添加阶梯"));
-  addTierBtn->setCursor(Qt::PointingHandCursor);
-  auto* removeTierBtn = new QPushButton(QStringLiteral("- 移除选中"));
-  removeTierBtn->setCursor(Qt::PointingHandCursor);
+  auto* removeRuleBtn = new QPushButton(QStringLiteral("- 移除"));
+  removeRuleBtn->setCursor(Qt::PointingHandCursor);
+  removeRuleBtn->setStyleSheet(QStringLiteral(
+    "QPushButton { background: #f1f5f9; color: #475569; border: 1px solid #cbd5e1;"
+    "  border-radius: 5px; padding: 5px 14px; font-weight: 600; font-size: 12px; }"
+    "QPushButton:hover { background: #e2e8f0; }"));
 
-  connect(addTierBtn, &QPushButton::clicked, this,
-          [this]()
-          {
-            const int row = volumeDiscountTable_->rowCount();
-            volumeDiscountTable_->insertRow(row);
-            auto* pagesItem = new QTableWidgetItem(QStringLiteral("100"));
-            pagesItem->setData(Qt::EditRole, 100);
-            volumeDiscountTable_->setItem(row, 0, pagesItem);
-            auto* discItem = new QTableWidgetItem(QStringLiteral("0.95"));
-            discItem->setData(Qt::EditRole, 0.95);
-            volumeDiscountTable_->setItem(row, 1, discItem);
-          });
+  addLayout->addWidget(new QLabel(QStringLiteral("纸张")));
+  addLayout->addWidget(paperCombo);
+  addLayout->addWidget(new QLabel(QStringLiteral("单双")));
+  addLayout->addWidget(duplexCombo);
+  addLayout->addWidget(new QLabel(QStringLiteral("颜色")));
+  addLayout->addWidget(colorCombo);
+  addLayout->addWidget(new QLabel(QStringLiteral("类型")));
+  addLayout->addWidget(extCombo);
+  addLayout->addWidget(new QLabel(QStringLiteral("单价")));
+  addLayout->addWidget(priceSpin);
+  addLayout->addWidget(addRuleBtn);
+  addLayout->addWidget(removeRuleBtn);
+  addLayout->addStretch(1);
 
-  connect(removeTierBtn, &QPushButton::clicked, this,
-          [this]()
-          {
-            const int row = volumeDiscountTable_->currentRow();
-            if (row >= 0)
-            {
-              volumeDiscountTable_->removeRow(row);
-            }
-          });
+  rulesLayout->addWidget(addRow);
 
-  volBtnRow->addWidget(addTierBtn);
-  volBtnRow->addWidget(removeTierBtn);
-  volBtnRow->addStretch(1);
+  // Preset buttons
+  auto* presetRow = new QHBoxLayout();
+  auto* presetLabel = new QLabel(QStringLiteral("快速预设:"));
+  presetLabel->setStyleSheet(QStringLiteral("color: #64748b; font-size: 11px;"));
+  presetRow->addWidget(presetLabel);
 
-  volLayout->addWidget(volumeDiscountTable_);
-  volLayout->addLayout(volBtnRow);
-  layout->addWidget(volGroup);
+  auto addPreset = [&](const QString& name, const QString& paper, const QString& duplex,
+                       const QString& color, const QString& ext, double price)
+  {
+    auto* btn = new QPushButton(name);
+    btn->setCursor(Qt::PointingHandCursor);
+    btn->setStyleSheet(QStringLiteral(
+      "QPushButton { background: #eff6ff; color: #1d4ed8; border: 1px solid #bfdbfe;"
+      "  border-radius: 5px; padding: 4px 10px; font-size: 11px; font-weight: 600; }"
+      "QPushButton:hover { background: #dbeafe; }"));
+    connect(btn, &QPushButton::clicked, this, [=]() {
+      paperCombo->setCurrentText(paper);
+      duplexCombo->setCurrentText(duplex);
+      colorCombo->setCurrentText(color);
+      extCombo->setCurrentText(ext);
+      priceSpin->setValue(price);
+    });
+    presetRow->addWidget(btn);
+  };
+
+  addPreset(QStringLiteral("A4单黑白"), QStringLiteral("A4|B5"), QStringLiteral("单面"),
+            QStringLiteral("黑白"), QStringLiteral("全部"), 0.15);
+  addPreset(QStringLiteral("A4双黑白"), QStringLiteral("A4|B5"), QStringLiteral("双面"),
+            QStringLiteral("黑白"), QStringLiteral("全部"), 0.25);
+  addPreset(QStringLiteral("A3单黑白"), QStringLiteral("A3"), QStringLiteral("单面"),
+            QStringLiteral("黑白"), QStringLiteral("全部"), 0.5);
+  addPreset(QStringLiteral("A3双黑白"), QStringLiteral("A3"), QStringLiteral("双面"),
+            QStringLiteral("黑白"), QStringLiteral("全部"), 1.0);
+  addPreset(QStringLiteral("A3单dwg"), QStringLiteral("A3"), QStringLiteral("单面"),
+            QStringLiteral("黑白"), QStringLiteral("dwg"), 1.0);
+  addPreset(QStringLiteral("A4单dwg"), QStringLiteral("A4|B5"), QStringLiteral("单面"),
+            QStringLiteral("黑白"), QStringLiteral("dwg"), 0.5);
+
+  presetRow->addStretch(1);
+  rulesLayout->addLayout(presetRow);
+
+  connect(addRuleBtn, &QPushButton::clicked, this, [=]() {
+    const int row = pricingRulesTable_->rowCount();
+    pricingRulesTable_->insertRow(row);
+    pricingRulesTable_->setItem(row, 0, new QTableWidgetItem(paperCombo->currentText()));
+    pricingRulesTable_->setItem(row, 1, new QTableWidgetItem(duplexCombo->currentText()));
+    pricingRulesTable_->setItem(row, 2, new QTableWidgetItem(colorCombo->currentText()));
+    pricingRulesTable_->setItem(row, 3, new QTableWidgetItem(extCombo->currentText()));
+    auto* priceItem = new QTableWidgetItem();
+    priceItem->setData(Qt::EditRole, priceSpin->value());
+    pricingRulesTable_->setItem(row, 4, priceItem);
+  });
+
+  connect(removeRuleBtn, &QPushButton::clicked, this, [this]() {
+    const int row = pricingRulesTable_->currentRow();
+    if (row >= 0)
+      pricingRulesTable_->removeRow(row);
+  });
+
+  layout->addWidget(rulesGroup);
   layout->addStretch(1);
 
   tabs_->addTab(page, QStringLiteral("价格方案"));
@@ -278,23 +371,58 @@ void SettingsDialog::loadFromConfig()
   merchantAddress_->setText(QString::fromStdString(config_.merchant.address));
 
   // Pricing
-  simplexPrice_->setValue(config_.pricing.single_sided_per_page);
-  duplexPrice_->setValue(config_.pricing.double_sided_per_sheet);
-  colorSurcharge_->setValue(config_.pricing.color_surcharge);
-  largePaperSurcharge_->setValue(config_.pricing.large_paper_surcharge);
-  highQualitySurcharge_->setValue(config_.pricing.high_quality_surcharge);
+  colorPricePending_->setChecked(config_.pricing.color_price_pending);
 
-  volumeDiscountTable_->setRowCount(0);
-  for (const auto& tier : config_.pricing.volume_discounts)
+  pricingRulesTable_->setRowCount(0);
+  if (config_.pricing.rules.empty())
   {
-    const int row = volumeDiscountTable_->rowCount();
-    volumeDiscountTable_->insertRow(row);
-    auto* pagesItem = new QTableWidgetItem();
-    pagesItem->setData(Qt::EditRole, tier.min_pages);
-    volumeDiscountTable_->setItem(row, 0, pagesItem);
-    auto* discItem = new QTableWidgetItem();
-    discItem->setData(Qt::EditRole, tier.discount);
-    volumeDiscountTable_->setItem(row, 1, discItem);
+    // Load factory defaults.
+    auto addDefault = [&](const QString& paper, const QString& duplex,
+                          const QString& color, const QString& ext, double price)
+    {
+      int row = pricingRulesTable_->rowCount();
+      pricingRulesTable_->insertRow(row);
+      pricingRulesTable_->setItem(row, 0, new QTableWidgetItem(paper));
+      pricingRulesTable_->setItem(row, 1, new QTableWidgetItem(duplex));
+      pricingRulesTable_->setItem(row, 2, new QTableWidgetItem(color));
+      pricingRulesTable_->setItem(row, 3, new QTableWidgetItem(ext));
+      auto* priceItem = new QTableWidgetItem();
+      priceItem->setData(Qt::EditRole, price);
+      pricingRulesTable_->setItem(row, 4, priceItem);
+    };
+    addDefault(QStringLiteral("A4|B5"), QStringLiteral("单面"), QStringLiteral("黑白"), QStringLiteral("全部"), 0.15);
+    addDefault(QStringLiteral("A4|B5"), QStringLiteral("双面"), QStringLiteral("黑白"), QStringLiteral("全部"), 0.25);
+    addDefault(QStringLiteral("A3"),    QStringLiteral("单面"), QStringLiteral("黑白"), QStringLiteral("全部"), 0.5);
+    addDefault(QStringLiteral("A3"),    QStringLiteral("双面"), QStringLiteral("黑白"), QStringLiteral("全部"), 1.0);
+    addDefault(QStringLiteral("A3"),    QStringLiteral("单面"), QStringLiteral("黑白"), QStringLiteral("dwg"),  1.0);
+    addDefault(QStringLiteral("A4|B5"), QStringLiteral("单面"), QStringLiteral("黑白"), QStringLiteral("dwg"),  0.5);
+  }
+  else
+  {
+    for (const auto& rule : config_.pricing.rules)
+    {
+      const int row = pricingRulesTable_->rowCount();
+      pricingRulesTable_->insertRow(row);
+      QString paper = QString::fromStdString(rule.paper_size);
+      QString duplex = QString::fromStdString(rule.duplex_mode);
+      QString color = QString::fromStdString(rule.color_mode);
+      QString ext = QString::fromStdString(rule.file_extension);
+      if (paper.isEmpty()) paper = QStringLiteral("全部");
+      if (duplex.isEmpty()) duplex = QStringLiteral("全部");
+      else if (duplex == QStringLiteral("simplex")) duplex = QStringLiteral("单面");
+      else if (duplex == QStringLiteral("duplex")) duplex = QStringLiteral("双面");
+      if (color.isEmpty()) color = QStringLiteral("全部");
+      else if (color == QStringLiteral("monochrome")) color = QStringLiteral("黑白");
+      else if (color == QStringLiteral("color")) color = QStringLiteral("彩色");
+      if (ext.isEmpty()) ext = QStringLiteral("全部");
+      pricingRulesTable_->setItem(row, 0, new QTableWidgetItem(paper));
+      pricingRulesTable_->setItem(row, 1, new QTableWidgetItem(duplex));
+      pricingRulesTable_->setItem(row, 2, new QTableWidgetItem(color));
+      pricingRulesTable_->setItem(row, 3, new QTableWidgetItem(ext));
+      auto* priceItem = new QTableWidgetItem();
+      priceItem->setData(Qt::EditRole, rule.price_per_sheet);
+      pricingRulesTable_->setItem(row, 4, priceItem);
+    }
   }
 
   // Storage
@@ -306,6 +434,9 @@ void SettingsDialog::loadFromConfig()
   // Monitoring
   stallTimeout_->setValue(config_.monitoring.stall_timeout_seconds);
   perfLogEnabled_->setChecked(config_.monitoring.perf_log_enabled);
+
+  // Printers
+  reloadPrinterList();
 }
 
 void SettingsDialog::storeToConfig()
@@ -316,33 +447,81 @@ void SettingsDialog::storeToConfig()
   config_.merchant.address = merchantAddress_->text().trimmed().toStdString();
 
   // Pricing
-  config_.pricing.single_sided_per_page = simplexPrice_->value();
-  config_.pricing.double_sided_per_sheet = duplexPrice_->value();
-  config_.pricing.color_surcharge = colorSurcharge_->value();
-  config_.pricing.large_paper_surcharge = largePaperSurcharge_->value();
-  config_.pricing.high_quality_surcharge = highQualitySurcharge_->value();
+  config_.pricing.color_price_pending = colorPricePending_->isChecked();
 
-  config_.pricing.volume_discounts.clear();
-  for (int row = 0; row < volumeDiscountTable_->rowCount(); ++row)
+  config_.pricing.rules.clear();
+  for (int row = 0; row < pricingRulesTable_->rowCount(); ++row)
   {
-    const auto* pagesItem = volumeDiscountTable_->item(row, 0);
-    const auto* discItem = volumeDiscountTable_->item(row, 1);
-    if (pagesItem == nullptr || discItem == nullptr) continue;
+    auto* paperItem = pricingRulesTable_->item(row, 0);
+    auto* duplexItem = pricingRulesTable_->item(row, 1);
+    auto* colorItem = pricingRulesTable_->item(row, 2);
+    auto* extItem = pricingRulesTable_->item(row, 3);
+    auto* priceItem = pricingRulesTable_->item(row, 4);
 
-    bool ok = false;
-    const int minPages = pagesItem->data(Qt::EditRole).toInt(&ok);
-    if (!ok || minPages <= 0) continue;
+    double price = 0.0;
+    if (priceItem)
+    {
+      bool ok = false;
+      price = priceItem->data(Qt::EditRole).toDouble(&ok);
+      if (!ok) price = 0.0;
+    }
 
-    const double discount = discItem->data(Qt::EditRole).toDouble(&ok);
-    if (!ok || discount <= 0.0 || discount > 1.0) continue;
+    QStringList papers = splitDimension(paperItem ? paperItem->text() : QString());
+    QStringList duplexes = splitDimension(duplexItem ? duplexItem->text() : QString());
+    QStringList colors = splitDimension(colorItem ? colorItem->text() : QString());
+    QStringList exts = splitDimension(extItem ? extItem->text() : QString());
 
-    config_.pricing.volume_discounts.push_back({minPages, discount});
+    if (papers.isEmpty()) papers.append(QString());
+    if (duplexes.isEmpty()) duplexes.append(QString());
+    if (colors.isEmpty()) colors.append(QString());
+    if (exts.isEmpty()) exts.append(QString());
+
+    for (const QString& p : papers)
+    {
+      for (const QString& d : duplexes)
+      {
+        for (const QString& c : colors)
+        {
+          for (const QString& e : exts)
+          {
+            core::PricingRule rule;
+            rule.rule_id = std::to_string(config_.pricing.rules.size() + 1);
+            rule.paper_size = p.trimmed().toStdString();
+            rule.duplex_mode = mapDuplex(d).toStdString();
+            rule.color_mode = mapColor(c).toStdString();
+            rule.file_extension = e.trimmed().toLower().toStdString();
+            rule.price_per_sheet = price;
+            rule.priority = wpce::common::rule_specificity(rule);
+            config_.pricing.rules.push_back(std::move(rule));
+          }
+        }
+      }
+    }
   }
-  // Keep sorted.
-  std::sort(config_.pricing.volume_discounts.begin(),
-            config_.pricing.volume_discounts.end(),
-            [](const common::VolumeDiscountTier& a, const common::VolumeDiscountTier& b)
-            { return a.min_pages < b.min_pages; });
+  wpce::common::sort_rules_by_priority(config_.pricing.rules);
+
+  // Printers (color capability profiles)
+  config_.printers.profiles.clear();
+  if (printerTable_ != nullptr)
+  {
+    for (int row = 0; row < printerTable_->rowCount(); ++row)
+    {
+      auto* nameItem = printerTable_->item(row, 0);
+      auto* combo = qobject_cast<QComboBox*>(printerTable_->cellWidget(row, 1));
+      if (nameItem == nullptr) continue;
+      common::PrinterProfile profile;
+      profile.printer_name = nameItem->text().trimmed().toStdString();
+      if (combo != nullptr)
+      {
+        int idx = combo->currentIndex();
+        if (idx == 0) profile.is_color_capable = true;
+        else if (idx == 1) profile.is_color_capable = false;
+        else continue;  // "不监听" — skip
+      }
+      if (!profile.printer_name.empty())
+        config_.printers.profiles.push_back(std::move(profile));
+    }
+  }
 
   // Storage
   config_.storage.output_root = outputRoot_->text().trimmed().toStdString();
@@ -389,6 +568,79 @@ void SettingsDialog::onRestoreDefaults()
 
   config_ = common::AppConfig::defaults();
   loadFromConfig();
+}
+
+// ── Printer tab ─────────────────────────────────────────────────────────────
+
+void SettingsDialog::buildPrinterTab()
+{
+  auto* page = new QWidget();
+  auto* layout = new QVBoxLayout(page);
+  layout->setContentsMargins(16, 16, 16, 16);
+  layout->setSpacing(14);
+
+  auto* headerRow = new QHBoxLayout();
+  auto* headerLabel = new QLabel(QStringLiteral("打印机能力配置"));
+  headerLabel->setStyleSheet(QStringLiteral(
+    "font-size: 14px; font-weight: bold; color: #0f172a;"));
+  headerRow->addWidget(headerLabel);
+  headerRow->addStretch(1);
+
+  detectPrintersBtn_ = new QPushButton(QStringLiteral("重新探测"));
+  detectPrintersBtn_->setCursor(Qt::PointingHandCursor);
+  detectPrintersBtn_->setStyleSheet(QStringLiteral(
+    "QPushButton { background: #2563eb; color: white; border: none;"
+    "  border-radius: 5px; padding: 6px 14px; font-weight: 600; font-size: 12px; }"
+    "QPushButton:hover { background: #1d4ed8; }"));
+  connect(detectPrintersBtn_, &QPushButton::clicked, this, [this]() {
+    config_.printers = wpce::common::detect_printer_capabilities();
+    reloadPrinterList();
+  });
+  headerRow->addWidget(detectPrintersBtn_);
+  layout->addLayout(headerRow);
+
+  auto* hintLabel = new QLabel(QStringLiteral(
+    "黑白打印机收到彩色作业时按黑白计价；\n"
+    "彩色打印机收到彩色作业时留空等操作员填价。"));
+  hintLabel->setStyleSheet(QStringLiteral("color: #64748b; font-size: 11px;"));
+  layout->addWidget(hintLabel);
+
+  printerTable_ = new QTableWidget(0, 2);
+  printerTable_->setHorizontalHeaderLabels({
+    QStringLiteral("打印机名称"), QStringLiteral("能力") });
+  printerTable_->horizontalHeader()->setSectionResizeMode(0, QHeaderView::Stretch);
+  printerTable_->horizontalHeader()->setSectionResizeMode(1, QHeaderView::ResizeToContents);
+  printerTable_->verticalHeader()->hide();
+  printerTable_->setAlternatingRowColors(true);
+  printerTable_->setStyleSheet(QStringLiteral(
+    "QTableWidget { border: 1px solid #e2e8f0; border-radius: 6px; }"
+    "QTableWidget::item { padding: 5px 8px; }"));
+  layout->addWidget(printerTable_);
+
+  layout->addStretch(1);
+  tabs_->addTab(page, QStringLiteral("打印机"));
+}
+
+void SettingsDialog::reloadPrinterList()
+{
+  if (printerTable_ == nullptr) return;
+  printerTable_->setRowCount(0);
+
+  for (const auto& profile : config_.printers.profiles)
+  {
+    int row = printerTable_->rowCount();
+    printerTable_->insertRow(row);
+    printerTable_->setItem(row, 0, new QTableWidgetItem(
+      QString::fromStdString(profile.printer_name)));
+
+    auto* combo = new QComboBox();
+    combo->addItem(QStringLiteral("彩色"));
+    combo->addItem(QStringLiteral("黑白"));
+    combo->addItem(QStringLiteral("不监听"));
+    combo->setCurrentIndex(profile.is_color_capable ? 0 : 1);
+    combo->setStyleSheet(QStringLiteral("QComboBox { padding: 4px 8px; }"));
+    printerTable_->setCellWidget(row, 1, combo);
+  }
 }
 
 }  // namespace wpce::ui

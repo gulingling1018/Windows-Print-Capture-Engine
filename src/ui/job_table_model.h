@@ -26,6 +26,7 @@ struct JobRowData
   int totalPages{0};
   int pagesPrinted{0};
   double price{0.0};
+  core::JobPricingEntry pricing;
   QDateTime lastUpdated;   // UTC — when the row data last changed
   std::vector<core::JobLifecycleEvent> lifecycleEvents;
 };

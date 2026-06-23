@@ -60,6 +60,10 @@ struct MetadataSnapshot
   /// Captured from the PrintTicket's psk:PageRange ParameterInit.
   FieldValue page_range;
 
+  /// File extension extracted from the document name (e.g. "pdf", "dwg", "docx").
+  /// Lowercased, without the leading dot.  Used for per-filetype pricing rules.
+  FieldValue file_extension;
+
   /// Hex dump of dmFields bitmask for diagnostics.
   /// e.g. "0x0007635f" allows checking which fields the driver reports.
   /// Set to the literal "PrintTicket" when this snapshot's authoritative
@@ -148,6 +152,89 @@ struct JobLifecycleSummary
 
   /// Total observed lifecycle wall-clock duration in milliseconds.
   std::int64_t total_duration_ms{0};
+};
+
+// ── Pricing & settlement data structures ─────────────────────────────────
+
+/// A single pricing rule in the matrix-based pricing system.
+/// Empty string fields mean "match all" — the rule applies regardless of
+/// that dimension.  Priority (specificity score) is computed automatically.
+///
+/// Multi-value dimensions: `paper_size` and `file_extension` may contain
+/// a pipe-separated string like "A4|B5" or "pdf|dwg" in the config file.
+/// At load time these are split into `paper_size_set` / `file_extension_set`
+/// for proper multi-value matching.  The single-string fields are kept
+/// for backward-compat serialisation; the set fields are authoritative
+/// for matching when non-empty.
+struct PricingRule
+{
+  std::string rule_id;           // Unique identifier, e.g. "rule-001"
+  std::string paper_size;        // Empty = match all; may be "A4|B5"
+  std::string duplex_mode;       // "simplex" | "duplex" | "" = all
+  std::string color_mode;        // "color" | "monochrome" | "" = all
+  std::string file_extension;    // Empty = match all; may be "pdf|dwg"
+  double price_per_sheet{0.0};   // Price per physical sheet of paper
+  int priority{0};               // Specificity: count of non-empty dimensions
+
+  /// Multi-value expansions of paper_size (lowercased, no surrounding pipes).
+  /// Empty means "match all paper sizes".
+  std::vector<std::string> paper_size_set;
+
+  /// Multi-value expansions of file_extension (lowercased).
+  /// Empty means "match all file types".
+  std::vector<std::string> file_extension_set;
+};
+
+/// Breakdown of physical sheet consumption for a print job,
+/// correctly handling the odd-page tail in duplex printing.
+struct SheetBreakdown
+{
+  int full_duplex_sheets{0};   // Complete duplex sheets (2 pages each)
+  int simplex_tail_pages{0};   // Leftover simplex pages (0 or 1 for duplex)
+  int total_sheets{0};         // total = full_duplex_sheets + simplex_tail_pages
+};
+
+/// Per-job pricing result produced by the pricing engine.
+/// Carries enough detail for the frontend to display a transparent
+/// price breakdown and flag items that require manual operator input.
+struct JobPricingEntry
+{
+  std::uint32_t job_id{0};
+  int total_pages{0};
+  int copies{1};
+  int effective_sheets{0};       // Total physical sheets consumed
+  int duplex_full_sheets{0};     // Complete duplex sheets
+  int simplex_tail_pages{0};     // Odd-page tail (simplex)
+  std::string matched_rule_id;   // ID of the rule that matched, or empty
+  std::string tail_rule_id;      // ID of the rule used for simplex tail, or empty
+  double base_price{0.0};        // Full duplex sheets price
+  double tail_price{0.0};        // Simplex tail pages price
+  double total_price{0.0};
+  bool price_pending{false};     // Requires operator to manually enter a price
+  std::string pending_reason;    // "color" | "unmatched_rule" | "no_simplex_rule_for_tail" | ...
+  bool color_downgraded{false};  // True if color job on B&W printer → charged as monochrome
+  std::string note;              // Human-readable note (e.g. "color_on_bw_printer")
+};
+
+/// A frozen settlement order that captures all pricing decisions at the
+/// moment of settlement.  This is the immutable audit record.
+struct SettlementOrder
+{
+  std::int32_t schema_version{2};
+  std::string order_id;             // e.g. "SETTLE-20260622-000001"
+  std::string batch_id;             // Associated BillingBatch.batch_id (v2+)
+  std::string task_id;              // Legacy field (kept for v1 backward compat)
+  std::string user_id;              // Batch display_name (v2+) or legacy user
+  std::string settled_by;           // Operator name (filled by frontend)
+  std::string settled_at_utc;       // ISO8601 timestamp of settlement
+  std::string period_start_utc;     // Time window start
+  std::string period_end_utc;       // Time window end
+  std::vector<std::uint32_t> job_ids;      // Print jobs in this order
+  std::vector<JobPricingEntry> pricing_entries;  // Per-job cost breakdown
+  std::string pricing_snapshot_json; // Frozen PricingConfig at settlement time
+  double total_price{0.0};
+  double color_merged_total{0.0};   // >0 when operator entered a single merged color price
+  std::string currency{"CNY"};
 };
 
 }  // namespace wpce::core

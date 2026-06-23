@@ -1,4 +1,5 @@
 #include "collector/metadata_collector.h"
+#include "common/pricing_engine.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -521,6 +522,7 @@ core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
     snapshot.collate = make_not_reported();
     snapshot.print_quality = make_not_reported();
     snapshot.media_type = make_not_reported();
+    snapshot.file_extension = make_not_reported();
     return snapshot;
   }
 
@@ -540,6 +542,23 @@ core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
   snapshot.collate = extract_collate(*dm);
   snapshot.print_quality = extract_print_quality(*dm);
   snapshot.media_type = extract_media_type(*dm);
+
+  // Extract file extension from the document name for per-filetype pricing.
+  {
+    std::string doc_name = to_utf8(job.pDocument);
+    if (!doc_name.empty())
+    {
+      std::string ext = common::extract_file_extension(doc_name);
+      if (!ext.empty())
+        snapshot.file_extension = core::FieldValue{std::move(ext), core::FieldState::Reported};
+      else
+        snapshot.file_extension = make_not_reported();
+    }
+    else
+    {
+      snapshot.file_extension = make_not_reported();
+    }
+  }
 
   return snapshot;
 }

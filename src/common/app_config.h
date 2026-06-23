@@ -1,5 +1,8 @@
 #pragma once
 
+#include "common/printer_profile.h"
+#include "core/data_contracts.h"
+
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
@@ -31,32 +34,28 @@ struct StorageConfig
   int retention_days{90};
 };
 
-struct VolumeDiscountTier
-{
-  int min_pages{0};
-  double discount{1.0}; // 1.0 = full price, 0.85 = 15% off
-};
-
 struct PricingConfig
 {
-  /// Price per page for single-sided (simplex) printing.  Default: 0.15 CNY/page.
-  double single_sided_per_page{0.15};
+  // ── Matrix pricing rules ───────────────────────────────────────────
+  //
+  // The legacy additive fields (single_sided_per_page, color_surcharge,
+  // volume_discounts, etc.) have been removed.  All pricing is now
+  // matrix-based.  Old config files containing legacy fields are still
+  // loadable — the legacy fields are silently ignored.
 
-  /// Price per sheet for double-sided (duplex) printing.  Default: 0.25 CNY/sheet.
-  double double_sided_per_sheet{0.25};
+  /// Per-dimension pricing rules.  When non-empty, the pricing engine
+  /// uses matrix-based matching.  When empty, the engine falls back to
+  /// the built-in factory defaults (see AppConfig::defaults()).
+  std::vector<core::PricingRule> rules;
 
-  /// Additional surcharge per page when printing in colour.
-  double color_surcharge{0.50};
-
-  /// Additional surcharge per page for large paper sizes (A3, Tabloid, Ledger).
-  double large_paper_surcharge{0.30};
-
-  /// Additional surcharge per page for high-quality / photo mode.
-  double high_quality_surcharge{0.10};
-
-  /// Volume discount tiers.  Sorted by min_pages ascending.
-  /// e.g. [{100, 0.95}, {500, 0.90}, {1000, 0.85}]
-  std::vector<VolumeDiscountTier> volume_discounts;
+  /// When true, colour print jobs are NOT auto-priced.  Instead they
+  /// are flagged as price_pending and the operator must enter a price
+  /// manually in the settlement dialog.  Default: true.
+  ///
+  /// Note: this only applies to jobs on color-capable printers.  A
+  /// "color" job on a B&W printer is downgraded to monochrome pricing
+  /// and never flagged as pending, regardless of this setting.
+  bool color_price_pending{true};
 
   /// ISO 4217 currency code or symbol.  Default: "CNY".
   std::string currency{"CNY"};
@@ -100,7 +99,13 @@ struct AppConfig
   MonitoringConfig monitoring;
   WindowLayoutConfig window;
 
-  /// Build a config populated with sensible factory defaults.
+  /// Printer capability profiles for color-aware pricing.
+  /// Populated automatically on first launch via
+  /// detect_printer_capabilities(); user can override in settings.
+  PrinterProfileConfig printers;
+
+  /// Build a config populated with sensible factory defaults,
+  /// including the 6 default pricing rules.
   static AppConfig defaults();
 
   /// Resolve the best configuration file path:
@@ -119,7 +124,10 @@ struct AppConfig
 
   /// Populate this configuration from a JSON file.  Returns true on success.
   /// Missing keys retain their current (typically default) values.
+  /// Legacy additive pricing fields (if present in an old file) are
+  /// silently ignored.
   bool load_from_json(const std::filesystem::path& path);
 };
 
 }  // namespace wpce::common
+

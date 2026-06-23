@@ -212,6 +212,15 @@ core::MetadataSnapshot merge_metadata_snapshots(core::MetadataSnapshot current,
   merge_field(current.media_type,    incoming.media_type,    current_pt, incoming_pt);
   merge_field(current.page_range,    incoming.page_range,    current_pt, incoming_pt);
 
+  // file_extension is extracted from the document name in the DEVMODE
+  // path only (PrintTicket path doesn't expose it).  Treat it like a
+  // progress field — always take a Reported value when available,
+  // regardless of which source is "authoritative" for other settings.
+  // This prevents a PrintTicket snapshot from blocking a later DEVMODE
+  // snapshot's file_extension, which would otherwise cause per-filetype
+  // pricing rules to silently fail to match.
+  merge_progress_field(current.file_extension, incoming.file_extension);
+
   // Source marker — PrintTicket authority is sticky.
   if (incoming_pt || current_pt)
   {
@@ -227,7 +236,12 @@ core::MetadataSnapshot merge_metadata_snapshots(core::MetadataSnapshot current,
 
 }  // namespace
 
-WatcherBridge::WatcherBridge(QObject* parent) : QObject(parent) {}
+WatcherBridge::WatcherBridge(QObject* parent) : QObject(parent)
+{
+  qRegisterMetaType<core::JobSnapshot>("core::JobSnapshot");
+  qRegisterMetaType<core::MetadataSnapshot>("core::MetadataSnapshot");
+  qRegisterMetaType<core::JobLifecycleEvent>("core::JobLifecycleEvent");
+}
 
 WatcherBridge::~WatcherBridge()
 {
@@ -491,7 +505,9 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
       {
         log_callback(watcher::LogLevel::Warn, "bridge",
                      "Printer \"" + narrow_utf8(printerName.c_str()) + "\" skipped — OpenPrinterW failed");
-        emit printerSkipped(QString::fromStdWString(printerName));
+        QMetaObject::invokeMethod(this, [this, pName = QString::fromStdWString(printerName)]() {
+          emit printerSkipped(pName);
+        }, Qt::QueuedConnection);
         return;
       }
       ClosePrinter(hTest);
@@ -514,7 +530,9 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
     auto jobCallback = [&](const core::JobSnapshot& rawSnapshot)
     {
       core::JobSnapshot snapshot = normalizeJobSnapshot(rawSnapshot, printer_name_str);
-      emit jobSnapshotReceived(snapshot);
+      QMetaObject::invokeMethod(this, [this, snapshot]() {
+        emit jobSnapshotReceived(snapshot);
+      }, Qt::QueuedConnection);
       std::scoped_lock lock(pendingMutex);
       jobCache[snapshot.job_id] = snapshot;
     };
@@ -530,7 +548,9 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
     auto metadataCallback = [&](const core::MetadataSnapshot& rawMetadata)
     {
       core::MetadataSnapshot metadata = normalizeMetadata(rawMetadata, printer_name_str);
-      emit metadataReceived(metadata);
+      QMetaObject::invokeMethod(this, [this, metadata]() {
+        emit metadataReceived(metadata);
+      }, Qt::QueuedConnection);
       core::JobSnapshot job;
       {
         std::scoped_lock lock(pendingMutex);
@@ -607,7 +627,9 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
     auto lifecycleCallback = [&](const core::JobLifecycleEvent& rawEvent)
     {
       core::JobLifecycleEvent event = normalizeLifecycleEvent(rawEvent, printer_name_str);
-      emit lifecycleEventReceived(event);
+      QMetaObject::invokeMethod(this, [this, event]() {
+        emit lifecycleEventReceived(event);
+      }, Qt::QueuedConnection);
     };
 
     watcher::PrintWatcher watcher(
@@ -631,7 +653,8 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
     std::unordered_set<std::string> seen_pt_files;
     // Seed with files already present (don't replay old sessions).
     {
-      for (const auto& entry : std::filesystem::directory_iterator(outputDir))
+      std::error_code ec;
+      for (const auto& entry : std::filesystem::directory_iterator(outputDir, ec))
       {
         auto n = entry.path().filename().string();
         if (n.starts_with("job-") && n.ends_with("-pt-metadata.json"))
@@ -752,12 +775,16 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
   }
   catch (const std::exception& error)
   {
-    emit watcherError(QString::fromStdString(error.what()));
+    QMetaObject::invokeMethod(this, [this, msg = QString::fromStdString(error.what())]() {
+      emit watcherError(msg);
+    }, Qt::QueuedConnection);
   }
   catch (...)
   {
-    emit watcherError(QStringLiteral("Unknown error watching %1")
-                      .arg(QString::fromStdWString(printerName)));
+    QMetaObject::invokeMethod(this, [this, msg = QStringLiteral("Unknown error watching %1")
+                      .arg(QString::fromStdWString(printerName))]() {
+      emit watcherError(msg);
+    }, Qt::QueuedConnection);
   }
 }
 
@@ -807,70 +834,70 @@ void WatcherBridge::runWatcherWithRestart(const std::wstring& printerName,
 
     // ── Unexpected exit — schedule restart with backoff ───────────────
     const auto now = std::chrono::steady_clock::now();
+    std::chrono::seconds delay{1};
 
-    std::scoped_lock lock(restartStateMutex_);
-    auto& state = restartStates_[printerName];
-    state.printer_name = printerName;
-
-    if (state.restart_count == 0)
     {
-      state.first_restart_time = now;
-    }
+      std::scoped_lock lock(restartStateMutex_);
+      auto& state = restartStates_[printerName];
+      state.printer_name = printerName;
 
-    ++state.restart_count;
-
-    // ── Budget check ──────────────────────────────────────────────────
-    if (state.restart_count > kMaxRestarts &&
-        now - state.first_restart_time < kRestartWindow)
-    {
-      state.permanent_failure = true;
-      auto name = QString::fromStdWString(printerName);
-      auto error_msg = QStringLiteral("在 %1 分钟内崩溃 %2 次，已停止重试")
-                         .arg(kRestartWindow.count())
-                         .arg(kMaxRestarts);
-      common::log_error("bridge",
-        printer_utf8 + ": permanent failure — " +
-        std::to_string(kMaxRestarts) + " crashes in " +
-        std::to_string(kRestartWindow.count()) + " min");
-
-      QMetaObject::invokeMethod(this, [this, name = std::move(name),
-                                        error = std::move(error_msg)]() {
-        emit watcherPermanentFailure(name, error);
-      }, Qt::QueuedConnection);
-      return;
-    }
-
-    // ── Reset counter if previous session was stable ──────────────────
-    if (state.restart_count > 1)
-    {
-      auto elapsed_since_first =
-        std::chrono::duration_cast<std::chrono::seconds>(
-          now - state.first_restart_time);
-      if (elapsed_since_first > kResetAfterStable)
+      if (state.restart_count == 0)
       {
-        // Ran stably for > 60 s before this crash — reset the counter.
-        state.restart_count = 1;
         state.first_restart_time = now;
       }
-    }
 
-    // ── Compute backoff ───────────────────────────────────────────────
-    const int backoff_index = std::min(
-      state.restart_count - 1,
-      static_cast<int>(std::size(kBackoffSequence)) - 1);
-    const auto delay = kBackoffSequence[backoff_index];
-    state.current_backoff = delay;
+      ++state.restart_count;
 
-    common::log_warn("bridge",
-      printer_utf8 + ": watcher exited unexpectedly, restart " +
-      std::to_string(state.restart_count) + "/" +
-      std::to_string(kMaxRestarts) + " after " +
-      std::to_string(delay.count()) + " s backoff");
+      // ── Budget check ──────────────────────────────────────────────────
+      if (state.restart_count > kMaxRestarts &&
+          now - state.first_restart_time < kRestartWindow)
+      {
+        state.permanent_failure = true;
+        auto name = QString::fromStdWString(printerName);
+        auto error_msg = QStringLiteral("在 %1 分钟内崩溃 %2 次，已停止重试")
+                           .arg(kRestartWindow.count())
+                           .arg(kMaxRestarts);
+        common::log_error("bridge",
+          printer_utf8 + ": permanent failure — " +
+          std::to_string(kMaxRestarts) + " crashes in " +
+          std::to_string(kRestartWindow.count()) + " min");
+
+        QMetaObject::invokeMethod(this, [this, name = std::move(name),
+                                          error = std::move(error_msg)]() {
+          emit watcherPermanentFailure(name, error);
+        }, Qt::QueuedConnection);
+        return;
+      }
+
+      // ── Reset counter if previous session was stable ──────────────────
+      if (state.restart_count > 1)
+      {
+        auto elapsed_since_first =
+          std::chrono::duration_cast<std::chrono::seconds>(
+            now - state.first_restart_time);
+        if (elapsed_since_first > kResetAfterStable)
+        {
+          // Ran stably for > 60 s before this crash — reset the counter.
+          state.restart_count = 1;
+          state.first_restart_time = now;
+        }
+      }
+
+      // ── Compute backoff ───────────────────────────────────────────────
+      const int backoff_index = std::min(
+        state.restart_count - 1,
+        static_cast<int>(std::size(kBackoffSequence)) - 1);
+      delay = kBackoffSequence[backoff_index];
+      state.current_backoff = delay;
+
+      common::log_warn("bridge",
+        printer_utf8 + ": watcher exited unexpectedly, restart " +
+        std::to_string(state.restart_count) + "/" +
+        std::to_string(kMaxRestarts) + " after " +
+        std::to_string(delay.count()) + " s backoff");
+    }  // lock released here
 
     // ── Sleep with backoff ────────────────────────────────────────────
-    // Unlock before sleeping so stopWatching() can inspect state.
-    lock.~scoped_lock();
-
     const auto deadline = std::chrono::steady_clock::now() + delay;
     while (std::chrono::steady_clock::now() < deadline)
     {

@@ -4,6 +4,7 @@
 #include "ui/completion_dialog.h"
 
 #include <QDialogButtonBox>
+#include <QDoubleSpinBox>
 #include <QFrame>
 #include <QHeaderView>
 #include <QLabel>
@@ -25,13 +26,32 @@ CompletionDialog::CompletionDialog(const QString& userId,
   buildUi(userId, lines, pricing);
 }
 
+std::vector<double> CompletionDialog::finalPrices() const
+{
+  std::vector<double> result;
+  if (table_ == nullptr) return result;
+
+  for (int row = 0; row < table_->rowCount(); ++row)
+  {
+    auto* spin = qobject_cast<QDoubleSpinBox*>(table_->cellWidget(row, 4));
+    if (spin != nullptr)
+      result.push_back(spin->value());
+    else
+    {
+      auto* item = table_->item(row, 4);
+      result.push_back(item != nullptr ? item->text().toDouble() : 0.0);
+    }
+  }
+  return result;
+}
+
 void CompletionDialog::buildUi(const QString& userId,
                                 const std::vector<JobCostLine>& lines,
                                 const PricingConfig& /*pricing*/)
 {
   setWindowTitle(QStringLiteral("结算 — %1").arg(userId));
-  setMinimumSize(520, 360);
-  resize(560, 420);
+  setMinimumSize(580, 400);
+  resize(640, 480);
 
   auto* root = new QVBoxLayout(this);
   root->setContentsMargins(20, 20, 20, 20);
@@ -58,12 +78,11 @@ void CompletionDialog::buildUi(const QString& userId,
   detailLabel->setFont(sectionFont);
   root->addWidget(detailLabel);
 
-  table_ = new QTableWidget(static_cast<int>(lines.size()), 5, this);
+  table_ = new QTableWidget(static_cast<int>(lines.size()), 6, this);
   table_->setHorizontalHeaderLabels({
     QStringLiteral("文档"), QStringLiteral("页数"),
-    QStringLiteral("颜色"), QStringLiteral("双面"),
-    QStringLiteral("金额 (¥)") });
-  table_->setEditTriggers(QAbstractItemView::NoEditTriggers);
+    QStringLiteral("颜色"), QStringLiteral("单|双面"),
+    QStringLiteral("金额 (¥)"), QStringLiteral("状态") });
   table_->setSelectionBehavior(QAbstractItemView::SelectRows);
   table_->setAlternatingRowColors(true);
   table_->setShowGrid(false);
@@ -74,18 +93,18 @@ void CompletionDialog::buildUi(const QString& userId,
   table_->horizontalHeader()->setSectionResizeMode(2, QHeaderView::ResizeToContents);
   table_->horizontalHeader()->setSectionResizeMode(3, QHeaderView::ResizeToContents);
   table_->horizontalHeader()->setSectionResizeMode(4, QHeaderView::ResizeToContents);
+  table_->horizontalHeader()->setSectionResizeMode(5, QHeaderView::ResizeToContents);
   table_->setStyleSheet(QStringLiteral(
     "QTableWidget { background: white; border: 1px solid #e2e8f0; border-radius: 6px; }"
     "QTableWidget::item { padding: 6px 10px; }"
     "QHeaderView::section { background: #f1f5f9; color: #475569; font-weight: bold;"
     "  padding: 7px 10px; border-bottom: 2px solid #cbd5e1; }"));
 
-  double grandTotal = 0.0;
-  int grandPages = 0;
-
+  int pendingCount = 0;
   for (std::size_t i = 0; i < lines.size(); ++i)
   {
     const auto& line = lines[i];
+    if (line.pricePending) ++pendingCount;
 
     auto* docItem = new QTableWidgetItem(line.documentName);
     docItem->setData(Qt::UserRole, line.pages);
@@ -99,27 +118,87 @@ void CompletionDialog::buildUi(const QString& userId,
     auto* duplexItem = new QTableWidgetItem(line.duplexMode);
     duplexItem->setTextAlignment(Qt::AlignCenter);
 
-    std::ostringstream priceStr;
-    priceStr << std::fixed << std::setprecision(2) << line.price;
-    auto* priceItem = new QTableWidgetItem(QString::fromStdString(priceStr.str()));
-    priceItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
-    QFont monoFont(QStringLiteral("Cascadia Mono"));
-    monoFont.setStyleHint(QFont::Monospace);
-    priceItem->setFont(monoFont);
-    if (line.price > 0)
-      priceItem->setForeground(QColor(0x06, 0x76, 0x47));
+    // Price column: editable spin-box for pending, read-only label otherwise.
+    if (line.pricePending)
+    {
+      auto* spin = new QDoubleSpinBox();
+      spin->setRange(0.00, 9999.99);
+      spin->setDecimals(2);
+      spin->setSingleStep(0.10);
+      spin->setValue(line.price);
+      spin->setButtonSymbols(QAbstractSpinBox::NoButtons);
+      spin->setStyleSheet(QStringLiteral(
+        "QDoubleSpinBox { border: 1px solid #f59e0b; border-radius: 4px;"
+        "  padding: 3px 6px; background: #fffbeb; color: #92400e; }"
+        "QDoubleSpinBox:focus { border-color: #d97706; background: white; }"));
+      connect(spin, QOverload<double>::of(&QDoubleSpinBox::valueChanged),
+              this, &CompletionDialog::recalcTotal);
+      table_->setCellWidget(static_cast<int>(i), 4, spin);
+    }
+    else
+    {
+      std::ostringstream priceStr;
+      priceStr << std::fixed << std::setprecision(2) << line.price;
+      auto* priceItem = new QTableWidgetItem(QString::fromStdString(priceStr.str()));
+      priceItem->setTextAlignment(Qt::AlignRight | Qt::AlignVCenter);
+      QFont monoFont(QStringLiteral("Cascadia Mono"));
+      monoFont.setStyleHint(QFont::Monospace);
+      priceItem->setFont(monoFont);
+      if (line.price > 0)
+        priceItem->setForeground(QColor(0x06, 0x76, 0x47));
+      table_->setItem(static_cast<int>(i), 4, priceItem);
+    }
+
+    // Status column.
+    QString statusText;
+    if (line.pricePending)
+    {
+      if (line.pendingReason == QStringLiteral("color"))
+        statusText = QStringLiteral("彩印待填价");
+      else if (line.pendingReason == QStringLiteral("unmatched_rule"))
+        statusText = QStringLiteral("未匹配规则");
+      else
+        statusText = QStringLiteral("待填价");
+    }
+    else if (line.price <= 0.0)
+    {
+      statusText = QStringLiteral("—");
+    }
+    else
+    {
+      statusText = QStringLiteral("已定价");
+    }
+    auto* statusItem = new QTableWidgetItem(statusText);
+    statusItem->setTextAlignment(Qt::AlignCenter);
+    if (line.pricePending)
+    {
+      statusItem->setForeground(QColor(0x92, 0x40, 0x0e));
+      statusItem->setBackground(QColor(0xff, 0xfb, 0xeb));
+    }
+    table_->setItem(static_cast<int>(i), 5, statusItem);
 
     table_->setItem(static_cast<int>(i), 0, docItem);
     table_->setItem(static_cast<int>(i), 1, pagesItem);
     table_->setItem(static_cast<int>(i), 2, colorItem);
     table_->setItem(static_cast<int>(i), 3, duplexItem);
-    table_->setItem(static_cast<int>(i), 4, priceItem);
-
-    grandTotal += line.price;
-    grandPages += line.pages;
   }
 
   root->addWidget(table_, 1);
+
+  // ── Pending warning banner ─────────────────────────────────────────
+  if (pendingCount > 0)
+  {
+    auto* warnFrame = new QFrame();
+    warnFrame->setStyleSheet(QStringLiteral(
+      "QFrame { background: #fffbeb; border: 1px solid #f59e0b; border-radius: 6px; }"));
+    auto* warnLayout = new QHBoxLayout(warnFrame);
+    warnLayout->setContentsMargins(12, 8, 12, 8);
+    auto* warnLabel = new QLabel(
+      QStringLiteral("⚠ 有 %1 项作业需要手动定价，请在「金额」列输入价格后确认结算。").arg(pendingCount));
+    warnLabel->setStyleSheet(QStringLiteral("color: #92400e; font-weight: 600;"));
+    warnLayout->addWidget(warnLabel);
+    root->addWidget(warnFrame);
+  }
 
   // ── Totals row ─────────────────────────────────────────────────────
   auto* totalFrame = new QFrame();
@@ -131,12 +210,7 @@ void CompletionDialog::buildUi(const QString& userId,
   totalLayout->setContentsMargins(14, 10, 14, 10);
   totalLayout->setSpacing(4);
 
-  std::ostringstream totalStr;
-  totalStr << std::fixed << std::setprecision(2) << grandTotal;
-  totalLabel_ = new QLabel(
-    QStringLiteral("合计: %1 页    金额: ¥%2")
-      .arg(grandPages)
-      .arg(QString::fromStdString(totalStr.str())));
+  totalLabel_ = new QLabel(QStringLiteral("合计: 0 页    金额: ¥0.00"));
   QFont totalFont;
   totalFont.setPointSize(13);
   totalFont.setWeight(QFont::DemiBold);
@@ -145,6 +219,8 @@ void CompletionDialog::buildUi(const QString& userId,
   totalLayout->addWidget(totalLabel_);
 
   root->addWidget(totalFrame);
+
+  recalcTotal();
 
   // ── Buttons ────────────────────────────────────────────────────────
   auto* buttonLayout = new QHBoxLayout();
@@ -173,6 +249,36 @@ void CompletionDialog::buildUi(const QString& userId,
     accept();
   });
   connect(cancelBtn_, &QPushButton::clicked, this, &QDialog::reject);
+}
+
+void CompletionDialog::recalcTotal()
+{
+  if (table_ == nullptr || totalLabel_ == nullptr) return;
+
+  double grandTotal = 0.0;
+  int grandPages = 0;
+
+  for (int row = 0; row < table_->rowCount(); ++row)
+  {
+    auto* pagesItem = table_->item(row, 1);
+    if (pagesItem != nullptr)
+      grandPages += pagesItem->text().toInt();
+
+    auto* spin = qobject_cast<QDoubleSpinBox*>(table_->cellWidget(row, 4));
+    if (spin != nullptr)
+      grandTotal += spin->value();
+    else
+    {
+      auto* priceItem = table_->item(row, 4);
+      if (priceItem != nullptr)
+        grandTotal += priceItem->text().toDouble();
+    }
+  }
+
+  totalLabel_->setText(
+    QStringLiteral("合计: %1 页    金额: ¥%2")
+      .arg(grandPages)
+      .arg(QString::number(grandTotal, 'f', 2)));
 }
 
 }  // namespace wpce::ui

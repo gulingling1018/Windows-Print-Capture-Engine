@@ -1,4 +1,5 @@
 #include "common/app_config.h"
+#include "common/pricing_engine.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -75,6 +76,28 @@ std::filesystem::path get_appdata_directory()
   return std::filesystem::path(home ? home : ".") / ".wpce";
 }
 #endif
+
+/// Split a pipe-separated string like "A4|B5" into a lowercased vector.
+/// Empty input → empty vector.  Used to backfill the set fields of
+/// PricingRule from older config files that only stored the pipe string.
+std::vector<std::string> split_pipe_lower(const std::string& s)
+{
+  std::vector<std::string> out;
+  std::string cur;
+  for (char c : s)
+  {
+    if (c == '|')
+    {
+      if (!cur.empty()) { out.push_back(cur); cur.clear(); }
+    }
+    else
+    {
+      cur += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+    }
+  }
+  if (!cur.empty()) out.push_back(cur);
+  return out;
+}
 
 // ── Minimal JSON writer ─────────────────────────────────────────────────────
 
@@ -403,18 +426,66 @@ AppConfig AppConfig::defaults()
   config.storage.queue_capacity = 256;
   config.storage.retention_days = 90;
 
-  // Pricing defaults
-  config.pricing.single_sided_per_page = 0.15;
-  config.pricing.double_sided_per_sheet = 0.25;
-  config.pricing.color_surcharge = 0.50;
-  config.pricing.large_paper_surcharge = 0.30;
-  config.pricing.high_quality_surcharge = 0.10;
-  config.pricing.volume_discounts = {
-    {100, 0.95},
-    {500, 0.90},
-    {1000, 0.85},
-  };
+  // Pricing defaults — matrix rules (factory preset of 6 default rules).
+  // Legacy additive fields have been removed; rules are the single
+  // source of pricing truth.
   config.pricing.currency = "CNY";
+  config.pricing.color_price_pending = true;
+  config.pricing.rules.clear();
+
+  auto addRule = [&](std::string id, std::string paper, std::string duplex,
+                     std::string color, std::string ext, double price)
+  {
+    core::PricingRule r;
+    r.rule_id = std::move(id);
+    r.paper_size = paper;
+    r.duplex_mode = duplex;
+    r.color_mode = color;
+    r.file_extension = ext;
+    r.price_per_sheet = price;
+    // Expand multi-value pipe strings into the set fields.
+    {
+      std::string lower;
+      lower.reserve(paper.size());
+      for (char c : paper) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      std::string cur;
+      for (char c : lower)
+      {
+        if (c == '|') { if (!cur.empty()) { r.paper_size_set.push_back(cur); cur.clear(); } }
+        else cur += c;
+      }
+      if (!cur.empty()) r.paper_size_set.push_back(cur);
+    }
+    {
+      std::string lower;
+      lower.reserve(ext.size());
+      for (char c : ext) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      std::string cur;
+      for (char c : lower)
+      {
+        if (c == '|') { if (!cur.empty()) { r.file_extension_set.push_back(cur); cur.clear(); } }
+        else cur += c;
+      }
+      if (!cur.empty()) r.file_extension_set.push_back(cur);
+    }
+    r.priority = rule_specificity(r);
+    config.pricing.rules.push_back(std::move(r));
+  };
+
+  // The 6 factory default rules per project spec.
+  // paper|duplex|color|filetype|price  (empty ext = all file types)
+  addRule("default-1", "A4|B5", "simplex", "monochrome", "",      0.15);
+  addRule("default-2", "A4|B5", "duplex",  "monochrome", "",      0.25);
+  addRule("default-3", "A3",    "simplex", "monochrome", "",      0.50);
+  addRule("default-4", "A3",    "duplex",  "monochrome", "",      1.00);
+  addRule("default-5", "A3",    "simplex", "monochrome", "dwg",   1.00);
+  addRule("default-6", "A4|B5", "simplex", "monochrome", "dwg",   0.50);
+
+  sort_rules_by_priority(config.pricing.rules);
+
+  // Printer capability defaults — empty; first-launch detection populates.
+  config.printers.profiles.clear();
+  config.printers.default_color_capable = false;
 
   // Merchant defaults (empty)
   config.merchant.name.clear();
@@ -509,28 +580,59 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
       // pricing
       w.key("pricing");
       w.begin_object();
-      w.key("single_sided_per_page");
-      w.write_double(pricing.single_sided_per_page);
-      w.key("double_sided_per_sheet");
-      w.write_double(pricing.double_sided_per_sheet);
-      w.key("color_surcharge");
-      w.write_double(pricing.color_surcharge);
-      w.key("large_paper_surcharge");
-      w.write_double(pricing.large_paper_surcharge);
-      w.key("high_quality_surcharge");
-      w.write_double(pricing.high_quality_surcharge);
       w.key("currency");
       w.write_string(pricing.currency);
+      w.key("color_price_pending");
+      w.write_bool(pricing.color_price_pending);
 
-      w.key("volume_discounts");
+      w.key("rules");
       w.begin_array();
-      for (const auto& vd : pricing.volume_discounts)
+      for (const auto& rule : pricing.rules)
       {
         w.begin_object();
-        w.key("min_pages");
-        w.write_int(vd.min_pages);
-        w.key("discount");
-        w.write_double(vd.discount);
+        w.key("rule_id");
+        w.write_string(rule.rule_id);
+        w.key("paper_size");
+        w.write_string(rule.paper_size);
+        w.key("duplex_mode");
+        w.write_string(rule.duplex_mode);
+        w.key("color_mode");
+        w.write_string(rule.color_mode);
+        w.key("file_extension");
+        w.write_string(rule.file_extension);
+        w.key("price_per_sheet");
+        w.write_double(rule.price_per_sheet);
+
+        // Multi-value expansions (authoritative for matching).
+        w.key("paper_size_set");
+        w.begin_array();
+        for (const auto& s : rule.paper_size_set) w.write_string(s);
+        w.end_array();
+
+        w.key("file_extension_set");
+        w.begin_array();
+        for (const auto& s : rule.file_extension_set) w.write_string(s);
+        w.end_array();
+
+        w.end_object();
+      }
+      w.end_array();
+      w.end_object();
+
+      // printers (color capability profiles)
+      w.key("printers");
+      w.begin_object();
+      w.key("default_color_capable");
+      w.write_bool(printers.default_color_capable);
+      w.key("profiles");
+      w.begin_array();
+      for (const auto& p : printers.profiles)
+      {
+        w.begin_object();
+        w.key("printer_name");
+        w.write_string(p.printer_name);
+        w.key("is_color_capable");
+        w.write_bool(p.is_color_capable);
         w.end_object();
       }
       w.end_array();
@@ -625,31 +727,92 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
         while (r.end_object_or_next())
         {
           const std::string pk = r.read_key();
-          if (pk == "single_sided_per_page")        pricing.single_sided_per_page = r.read_number();
-          else if (pk == "double_sided_per_sheet")  pricing.double_sided_per_sheet = r.read_number();
-          else if (pk == "color_surcharge")         pricing.color_surcharge = r.read_number();
-          else if (pk == "large_paper_surcharge")   pricing.large_paper_surcharge = r.read_number();
-          else if (pk == "high_quality_surcharge")  pricing.high_quality_surcharge = r.read_number();
-          else if (pk == "currency")                pricing.currency = r.read_string();
+          if (pk == "currency")                       pricing.currency = r.read_string();
+          else if (pk == "color_price_pending")       pricing.color_price_pending = r.read_bool();
+          // Legacy additive fields (silently ignored for forward-compat).
+          else if (pk == "single_sided_per_page")     (void)r.read_number();
+          else if (pk == "double_sided_per_sheet")    (void)r.read_number();
+          else if (pk == "color_surcharge")           (void)r.read_number();
+          else if (pk == "large_paper_surcharge")     (void)r.read_number();
+          else if (pk == "high_quality_surcharge")    (void)r.read_number();
           else if (pk == "volume_discounts")
           {
-            pricing.volume_discounts.clear();
             r.begin_array();
             while (r.end_array_or_next())
             {
-              VolumeDiscountTier tier;
+              r.begin_object();
+              while (r.end_object_or_next()) (void)r.read_string();
+            }
+          }
+          else if (pk == "rules")
+          {
+            pricing.rules.clear();
+            r.begin_array();
+            while (r.end_array_or_next())
+            {
+              core::PricingRule rule;
               r.begin_object();
               while (r.end_object_or_next())
               {
-                const std::string vk = r.read_key();
-                if (vk == "min_pages")      tier.min_pages = r.read_int();
-                else if (vk == "discount")  tier.discount = r.read_number();
+                const std::string rk = r.read_key();
+                if (rk == "rule_id")              rule.rule_id = r.read_string();
+                else if (rk == "paper_size")      rule.paper_size = r.read_string();
+                else if (rk == "duplex_mode")     rule.duplex_mode = r.read_string();
+                else if (rk == "color_mode")      rule.color_mode = r.read_string();
+                else if (rk == "file_extension")  rule.file_extension = r.read_string();
+                else if (rk == "price_per_sheet") rule.price_per_sheet = r.read_number();
+                else if (rk == "paper_size_set")
+                {
+                  r.begin_array();
+                  while (r.end_array_or_next()) rule.paper_size_set.push_back(r.read_string());
+                }
+                else if (rk == "file_extension_set")
+                {
+                  r.begin_array();
+                  while (r.end_array_or_next()) rule.file_extension_set.push_back(r.read_string());
+                }
                 else (void)r.read_string();
               }
-              pricing.volume_discounts.push_back(tier);
+              // Backfill set fields from the pipe-string form when the
+              // set was missing (e.g. older config files).
+              if (rule.paper_size_set.empty() && !rule.paper_size.empty())
+                rule.paper_size_set = split_pipe_lower(rule.paper_size);
+              if (rule.file_extension_set.empty() && !rule.file_extension.empty())
+                rule.file_extension_set = split_pipe_lower(rule.file_extension);
+              rule.priority = rule_specificity(rule);
+              pricing.rules.push_back(std::move(rule));
             }
+            sort_rules_by_priority(pricing.rules);
           }
           else (void)r.read_string(); // skip unknown
+        }
+      }
+      else if (key == "printers")
+      {
+        r.begin_object();
+        while (r.end_object_or_next())
+        {
+          const std::string pk = r.read_key();
+          if (pk == "default_color_capable")  printers.default_color_capable = r.read_bool();
+          else if (pk == "profiles")
+          {
+            printers.profiles.clear();
+            r.begin_array();
+            while (r.end_array_or_next())
+            {
+              PrinterProfile profile;
+              r.begin_object();
+              while (r.end_object_or_next())
+              {
+                const std::string ppk = r.read_key();
+                if (ppk == "printer_name")        profile.printer_name = r.read_string();
+                else if (ppk == "is_color_capable") profile.is_color_capable = r.read_bool();
+                else (void)r.read_string();
+              }
+              printers.profiles.push_back(std::move(profile));
+            }
+          }
+          else (void)r.read_string();
         }
       }
       else if (key == "merchant")

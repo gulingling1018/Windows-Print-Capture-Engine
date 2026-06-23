@@ -1,11 +1,15 @@
 #include "ui/main_window.h"
 
+#include "bridge/settlement_bridge.h"
 #include "common/app_config.h"
+#include "common/pricing_engine.h"
 #include "ui/grip_splitter.h"
 #include "ui/completion_dialog.h"
+#include "ui/history_explorer_dialog.h"
 #include "ui/job_detail_panel.h"
 #include "ui/grip_splitter.h"
 #include "ui/pricing_config.h"
+#include "ui/quick_settle_dialog.h"
 #include "ui/receipt_preview_panel.h"
 #include "ui/settings_dialog.h"
 #include "ui/user_color_palette.h"
@@ -24,9 +28,11 @@
 #include <QFrame>
 #include <QHBoxLayout>
 #include <QHeaderView>
+#include <QInputDialog>
 #include <QItemSelectionModel>
 #include <QLabel>
 #include <QLineEdit>
+#include <QMenu>
 #include <QResizeEvent>
 #include <QStackedWidget>
 #include <QStandardPaths>
@@ -392,22 +398,80 @@ QString ensureFilterInstalled()
   }
 }
 
-}  // namespace
+}  // namespace (anonymous)
+
+}  // namespace wpce::ui
+
+// ── Includes for MainWindow implementation ───────────────────────────
+
+#include "billing/billing_service.h"
+#include "bridge/settlement_bridge.h"
+#include "common/app_config.h"
+#include "common/pricing_engine.h"
+#include "common/printer_profile.h"
+#include "ui/billing_batch_model.h"
+#include "ui/grip_splitter.h"
+#include "ui/completion_dialog.h"
+#include "ui/job_detail_panel.h"
+#include "ui/pricing_config.h"
+#include "ui/quick_settle_dialog.h"
+#include "ui/receipt_preview_panel.h"
+#include "ui/settings_dialog.h"
+#include "ui/user_color_palette.h"
+#include "ui/user_group_delegate.h"
+#include "ui/watcher_bridge.h"
+
+#include <QAbstractItemView>
+#include <QCloseEvent>
+#include <QCoreApplication>
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QDir>
+#include <QFile>
+#include <QFrame>
+#include <QHBoxLayout>
+#include <QHeaderView>
+#include <QItemSelectionModel>
+#include <QLabel>
+#include <QLineEdit>
+#include <QResizeEvent>
+#include <QStackedWidget>
+#include <QStandardPaths>
+#include <QSizePolicy>
+#include <QStyle>
+#include <QUrl>
+#include <QVBoxLayout>
+
+#include <algorithm>
+#include <chrono>
+#include <iomanip>
+#include <sstream>
+
+#ifdef _WIN32
+#include <windows.h>
+#include <winspool.h>
+#include <shlobj.h>
+#endif
+
+namespace wpce::ui
+{
 
 // ── MainWindow ────────────────────────────────────────────────────────
 
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 {
   loadOrCreateConfig();
+  detectPrintersIfNeeded();
 
   setWindowTitle(QStringLiteral("WPCE 打印捕获控制台"));
   resize(config_.window.width, config_.window.height);
   setMinimumSize(1040, 640);
 
   bridge_ = new WatcherBridge(this);
-  groupModel_ = new UserGroupModel(this);
-  userTaskModel_ = new UserTaskModel(this);
-  userTaskModel_->setPricingConfig(&config_.pricing);
+  billingService_ = new BillingService(this);
+  billingService_->setPricingConfig(&config_.pricing);
+  billingService_->setPrinterProfiles(&config_.printers);
+  batchModel_ = new BillingBatchModel(billingService_, this);
 
   auto* central = new QWidget(this);
   central->setObjectName(QStringLiteral("AppRoot"));
@@ -435,7 +499,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   title->setObjectName(QStringLiteral("WindowTitle"));
   title->setMinimumWidth(0);
   title->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
-  auto* subtitle = new QLabel(QStringLiteral("按用户分组 · 打印作业参数审计"));
+  auto* subtitle = new QLabel(QStringLiteral("按时间段批次 · 打印计价与结算"));
   subtitle->setObjectName(QStringLiteral("WindowSubtitle"));
   subtitle->setMinimumWidth(0);
   subtitle->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
@@ -443,9 +507,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   titleBlock->addWidget(subtitle);
   heroLayout->addLayout(titleBlock, 1);
 
-  startBtn_ = new QPushButton(QStringLiteral("开始监听"));
+  startBtn_ = new QPushButton(QStringLiteral("开始"));
   startBtn_->setIcon(style()->standardIcon(QStyle::SP_MediaPlay));
-  startBtn_->setText(QStringLiteral("开始"));
   startBtn_->setToolTip(QStringLiteral("开始监听"));
   startBtn_->setFixedHeight(42);
   startBtn_->setMinimumWidth(80);
@@ -468,9 +531,22 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   setButtonRole(settingsBtn_, "quiet");
   makeIconButton(settingsBtn_, QStringLiteral("设置"));
 
+  auto* historyBtn = new QPushButton(QStringLiteral("历史"));
+  historyBtn->setIcon(style()->standardIcon(QStyle::SP_DialogOpenButton));
+  setButtonRole(historyBtn, "quiet");
+  makeIconButton(historyBtn, QStringLiteral("结算历史"));
+  connect(historyBtn, &QPushButton::clicked, this, [this]() {
+    if (historyDialog_ == nullptr)
+      historyDialog_ = new HistoryExplorerDialog(resolveStateDir(), this);
+    historyDialog_->loadOrders();
+    historyDialog_->show();
+    historyDialog_->raise();
+  });
+
   heroLayout->addWidget(startBtn_);
   heroLayout->addWidget(stopBtn_);
   heroLayout->addWidget(openOutputBtn_);
+  heroLayout->addWidget(historyBtn);
   heroLayout->addWidget(settingsBtn_);
   root->addWidget(hero);
 
@@ -493,7 +569,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
   metrics->addWidget(makeMetricCard(QStringLiteral("监听状态"), sessionStateLabel_), 0);
   metrics->addWidget(makeMetricCard(QStringLiteral("打印机"), printerCountLabel_), 0);
-  metrics->addWidget(makeMetricCard(QStringLiteral("活跃用户"), userCountLabel_), 0);
+  metrics->addWidget(makeMetricCard(QStringLiteral("活跃批次"), userCountLabel_), 0);
   metrics->addWidget(makeMetricCard(QStringLiteral("输出目录"), outputDirLabel_), 1);
   root->addLayout(metrics);
 
@@ -510,19 +586,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   treeHeader->setContentsMargins(0, 0, 0, 0);
   treeHeader->setSpacing(10);
 
-  auto* treeTitle = new QLabel(QStringLiteral("用户作业"));
+  auto* treeTitle = new QLabel(QStringLiteral("批次 / 作业"));
   treeTitle->setObjectName(QStringLiteral("PanelHeader"));
   treeTitle->setMinimumWidth(0);
   treeTitle->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 
-  resultCountLabel_ = new QLabel(QStringLiteral("0 用户 / 0 作业"));
+  resultCountLabel_ = new QLabel(QStringLiteral("0 批次 / 0 作业"));
   resultCountLabel_->setObjectName(QStringLiteral("MutedText"));
   resultCountLabel_->setMinimumWidth(0);
   resultCountLabel_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Preferred);
 
   searchEdit_ = new QLineEdit();
   searchEdit_->setObjectName(QStringLiteral("SearchBox"));
-  searchEdit_->setPlaceholderText(QStringLiteral("搜索用户"));
+  searchEdit_->setPlaceholderText(QStringLiteral("搜索批次"));
   searchEdit_->setClearButtonEnabled(true);
   searchEdit_->setMinimumWidth(96);
   searchEdit_->setMaximumWidth(140);
@@ -535,24 +611,30 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
   expandAllBtn_ = new QPushButton(QStringLiteral("全部展开"));
   expandAllBtn_->setIcon(style()->standardIcon(QStyle::SP_ArrowDown));
-  expandAllBtn_->setToolTip(QStringLiteral("展开所有用户下的作业"));
+  expandAllBtn_->setToolTip(QStringLiteral("展开所有批次下的作业"));
   setButtonRole(expandAllBtn_, "quiet");
-  makeIconButton(expandAllBtn_, QStringLiteral("展开所有用户下的作业"));
+  makeIconButton(expandAllBtn_, QStringLiteral("展开所有批次下的作业"));
 
   collapseAllBtn_ = new QPushButton(QStringLiteral("全部收起"));
   collapseAllBtn_->setIcon(style()->standardIcon(QStyle::SP_ArrowRight));
-  collapseAllBtn_->setToolTip(QStringLiteral("收起所有用户，只保留父级用户行"));
+  collapseAllBtn_->setToolTip(QStringLiteral("收起所有批次，只保留批次行"));
   setButtonRole(collapseAllBtn_, "quiet");
-  makeIconButton(collapseAllBtn_, QStringLiteral("收起所有用户，只保留父级用户行"));
+  makeIconButton(collapseAllBtn_, QStringLiteral("收起所有批次，只保留批次行"));
 
-  completeUserBtn_ = new QPushButton(QStringLiteral("结算选中用户"));
+  completeUserBtn_ = new QPushButton(QStringLiteral("结算"));
   completeUserBtn_->setIcon(style()->standardIcon(QStyle::SP_DialogApplyButton));
-  completeUserBtn_->setText(QStringLiteral("结算"));
-  completeUserBtn_->setToolTip(QStringLiteral("结算选中用户"));
+  completeUserBtn_->setToolTip(QStringLiteral("结算选中批次"));
   completeUserBtn_->setMinimumWidth(78);
   completeUserBtn_->setMaximumWidth(88);
   setButtonRole(completeUserBtn_, "primary");
   completeUserBtn_->setEnabled(false);
+
+  quickSettleBtn_ = new QPushButton(QStringLiteral("快速结算"));
+  quickSettleBtn_->setToolTip(QStringLiteral("打开悬浮结算窗口"));
+  quickSettleBtn_->setMinimumWidth(78);
+  quickSettleBtn_->setMaximumWidth(96);
+  setButtonRole(quickSettleBtn_, "primary");
+  quickSettleBtn_->setEnabled(false);
 
   treeHeader->addWidget(treeTitle);
   treeHeader->addWidget(resultCountLabel_);
@@ -562,6 +644,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   treeHeader->addWidget(searchEdit_);
   treeHeader->addWidget(clearFilterBtn_);
   treeHeader->addWidget(completeUserBtn_);
+  treeHeader->addWidget(quickSettleBtn_);
   treePanelLayout->addLayout(treeHeader);
 
   // ── QTreeView ─────────────────────────────────────────────────────
@@ -569,7 +652,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   treeView_->setObjectName(QStringLiteral("JobTree"));
   treeView_->setMinimumWidth(0);
   treeView_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
-  treeView_->setModel(groupModel_);
+  treeView_->setModel(batchModel_);
   treeView_->setSelectionBehavior(QAbstractItemView::SelectRows);
   treeView_->setSelectionMode(QAbstractItemView::SingleSelection);
   treeView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -580,53 +663,97 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   treeView_->setAnimated(true);
   treeView_->setIndentation(24);
   treeView_->setExpandsOnDoubleClick(true);
-  treeView_->setRootIsDecorated(true);  // branch area for top-level items
+  treeView_->setRootIsDecorated(true);
+
+  // ── Context menu for operator corrections (P9) ───────────────────
+  treeView_->setContextMenuPolicy(Qt::CustomContextMenu);
+  connect(treeView_, &QTreeView::customContextMenuRequested,
+          this, [this](const QPoint& pos) {
+    QModelIndex index = treeView_->indexAt(pos);
+    if (!index.isValid()) return;
+
+    QMenu menu(this);
+
+    if (batchModel_->isJobRow(index))
+    {
+      // Job row — offer removal / move.
+      std::uint32_t jobId = batchModel_->jobIdAt(index);
+      QString batchId = batchModel_->batchIdAt(index);
+      const auto* batch = batchModel_->batchAt(index.parent());
+      bool canModify = batch != nullptr && !batch->is_settled();
+
+      auto* removeAction = menu.addAction(QStringLiteral("从批次移除作业"));
+      removeAction->setEnabled(canModify);
+      connect(removeAction, &QAction::triggered, this, [this, batchId, jobId]() {
+        billingService_->removeJobFromBatch(batchId, jobId);
+      });
+
+      auto* deleteAction = menu.addAction(QStringLiteral("彻底删除作业"));
+      deleteAction->setEnabled(canModify);
+      connect(deleteAction, &QAction::triggered, this, [this, jobId]() {
+        billingService_->deleteJob(jobId);
+      });
+    }
+    else if (batchModel_->isBatchRow(index))
+    {
+      const auto* batch = batchModel_->batchAt(index);
+      if (batch == nullptr) return;
+      QString batchId = batchModel_->batchIdAt(index);
+
+      if (!batch->is_settled())
+      {
+        auto* suspendAction = menu.addAction(QStringLiteral("挂单"));
+        suspendAction->setEnabled(batch->is_active());
+        connect(suspendAction, &QAction::triggered, this, [this, batchId]() {
+          billingService_->suspend(batchId);
+        });
+
+        auto* resumeAction = menu.addAction(QStringLiteral("恢复接收"));
+        resumeAction->setEnabled(batch->is_suspended());
+        connect(resumeAction, &QAction::triggered, this, [this, batchId]() {
+          billingService_->resume(batchId);
+        });
+
+        menu.addSeparator();
+
+        auto* renameAction = menu.addAction(QStringLiteral("重命名批次..."));
+        connect(renameAction, &QAction::triggered, this, [this, batchId, batch]() {
+          bool ok = false;
+          QString newName = QInputDialog::getText(this,
+            QStringLiteral("重命名批次"), QStringLiteral("新名称:"),
+            QLineEdit::Normal, QString::fromStdString(batch->display_name), &ok);
+          if (ok && !newName.trimmed().isEmpty())
+            billingService_->renameBatch(batchId, newName.trimmed());
+        });
+      }
+    }
+
+    if (!menu.actions().isEmpty())
+      menu.exec(treeView_->viewport()->mapToGlobal(pos));
+  });
   treeView_->header()->setHighlightSections(false);
   treeView_->header()->setStretchLastSection(false);
-  treeView_->header()->setSectionsClickable(true);   // allow drag-to-resize
+  treeView_->header()->setSectionsClickable(true);
   treeView_->header()->setMinimumSectionSize(28);
   treeView_->header()->setCascadingSectionResizes(false);
 
-  // ── Column resize modes ──────────────────────────────────────────
-  //  Stretch    — name column absorbs residual width
-  //  Interactive — all others user-resizable like Excel
-  treeView_->header()->setSectionResizeMode(UserGroupModel::ColName,       QHeaderView::Stretch);
-  treeView_->header()->setSectionResizeMode(UserGroupModel::ColPhase,      QHeaderView::Interactive);
-  treeView_->header()->setSectionResizeMode(UserGroupModel::ColPages,      QHeaderView::Interactive);
-  treeView_->header()->setSectionResizeMode(UserGroupModel::ColColor,      QHeaderView::Interactive);
-  treeView_->header()->setSectionResizeMode(UserGroupModel::ColDuplex,     QHeaderView::Interactive);
-  treeView_->header()->setSectionResizeMode(UserGroupModel::ColProgress,   QHeaderView::Interactive);
-  treeView_->header()->setSectionResizeMode(UserGroupModel::ColPaper,      QHeaderView::Interactive);
-  treeView_->header()->setSectionResizeMode(UserGroupModel::ColSubmitTime, QHeaderView::Interactive);
+  treeView_->header()->setSectionResizeMode(BillingBatchModel::ColName,       QHeaderView::Interactive);
+  treeView_->header()->setSectionResizeMode(BillingBatchModel::ColState,      QHeaderView::Interactive);
+  treeView_->header()->setSectionResizeMode(BillingBatchModel::ColProgress,   QHeaderView::Interactive);
+  treeView_->header()->setSectionResizeMode(BillingBatchModel::ColPages,      QHeaderView::Interactive);
+  treeView_->header()->setSectionResizeMode(BillingBatchModel::ColDuplex,     QHeaderView::Interactive);
+  treeView_->header()->setSectionResizeMode(BillingBatchModel::ColPaper,      QHeaderView::Interactive);
+  treeView_->header()->setSectionResizeMode(BillingBatchModel::ColSubmitTime, QHeaderView::Interactive);
+  treeView_->header()->setSectionResizeMode(BillingBatchModel::ColPrice,      QHeaderView::Interactive);
 
-  treeView_->setColumnWidth(UserGroupModel::ColPhase,      62);
-  treeView_->setColumnWidth(UserGroupModel::ColProgress,   96);
-  treeView_->setColumnWidth(UserGroupModel::ColPages,      44);
-  treeView_->setColumnWidth(UserGroupModel::ColColor,      52);
-  treeView_->setColumnWidth(UserGroupModel::ColDuplex,     48);
-  treeView_->setColumnWidth(UserGroupModel::ColPaper,      70);
-  treeView_->setColumnWidth(UserGroupModel::ColSubmitTime, 120);
-
-  auto* groupDelegate = new UserGroupDelegate(treeView_);
-  treeView_->setItemDelegate(groupDelegate);
-  connect(groupDelegate, &UserGroupDelegate::documentClicked,
-          this, [this](const QModelIndex& index) {
-            const auto rowData = groupModel_->jobDataAt(index);
-            if (!rowData.has_value()) return;
-            const QString docName = QString::fromStdString(rowData->job.document_name);
-            if (docName.isEmpty()) return;
-            const QString jobFile = lastOutputDir_
-              + QStringLiteral("/jobs/job-")
-              + QString::number(rowData->job.job_id)
-              + QStringLiteral(".json");
-            if (QFile::exists(jobFile))
-              QDesktopServices::openUrl(QUrl::fromLocalFile(jobFile));
-            else
-              QDesktopServices::openUrl(QUrl::fromLocalFile(lastOutputDir_));
-            statusBar()->showMessage(
-              QStringLiteral("已打开: Job %1 — %2")
-                .arg(rowData->job.job_id).arg(docName), 3000);
-          });
+  treeView_->setColumnWidth(BillingBatchModel::ColName,       200);
+  treeView_->setColumnWidth(BillingBatchModel::ColState,      62);
+  treeView_->setColumnWidth(BillingBatchModel::ColProgress,   110);
+  treeView_->setColumnWidth(BillingBatchModel::ColPages,      48);
+  treeView_->setColumnWidth(BillingBatchModel::ColDuplex,     70);
+  treeView_->setColumnWidth(BillingBatchModel::ColPaper,      70);
+  treeView_->setColumnWidth(BillingBatchModel::ColSubmitTime, 130);
+  treeView_->setColumnWidth(BillingBatchModel::ColPrice,      70);
 
   emptyStateLabel_ = new QLabel(QStringLiteral("暂无打印作业"));
   emptyStateLabel_->setObjectName(QStringLiteral("EmptyState"));
@@ -639,7 +766,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   tableStack_->addWidget(treeView_);
   treePanelLayout->addWidget(tableStack_, 1);
 
-  // ── Right side: detail panel (full height, no timeline) ──────────
+  // ── Right side: detail panel ──────────────────────────────────────
   detailPanel_ = new JobDetailPanel();
   detailPanel_->setMinimumWidth(340);
   detailPanel_->setMaximumWidth(520);
@@ -672,7 +799,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   root->addWidget(verticalSplitter_, 1);
 
   scheduleWorkspaceRebalance();
-
   statusBar()->showMessage(QStringLiteral("就绪"));
 
   // ── Button wiring ─────────────────────────────────────────────────
@@ -681,155 +807,100 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   connect(openOutputBtn_, &QPushButton::clicked, this, &MainWindow::onOpenOutputClicked);
   connect(settingsBtn_, &QPushButton::clicked, this, &MainWindow::onSettingsClicked);
   connect(completeUserBtn_, &QPushButton::clicked, this, &MainWindow::onCompleteClicked);
+  connect(quickSettleBtn_, &QPushButton::clicked, this, [this]() {
+    if (quickSettleDialog_ == nullptr)
+    {
+      quickSettleDialog_ = new QuickSettleDialog(batchModel_, billingService_, &config_.pricing, this);
+      connect(quickSettleDialog_, &QuickSettleDialog::settleRequested,
+              this, [this](const QString& batchId) { billingService_->settle(batchId); });
+      connect(quickSettleDialog_, &QuickSettleDialog::hangUpRequested,
+              this, [this](const QString& batchId) { billingService_->suspend(batchId); });
+      connect(quickSettleDialog_, &QuickSettleDialog::resumeRequested,
+              this, [this](const QString& batchId) { billingService_->resume(batchId); });
+    }
+    int targetIndex = -1;
+    QModelIndex current = treeView_->currentIndex();
+    while (current.isValid() && !batchModel_->isBatchRow(current))
+      current = current.parent();
+    if (current.isValid())
+      targetIndex = current.row();
+    else
+      targetIndex = batchModel_->currentActiveRow();
+    if (targetIndex < 0)
+      targetIndex = batchModel_->nextRelevantRow(-1);
+    if (targetIndex >= 0)
+      quickSettleDialog_->setCurrentBatchIndex(targetIndex);
+    quickSettleDialog_->show();
+    quickSettleDialog_->raise();
+    quickSettleDialog_->activateWindow();
+  });
   connect(expandAllBtn_, &QPushButton::clicked, this, [this]() {
-    for (int i = 0; i < groupModel_->rowCount(); ++i)
+    for (int i = 0; i < batchModel_->rowCount(); ++i)
     {
       if (treeView_->isRowHidden(i, QModelIndex())) continue;
-      treeView_->expand(groupModel_->index(i, 0));
+      treeView_->expand(batchModel_->index(i, 0));
     }
-    statusBar()->showMessage(QStringLiteral("已展开所有用户作业"), 2000);
   });
   connect(collapseAllBtn_, &QPushButton::clicked, this, [this]() {
-    for (int i = 0; i < groupModel_->rowCount(); ++i)
-      treeView_->collapse(groupModel_->index(i, 0));
-    statusBar()->showMessage(QStringLiteral("已收起所有用户作业"), 2000);
+    for (int i = 0; i < batchModel_->rowCount(); ++i)
+      treeView_->collapse(batchModel_->index(i, 0));
   });
   connect(clearFilterBtn_, &QPushButton::clicked, this, [this]() {
     searchEdit_->clear();
-  });
-
-  // ── Search ────────────────────────────────────────────────────────
-  connect(searchEdit_, &QLineEdit::textChanged, this, [this](const QString&) {
     applySearchFilter();
   });
-
-  // ── Tree selection ────────────────────────────────────────────────
-  connect(treeView_->selectionModel(), &QItemSelectionModel::currentRowChanged,
+  connect(searchEdit_, &QLineEdit::textChanged, this, &MainWindow::applySearchFilter);
+  connect(treeView_->selectionModel(), &QItemSelectionModel::currentChanged,
           this, &MainWindow::onTreeSelectionChanged);
 
-  // ── Model data-changed → refresh ──────────────────────────────────
-  connect(groupModel_, &QAbstractItemModel::dataChanged, this, [this]() {
-    refreshSelectedDetail();
-    refreshSummaryCards();
-    refreshEmptyState();
-    refreshReceiptPanel();
-    scheduleWorkspaceRebalance();
-  });
-  connect(groupModel_, &QAbstractItemModel::rowsInserted, this, [this]() {
-    refreshGroupRowSpans();
-    applySearchFilter();
-    refreshSummaryCards();
-    refreshEmptyState();
-    refreshReceiptPanel();
-    scheduleWorkspaceRebalance();
-    // Auto-expand all users so operators see every job at a glance.
-    for (int i = 0; i < groupModel_->groupCount(); ++i)
-      treeView_->expand(groupModel_->index(i, 0));
-    QTimer::singleShot(0, this, &MainWindow::selectFirstIncompleteUser);
-  });
-  connect(groupModel_, &QAbstractItemModel::modelReset, this, [this]() {
-    refreshGroupRowSpans();
-    refreshSummaryCards();
-    refreshEmptyState();
-    refreshSelectedDetail();
-    refreshReceiptPanel();
-    scheduleWorkspaceRebalance();
-  });
-
-  // ── Bridge → Model ────────────────────────────────────────────────
+  // ── WatcherBridge → BillingService wiring ─────────────────────────
   connect(bridge_, &WatcherBridge::jobSnapshotReceived,
-          groupModel_, &UserGroupModel::onJobSnapshot);
-  connect(bridge_, &WatcherBridge::jobSnapshotReceived,
-          userTaskModel_, &UserTaskModel::onJobSnapshot);
+          billingService_, &BillingService::onJobSnapshot);
   connect(bridge_, &WatcherBridge::metadataReceived,
-          groupModel_, &UserGroupModel::onMetadata);
-  connect(bridge_, &WatcherBridge::metadataReceived,
-          this, [this](const core::MetadataSnapshot& metadata) {
-            Q_UNUSED(metadata);
-            refreshSelectedDetail();
-          });
-  connect(bridge_, &WatcherBridge::metadataReceived,
-          userTaskModel_, &UserTaskModel::onMetadata);
+          billingService_, &BillingService::onMetadata);
   connect(bridge_, &WatcherBridge::lifecycleEventReceived,
-          groupModel_, &UserGroupModel::onLifecycleEvent);
-  connect(bridge_, &WatcherBridge::lifecycleEventReceived,
-          userTaskModel_, &UserTaskModel::onLifecycleEvent);
+          billingService_, &BillingService::onLifecycleEvent);
   connect(bridge_, &WatcherBridge::watcherError, this,
           [this](const QString& error) {
             statusBar()->showMessage(QStringLiteral("警告: %1").arg(error), 5000);
-            updateButtonStates();
-            updatePrinterLabel();
+            updateButtonStates(); updatePrinterLabel();
           });
   connect(bridge_, &WatcherBridge::storageWarning, this,
-          [this](const QString& warning) {
-            statusBar()->showMessage(warning, 8000);
-          });
+          [this](const QString& warning) { statusBar()->showMessage(warning, 8000); });
   connect(bridge_, &WatcherBridge::watcherPermanentFailure, this,
-          [this](const QString& printerName, const QString& error) {
-            Q_UNUSED(printerName);
-            statusBar()->showMessage(
-              QStringLiteral("严重: %1").arg(error), 0);
-            updateButtonStates();
-            updatePrinterLabel();
+          [this](const QString&, const QString& error) {
+            statusBar()->showMessage(QStringLiteral("严重: %1").arg(error), 0);
+            updateButtonStates(); updatePrinterLabel();
           });
-  connect(bridge_, &WatcherBridge::printerSkipped,
-          this, &MainWindow::onPrinterSkipped);
-  connect(bridge_, &WatcherBridge::sessionFinished, this,
-          [this]() {
-            userTaskModel_->flushSave();
-            updateButtonStates();
-            updatePrinterLabel();
-          });
-  connect(bridge_, &WatcherBridge::watcherHeartbeat,
-          this, &MainWindow::onWatcherHeartbeat);
+  connect(bridge_, &WatcherBridge::printerSkipped, this, &MainWindow::onPrinterSkipped);
+  connect(bridge_, &WatcherBridge::sessionFinished, this, [this]() {
+    billingService_->flushSave(); updateButtonStates(); updatePrinterLabel();
+  });
+  connect(bridge_, &WatcherBridge::watcherHeartbeat, this, &MainWindow::onWatcherHeartbeat);
 
-  // ── Group completion ──────────────────────────────────────────────
-  connect(groupModel_, &UserGroupModel::userCompleted,
-          this, &MainWindow::onUserCompleted);
-  connect(groupModel_, &UserGroupModel::groupCountChanged,
-          this, [this](int total, int active) {
-            Q_UNUSED(total);
-            userCountLabel_->setText(QString::number(active));
-          });
+  // ── BillingService → UI refresh ───────────────────────────────────
+  connect(billingService_, &BillingService::batchesChanged, this, [this]() {
+    refreshSummaryCards(); refreshEmptyState(); refreshGroupRowSpans(); refreshReceiptPanel();
+  });
+  connect(billingService_, &BillingService::batchUpdated, this, [this](const QString&) {
+    refreshSummaryCards(); refreshReceiptPanel(); refreshSelectedDetail();
+  });
+  connect(billingService_, &BillingService::orderSettled, this, &MainWindow::onBatchSettled);
+
+  connect(receiptPanel_, &ReceiptPreviewPanel::settleRequested,
+          this, [this](const QString& batchId) { billingService_->settle(batchId); });
 
   // ── Heartbeat timer ───────────────────────────────────────────────
   heartbeatCheckTimer_ = new QTimer(this);
   heartbeatCheckTimer_->setInterval(3500);
-  connect(heartbeatCheckTimer_, &QTimer::timeout,
-          this, &MainWindow::checkStalePrinters);
+  connect(heartbeatCheckTimer_, &QTimer::timeout, this, &MainWindow::checkStalePrinters);
   heartbeatCheckTimer_->start();
 
-  // ── Receipt panel wiring ──────────────────────────────────────────
-  connect(userTaskModel_, &QAbstractItemModel::dataChanged,
-          this, &MainWindow::refreshReceiptPanel);
-  connect(userTaskModel_, &QAbstractItemModel::rowsInserted,
-          this, &MainWindow::refreshReceiptPanel);
-  connect(userTaskModel_, &QAbstractItemModel::modelReset,
-          this, &MainWindow::refreshReceiptPanel);
-  connect(groupModel_, &QAbstractItemModel::dataChanged,
-          this, &MainWindow::refreshReceiptPanel);
-  connect(groupModel_, &QAbstractItemModel::rowsInserted,
-          this, &MainWindow::refreshReceiptPanel);
-  connect(receiptPanel_, &ReceiptPreviewPanel::settleRequested,
-          this, [this](const QString& userId) {
-            groupModel_->completeUser(userId);
-            userTaskModel_->completeUserTask(userId);
-          });
+  updateButtonStates(); updatePrinterLabel();
+  refreshSummaryCards(); refreshEmptyState(); refreshGroupRowSpans();
 
-  // ── Initialise ────────────────────────────────────────────────────
-  updateButtonStates();
-  updatePrinterLabel();
-  refreshSummaryCards();
-  refreshEmptyState();
-  refreshGroupRowSpans();
-
-  // ── XPS filter auto-install check ──────────────────────────────────
-  // If running as admin, installs the filter silently (COM registration +
-  // pipeline injection + spooler restart).  After one admin run, all
-  // subsequent normal-user launches work without any setup.
   QString filterMsg = ensureFilterInstalled();
-  if (!filterMsg.isEmpty())
-    statusBar()->showMessage(filterMsg, 10000);
+  if (!filterMsg.isEmpty()) statusBar()->showMessage(filterMsg, 10000);
 
   QTimer::singleShot(100, this, &MainWindow::autoStart);
 }
@@ -840,11 +911,9 @@ MainWindow::~MainWindow()
   config_.window.height = height();
   common::AppConfig::ensure_config_file(common::AppConfig::default_config_path());
   config_.save_to_json(common::AppConfig::default_config_path());
-  userTaskModel_->flushSave();
+  billingService_->flushSave();
   bridge_->stopWatching();
 }
-
-// ── Actions ─────────────────────────────────────────────────────────
 
 void MainWindow::resizeEvent(QResizeEvent* event)
 {
@@ -855,7 +924,6 @@ void MainWindow::resizeEvent(QResizeEvent* event)
 void MainWindow::scheduleWorkspaceRebalance()
 {
   if (splitterRebalancePending_) return;
-
   splitterRebalancePending_ = true;
   QTimer::singleShot(0, this, [this]() {
     splitterRebalancePending_ = false;
@@ -871,13 +939,14 @@ void MainWindow::rebalanceWorkspaceSplitters()
   {
     const int treeWidth = treeView_->viewport() != nullptr ? treeView_->viewport()->width() : treeView_->width();
     const bool compactTree = treeWidth > 0 && treeWidth < 760;
-    treeView_->setColumnWidth(UserGroupModel::ColPhase, compactTree ? 56 : 60);
-    treeView_->setColumnWidth(UserGroupModel::ColProgress, compactTree ? 84 : 92);
-    treeView_->setColumnWidth(UserGroupModel::ColPages, compactTree ? 36 : 40);
-    treeView_->setColumnWidth(UserGroupModel::ColColor, compactTree ? 44 : 48);
-    treeView_->setColumnWidth(UserGroupModel::ColDuplex, compactTree ? 40 : 44);
-    treeView_->setColumnWidth(UserGroupModel::ColPaper, compactTree ? 58 : 66);
-    treeView_->setColumnWidth(UserGroupModel::ColSubmitTime, compactTree ? 104 : 116);
+    treeView_->setColumnWidth(BillingBatchModel::ColName,       compactTree ? 160 : 200);
+    treeView_->setColumnWidth(BillingBatchModel::ColState,      compactTree ? 56 : 62);
+    treeView_->setColumnWidth(BillingBatchModel::ColProgress,   compactTree ? 90 : 110);
+    treeView_->setColumnWidth(BillingBatchModel::ColPages,      compactTree ? 40 : 48);
+    treeView_->setColumnWidth(BillingBatchModel::ColDuplex,     compactTree ? 56 : 70);
+    treeView_->setColumnWidth(BillingBatchModel::ColPaper,      compactTree ? 58 : 70);
+    treeView_->setColumnWidth(BillingBatchModel::ColSubmitTime, compactTree ? 110 : 130);
+    treeView_->setColumnWidth(BillingBatchModel::ColPrice,      compactTree ? 56 : 70);
   }
 
   const int workspaceWidth = workspaceSplitter_->width();
@@ -886,12 +955,10 @@ void MainWindow::rebalanceWorkspaceSplitters()
     const QList<int> sizes = workspaceSplitter_->sizes();
     const int currentSideWidth = sizes.size() > 1 ? sizes.at(1) : 0;
     const int minimumUsefulSideWidth = std::min(400, std::max(340, workspaceWidth / 3));
-
     if (currentSideWidth < minimumUsefulSideWidth)
     {
       const int targetSideWidth = std::clamp((workspaceWidth * 36) / 100,
-                                             minimumUsefulSideWidth,
-                                             480);
+                                             minimumUsefulSideWidth, 480);
       const int targetTreeWidth = std::max(320, workspaceWidth - targetSideWidth);
       workspaceSplitter_->setSizes(QList<int>{targetTreeWidth, targetSideWidth});
     }
@@ -911,30 +978,23 @@ void MainWindow::rebalanceWorkspaceSplitters()
       verticalSplitter_->setSizes(QList<int>{workspaceHeight, std::max(170, verticalHeight - workspaceHeight)});
     }
   }
-
   detailPanel_->raise();
 }
 
 void MainWindow::onStartClicked()
 {
   if (bridge_->isRunning()) return;
-
-  userTaskModel_->flushSave();
-  groupModel_->clear();
-  userTaskModel_->clear();
+  billingService_->flushSave();
+  billingService_->clear();
   detailPanel_->clear();
   refreshReceiptPanel();
 
   lastOutputDir_ = resolveOutputRoot();
   QDir().mkpath(lastOutputDir_);
-
-  const QString tasksFile = lastOutputDir_ + QStringLiteral("/user_tasks.json");
-  userTaskModel_->setAutoSavePath(tasksFile);
-  if (QFile::exists(tasksFile))
-  {
-    userTaskModel_->loadFromJson(tasksFile);
-    refreshReceiptPanel();
-  }
+  const QString stateDir = resolveStateDir();
+  QDir().mkpath(stateDir);
+  billingService_->setStateDirectory(stateDir);
+  billingService_->load();
 
   const QString nativeOutputDir = QDir::toNativeSeparators(lastOutputDir_);
   outputDirLabel_->setText(compactPathText(nativeOutputDir));
@@ -942,20 +1002,15 @@ void MainWindow::onStartClicked()
 
   bridge_->setStallTimeout(std::chrono::seconds{config_.monitoring.stall_timeout_seconds});
   bridge_->startWatching(lastOutputDir_);
-  updateButtonStates();
-  updatePrinterLabel();
-  refreshSummaryCards();
-
-  statusBar()->showMessage(
-    QStringLiteral("监听中 -> %1").arg(QDir::toNativeSeparators(lastOutputDir_)));
+  updateButtonStates(); updatePrinterLabel(); refreshSummaryCards();
+  statusBar()->showMessage(QStringLiteral("监听中 -> %1").arg(QDir::toNativeSeparators(lastOutputDir_)));
 }
 
 void MainWindow::onStopClicked()
 {
   bridge_->stopWatching();
-  userTaskModel_->flushSave();
-  updateButtonStates();
-  updatePrinterLabel();
+  billingService_->flushSave();
+  updateButtonStates(); updatePrinterLabel();
   statusBar()->showMessage(QStringLiteral("已停止"));
 }
 
@@ -970,7 +1025,8 @@ void MainWindow::onSettingsClicked()
   SettingsDialog dialog(config_, this);
   if (dialog.exec() == QDialog::Accepted)
   {
-    userTaskModel_->setPricingConfig(&config_.pricing);
+    billingService_->setPricingConfig(&config_.pricing);
+    billingService_->setPrinterProfiles(&config_.printers);
     applyConfig();
     statusBar()->showMessage(QStringLiteral("设置已保存"), 3000);
   }
@@ -979,113 +1035,67 @@ void MainWindow::onSettingsClicked()
 void MainWindow::onCompleteClicked()
 {
   QModelIndex current = treeView_->currentIndex();
-  if (!current.isValid())
-  {
-    statusBar()->showMessage(QStringLiteral("请先选择一个用户"), 3000);
-    return;
-  }
-
-  // Walk up to the group row.
-  while (current.isValid() && !groupModel_->isGroupRow(current))
+  if (!current.isValid()) { statusBar()->showMessage(QStringLiteral("请先选择一个批次"), 3000); return; }
+  while (current.isValid() && !batchModel_->isBatchRow(current))
     current = current.parent();
+  if (!current.isValid()) { statusBar()->showMessage(QStringLiteral("请选择一个未结算的批次"), 3000); return; }
 
-  if (!current.isValid() || groupModel_->isGroupCompleted(current))
-  {
-    statusBar()->showMessage(QStringLiteral("请选择一个未结算的用户"), 3000);
-    return;
-  }
+  const QString batchId = batchModel_->batchIdAt(current);
+  const auto* batch = batchModel_->batchAt(current);
+  if (batch == nullptr || batch->is_settled()) { statusBar()->showMessage(QStringLiteral("请选择一个未结算的批次"), 3000); return; }
 
-  const QString userId = groupModel_->userIdAt(current);
-  const auto summary = groupModel_->groupSummaryAt(current);
-  int jobCount = 0;
-  double totalCost = 0.0;
   std::vector<JobCostLine> costLines;
-
-  for (int r = 0; r < groupModel_->rowCount(current); ++r)
+  for (int r = 0; r < batchModel_->rowCount(current); ++r)
   {
-    QModelIndex childIdx = groupModel_->index(r, 0, current);
-    auto jd = groupModel_->jobDataAt(childIdx);
-    if (!jd.has_value()) continue;
-
-    ++jobCount;
-    const double jobCost = calculate_job_cost(jd->metadata, config_.pricing);
-    totalCost += jobCost;
-
+    QModelIndex childIdx = batchModel_->index(r, 0, current);
+    const auto* job = batchModel_->jobAt(childIdx);
+    if (job == nullptr) continue;
     JobCostLine line;
-    line.documentName = QString::fromStdString(jd->job.document_name);
-    line.pages = parse_total_pages(jd->metadata);
-    if (jd->metadata.color.state == core::FieldState::Reported)
-      line.colorMode = QString::fromStdString(jd->metadata.color.value);
-    if (jd->metadata.duplex.state == core::FieldState::Reported)
-      line.duplexMode = QString::fromStdString(jd->metadata.duplex.value);
-    if (jd->metadata.paper_size.state == core::FieldState::Reported)
-      line.paperSize = QString::fromStdString(jd->metadata.paper_size.value);
-    line.price = jobCost;
+    line.documentName = QString::fromStdString(job->snapshot.document_name);
+    line.pages = job->pricing.total_pages;
+    if (job->metadata.color.state == core::FieldState::Reported)
+      line.colorMode = QString::fromStdString(job->metadata.color.value);
+    if (job->metadata.duplex.state == core::FieldState::Reported)
+      line.duplexMode = QString::fromStdString(job->metadata.duplex.value);
+    if (job->metadata.paper_size.state == core::FieldState::Reported)
+      line.paperSize = QString::fromStdString(job->metadata.paper_size.value);
+    if (job->metadata.file_extension.state == core::FieldState::Reported)
+      line.fileExtension = QString::fromStdString(job->metadata.file_extension.value);
+    line.pricePending = job->pricing.price_pending;
+    line.pendingReason = QString::fromStdString(job->pricing.pending_reason);
+    line.price = job->pricing.total_price;
     costLines.push_back(std::move(line));
   }
 
-  if (jobCount <= 0)
-  {
-    statusBar()->showMessage(QStringLiteral("该用户没有作业"), 3000);
-    return;
-  }
+  if (costLines.empty()) { statusBar()->showMessage(QStringLiteral("该批次没有作业"), 3000); return; }
 
-  // ── Confirm with dialog ────────────────────────────────
-  CompletionDialog dlg(userId, costLines, config_.pricing, this);
-  if (dlg.exec() != QDialog::Accepted)
-    return;
+  CompletionDialog dlg(QString::fromStdString(batch->display_name),
+                       costLines, config_.pricing, this);
+  if (dlg.exec() != QDialog::Accepted) return;
 
-  groupModel_->completeUser(userId);
-  userTaskModel_->completeUserTask(userId);
+  QString orderId = billingService_->settle(batchId);
+  if (orderId.isEmpty()) { statusBar()->showMessage(QStringLiteral("结算失败"), 3000); return; }
   statusBar()->showMessage(
-    QStringLiteral("已结算: %1  (%2 作业, %3 页, ¥%4)")
-      .arg(userId)
-      .arg(jobCount)
-      .arg(summary.simplexPages + summary.duplexPages + summary.specialPaperPages)
-      .arg(QString::number(totalCost, 'f', 2)),
-    5000);
+    QStringLiteral("已结算: %1 (订单 %2)")
+      .arg(QString::fromStdString(batch->display_name)).arg(orderId), 5000);
 }
 
 void MainWindow::onTreeSelectionChanged()
 {
   refreshSelectedDetail();
-
-  // Walk to group row and enable/disable complete button.
   QModelIndex current = treeView_->currentIndex();
-  while (current.isValid() && !groupModel_->isGroupRow(current))
+  while (current.isValid() && !batchModel_->isBatchRow(current))
     current = current.parent();
-
-  completeUserBtn_->setEnabled(
-    current.isValid() && !groupModel_->isGroupCompleted(current));
-
-  // ── Current-user price ──────────────────────────────────────────
-  if (current.isValid() && !groupModel_->isGroupCompleted(current))
-  {
-    const QString userId = groupModel_->userIdAt(current);
-    double total = 0.0;
-    for (int r = 0; r < groupModel_->rowCount(current); ++r)
-    {
-      QModelIndex childIdx = groupModel_->index(r, 0, current);
-      auto jd = groupModel_->jobDataAt(childIdx);
-      if (jd.has_value())
-        total += calculate_job_cost(jd->metadata, config_.pricing);
-    }
-    // Current-user price is shown in the receipt card and detail panel.
-    Q_UNUSED(userId);
-    Q_UNUSED(total);
-  }
-  else
-  {
-    // No selection — receipt panel still shows all active orders.
-  }
-
+  bool canSettle = current.isValid() && batchModel_->batchAt(current) != nullptr &&
+                   !batchModel_->batchAt(current)->is_settled();
+  completeUserBtn_->setEnabled(canSettle);
+  quickSettleBtn_->setEnabled(canSettle || batchModel_->batchCount() > 0);
   scheduleWorkspaceRebalance();
 }
 
 void MainWindow::onPrinterSkipped(const QString& printerName)
 {
-  statusBar()->showMessage(
-    QStringLiteral("已跳过打印机: %1").arg(printerName), 3000);
+  statusBar()->showMessage(QStringLiteral("已跳过打印机: %1").arg(printerName), 3000);
 }
 
 void MainWindow::onWatcherHeartbeat(const QString& printerName)
@@ -1093,47 +1103,28 @@ void MainWindow::onWatcherHeartbeat(const QString& printerName)
   printerHeartbeats_[printerName] = QDateTime::currentDateTimeUtc();
 }
 
-void MainWindow::onUserCompleted(const QString& userId)
+void MainWindow::onBatchSettled(const QString&, const QString&)
 {
-  Q_UNUSED(userId);
-  refreshSummaryCards();
-  refreshReceiptPanel();
-  selectFirstIncompleteUser();
-  onTreeSelectionChanged();
+  refreshSummaryCards(); refreshReceiptPanel();
+  selectNextRelevantBatch(); onTreeSelectionChanged();
 }
 
 void MainWindow::checkStalePrinters()
 {
   if (!bridge_->isRunning()) return;
-
   const auto now = QDateTime::currentDateTimeUtc();
   QStringList stale;
   for (const QString& name : bridge_->watchedPrinters())
   {
     auto it = printerHeartbeats_.find(name);
-    if (it == printerHeartbeats_.end())
-    {
-      printerHeartbeats_[name] = now;
-      continue;
-    }
-    if (it->secsTo(now) > 8)
-      stale.append(name);
+    if (it == printerHeartbeats_.end()) { printerHeartbeats_[name] = now; continue; }
+    if (it->secsTo(now) > 8) stale.append(name);
   }
-
   if (!stale.isEmpty())
-  {
-    statusBar()->showMessage(
-      QStringLiteral("打印机无响应: %1").arg(stale.join(QStringLiteral(", "))),
-      5000);
-  }
+    statusBar()->showMessage(QStringLiteral("打印机无响应: %1").arg(stale.join(QStringLiteral(", "))), 5000);
 }
 
-void MainWindow::autoStart()
-{
-  onStartClicked();
-}
-
-// ── UI state ─────────────────────────────────────────────────────────
+void MainWindow::autoStart() { onStartClicked(); }
 
 void MainWindow::updateButtonStates()
 {
@@ -1146,55 +1137,38 @@ void MainWindow::updateButtonStates()
 void MainWindow::updatePrinterLabel()
 {
   const bool running = bridge_->isRunning();
-  sessionStateLabel_->setText(running ? QStringLiteral("运行中")
-                                      : QStringLiteral("待启动"));
+  sessionStateLabel_->setText(running ? QStringLiteral("运行中") : QStringLiteral("待启动"));
   sessionStateLabel_->setProperty("state", running ? "running" : "idle");
   repolish(sessionStateLabel_);
-
   const int n = running ? bridge_->watchedPrinters().size() : 0;
   printerCountLabel_->setText(QString::number(n));
 }
 
 void MainWindow::refreshSummaryCards()
 {
-  const int totalGroups = groupModel_->groupCount();
-  const int totalJobs = groupModel_->totalJobCount();
-  int activeUsers = 0;
-  for (int i = 0; i < totalGroups; ++i)
-  {
-    QModelIndex idx = groupModel_->index(i, 0);
-    if (!groupModel_->isGroupCompleted(idx))
-      ++activeUsers;
-  }
-
-  userCountLabel_->setText(QString::number(activeUsers));
-  resultCountLabel_->setText(
-    QStringLiteral("%1 用户 / %2 作业").arg(totalGroups).arg(totalJobs));
-
+  const int totalBatches = batchModel_->batchCount();
+  int activeBatches = billingService_->activeBatchCount();
+  int totalJobs = billingService_->todayJobCount();
+  userCountLabel_->setText(QString::number(activeBatches));
+  resultCountLabel_->setText(QStringLiteral("%1 批次 / %2 作业").arg(totalBatches).arg(totalJobs));
   const bool filtersActive = !searchEdit_->text().trimmed().isEmpty();
   clearFilterBtn_->setEnabled(filtersActive);
-
-  // Update complete button state.
   onTreeSelectionChanged();
 }
 
 void MainWindow::applySearchFilter()
 {
-  if (treeView_ == nullptr || groupModel_ == nullptr) return;
-
+  if (treeView_ == nullptr || batchModel_ == nullptr) return;
   const QString norm = searchEdit_->text().trimmed();
   treeView_->setUpdatesEnabled(false);
-  for (int i = 0; i < groupModel_->rowCount(); ++i)
+  for (int i = 0; i < batchModel_->rowCount(); ++i)
   {
-    QModelIndex idx = groupModel_->index(i, 0);
-    const QString userId = groupModel_->userIdAt(idx);
-    const bool match = norm.isEmpty() ||
-      userId.contains(norm, Qt::CaseInsensitive);
+    QModelIndex idx = batchModel_->index(i, 0);
+    const QString displayName = idx.data(BillingBatchModel::DisplayNameRole).toString();
+    const bool match = norm.isEmpty() || displayName.contains(norm, Qt::CaseInsensitive);
     treeView_->setRowHidden(i, QModelIndex(), !match);
-    if (match && !norm.isEmpty())
-      treeView_->expand(idx);
-    else if (norm.isEmpty())
-      treeView_->collapse(idx);  // restore collapsed default when filter cleared
+    if (match && !norm.isEmpty()) treeView_->expand(idx);
+    else if (norm.isEmpty()) treeView_->collapse(idx);
   }
   treeView_->setUpdatesEnabled(true);
   clearFilterBtn_->setEnabled(!norm.isEmpty());
@@ -1204,210 +1178,103 @@ void MainWindow::applySearchFilter()
 void MainWindow::refreshEmptyState()
 {
   refreshSummaryCards();
-
-  const bool hasVisible = groupModel_->groupCount() > 0;
-  tableStack_->setCurrentWidget(
-    hasVisible ? static_cast<QWidget*>(treeView_)
-               : static_cast<QWidget*>(emptyStateLabel_));
-
+  const bool hasVisible = batchModel_->batchCount() > 0;
+  tableStack_->setCurrentWidget(hasVisible ? static_cast<QWidget*>(treeView_) : static_cast<QWidget*>(emptyStateLabel_));
   if (hasVisible) return;
-
-  emptyStateLabel_->setText(
-    bridge_->isRunning()
-      ? QStringLiteral("暂无打印作业")
-      : QStringLiteral("点击「开始监听」启动"));
+  emptyStateLabel_->setText(bridge_->isRunning() ? QStringLiteral("暂无打印作业") : QStringLiteral("点击「开始监听」启动"));
 }
 
 void MainWindow::refreshGroupRowSpans()
 {
-  if (treeView_ == nullptr || groupModel_ == nullptr) return;
-
-  for (int i = 0; i < groupModel_->groupCount(); ++i)
+  if (treeView_ == nullptr || batchModel_ == nullptr) return;
+  for (int i = 0; i < batchModel_->batchCount(); ++i)
     treeView_->setFirstColumnSpanned(i, QModelIndex(), true);
 }
 
 void MainWindow::refreshSelectedDetail()
 {
   QModelIndex current = treeView_->currentIndex();
-  if (!current.isValid())
-  {
-    detailPanel_->clear();
-    return;
-  }
+  if (!current.isValid()) { detailPanel_->clear(); return; }
 
-  if (groupModel_->isGroupRow(current))
+  if (batchModel_->isBatchRow(current))
   {
-    // Group row — show rich summary card with aggregated stats.
-    const QString userId = groupModel_->userIdAt(current);
-    const auto summary = groupModel_->groupSummaryAt(current);
-    bool completed = groupModel_->isGroupCompleted(current);
-
-    // Count active (non-terminal) child jobs.
+    const auto* batch = batchModel_->batchAt(current);
+    if (batch == nullptr) { detailPanel_->clear(); return; }
+    UserGroupSummary summary;
+    summary.jobCount = static_cast<int>(batch->job_ids.size());
+    summary.simplexPages = batch->simplex_pages;
+    summary.duplexPages = batch->duplex_pages;
+    summary.duplexSheets = (batch->duplex_pages + 1) / 2;
+    summary.totalPrice = batch->total_price;
+    summary.pendingCount = batch->pending_count;
+    if (!batch->first_doc_anchor.document_name.empty())
+      summary.specialItems.append(QStringLiteral("首: %1").arg(QString::fromStdString(batch->first_doc_anchor.document_name)));
+    if (!batch->last_doc_anchor.document_name.empty())
+      summary.specialItems.append(QStringLiteral("尾: %1").arg(QString::fromStdString(batch->last_doc_anchor.document_name)));
     int activeJobs = 0;
-    for (int r = 0; r < groupModel_->rowCount(current); ++r)
+    for (int r = 0; r < batchModel_->rowCount(current); ++r)
     {
-      QModelIndex childIdx = groupModel_->index(r, 0, current);
-      auto jd = groupModel_->jobDataAt(childIdx);
-      if (jd.has_value() && !is_terminal_phase(jd->phase))
-        ++activeJobs;
+      QModelIndex childIdx = batchModel_->index(r, 0, current);
+      const auto* job = batchModel_->jobAt(childIdx);
+      if (job != nullptr && !is_terminal_phase(job->phase)) ++activeJobs;
     }
-
-    detailPanel_->showGroupSummary(userId, summary, activeJobs, completed);
+    detailPanel_->showGroupSummary(QString::fromStdString(batch->display_name), summary, activeJobs, batch->is_settled());
   }
   else
   {
-    // Job row — delegate to existing detail panel.
-    auto jd = groupModel_->jobDataAt(current);
-    if (jd.has_value())
-      detailPanel_->showJob(jd->job, jd->metadata);
+    const auto* job = batchModel_->jobAt(current);
+    if (job != nullptr) detailPanel_->showJob(job->snapshot, job->metadata, job->pricing);
   }
 }
 
-void MainWindow::selectFirstIncompleteUser()
+void MainWindow::selectNextRelevantBatch()
 {
-  if (groupModel_->groupCount() == 0) return;
-
+  if (batchModel_->batchCount() == 0) return;
   QModelIndex current = treeView_->currentIndex();
-  while (current.isValid() && !groupModel_->isGroupRow(current))
+  while (current.isValid() && !batchModel_->isBatchRow(current))
     current = current.parent();
-
-  if (current.isValid()
-      && !groupModel_->isGroupCompleted(current)
-      && !treeView_->isRowHidden(current.row(), QModelIndex()))
+  int fromRow = current.isValid() ? current.row() : -1;
+  int next = batchModel_->nextRelevantRow(fromRow);
+  if (next < 0) return;
+  QModelIndex idx = batchModel_->index(next, 0);
+  if (!treeView_->isRowHidden(next, QModelIndex()))
   {
-    return;
-  }
-
-  for (int i = 0; i < groupModel_->groupCount(); ++i)
-  {
-    if (treeView_->isRowHidden(i, QModelIndex())) continue;
-
-    QModelIndex idx = groupModel_->index(i, 0);
-    if (!groupModel_->isGroupCompleted(idx))
-    {
-      treeView_->selectionModel()->setCurrentIndex(
-        idx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
-      treeView_->expand(idx);
-      treeView_->scrollTo(idx, QAbstractItemView::PositionAtCenter);
-      return;
-    }
+    treeView_->selectionModel()->setCurrentIndex(idx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    treeView_->expand(idx);
+    treeView_->scrollTo(idx, QAbstractItemView::PositionAtCenter);
   }
 }
 
 void MainWindow::refreshReceiptPanel()
 {
-  if (receiptPanel_ == nullptr || groupModel_ == nullptr || userTaskModel_ == nullptr)
-    return;
-
+  if (receiptPanel_ == nullptr || batchModel_ == nullptr || billingService_ == nullptr) return;
   receiptPanel_->clearCards();
+  const auto& batches = billingService_->batches();
 
-  // Pass 1: active (in-progress) users first.
-  for (int i = 0; i < groupModel_->groupCount(); ++i)
+  for (const auto& batch : batches)
   {
-    QModelIndex groupIdx = groupModel_->index(i, 0);
-    if (groupModel_->isGroupCompleted(groupIdx))
-      continue;
-
-    const QString userId = groupModel_->userIdAt(groupIdx);
-    const auto summary = groupModel_->groupSummaryAt(groupIdx);
-
-    // Find matching task in userTaskModel for order-id and price.
-    const auto* task = userTaskModel_->taskForUser(userId);
-    QString taskId = (task != nullptr) ? task->taskId : QStringLiteral("—");
-    double totalPrice = (task != nullptr) ? task->totalPrice : 0.0;
-    if (totalPrice <= 0.0)
-    {
-      // Fallback: compute price on the fly from child jobs.
-      for (int r = 0; r < groupModel_->rowCount(groupIdx); ++r)
-      {
-        QModelIndex childIdx = groupModel_->index(r, 0, groupIdx);
-        auto jd = groupModel_->jobDataAt(childIdx);
-        if (jd.has_value())
-          totalPrice += calculate_job_cost(jd->metadata, config_.pricing);
-      }
-    }
-
-    // Gather first/last document names.
-    QString firstDoc, lastDoc;
-    int childCount = groupModel_->rowCount(groupIdx);
-    if (childCount > 0)
-    {
-      auto first = groupModel_->jobDataAt(groupModel_->index(0, 0, groupIdx));
-      if (first.has_value())
-        firstDoc = QString::fromStdString(first->job.document_name);
-      if (childCount > 1)
-      {
-        auto last = groupModel_->jobDataAt(groupModel_->index(childCount - 1, 0, groupIdx));
-        if (last.has_value())
-          lastDoc = QString::fromStdString(last->job.document_name);
-      }
-      else
-      {
-        lastDoc = firstDoc;
-      }
-    }
-
-    int totalPages = summary.simplexPages + summary.duplexPages + summary.specialPaperPages;
-    QColor userColor = groupIdx.data(UserGroupModel::RowColorRole).value<QColor>();
-
-    receiptPanel_->addCard(taskId, userId, firstDoc, lastDoc,
-                           totalPages, totalPrice, userColor, /*completed=*/false);
+    if (batch.is_settled()) continue;
+    QString firstDoc = QString::fromStdString(batch.first_doc_anchor.document_name);
+    QString lastDoc = QString::fromStdString(batch.last_doc_anchor.document_name);
+    int totalPages = batch.simplex_pages + batch.duplex_pages;
+    QColor userColor = userBackgroundColor(QString::fromStdString(batch.batch_id));
+    bool hasPending = batch.pending_count > 0;
+    receiptPanel_->addCard(QString::fromStdString(batch.batch_id),
+      QString::fromStdString(batch.display_name), firstDoc, lastDoc,
+      totalPages, batch.total_price, userColor, false, hasPending);
   }
-
-  // Pass 2: completed users as grayed-out placeholders.
-  for (int i = 0; i < groupModel_->groupCount(); ++i)
+  for (auto it = batches.rbegin(); it != batches.rend(); ++it)
   {
-    QModelIndex groupIdx = groupModel_->index(i, 0);
-    if (!groupModel_->isGroupCompleted(groupIdx))
-      continue;
-
-    const QString userId = groupModel_->userIdAt(groupIdx);
-    const auto summary = groupModel_->groupSummaryAt(groupIdx);
-
-    // Recover task info from UserTaskModel (completed tasks are no longer
-    // in the active index — look up by user's task in the full task list).
-    QString taskId = QStringLiteral("—");
-    double totalPrice = 0.0;
-    for (int t = 0; t < userTaskModel_->rowCount(); ++t)
-    {
-      const auto* task = userTaskModel_->taskAtRow(t);
-      if (task != nullptr && task->userId == userId)
-      {
-        taskId = task->taskId;
-        totalPrice = task->totalPrice;
-        break;
-      }
-    }
-
-    // Gather first/last document names.
-    QString firstDoc, lastDoc;
-    int childCount = groupModel_->rowCount(groupIdx);
-    if (childCount > 0)
-    {
-      auto first = groupModel_->jobDataAt(groupModel_->index(0, 0, groupIdx));
-      if (first.has_value())
-        firstDoc = QString::fromStdString(first->job.document_name);
-      if (childCount > 1)
-      {
-        auto last = groupModel_->jobDataAt(groupModel_->index(childCount - 1, 0, groupIdx));
-        if (last.has_value())
-          lastDoc = QString::fromStdString(last->job.document_name);
-      }
-      else
-      {
-        lastDoc = firstDoc;
-      }
-    }
-
-    int totalPages = summary.simplexPages + summary.duplexPages + summary.specialPaperPages;
-    QColor userColor = groupIdx.data(UserGroupModel::RowColorRole).value<QColor>();
-
-    receiptPanel_->addCard(taskId, userId, firstDoc, lastDoc,
-                           totalPages, totalPrice, userColor, /*completed=*/true);
+    if (!it->is_settled()) continue;
+    QString firstDoc = QString::fromStdString(it->first_doc_anchor.document_name);
+    QString lastDoc = QString::fromStdString(it->last_doc_anchor.document_name);
+    int totalPages = it->simplex_pages + it->duplex_pages;
+    QColor userColor = userBackgroundColor(QString::fromStdString(it->batch_id));
+    receiptPanel_->addCard(QString::fromStdString(it->batch_id),
+      QString::fromStdString(it->display_name), firstDoc, lastDoc,
+      totalPages, it->total_price, userColor, true, false);
   }
 }
-
-// ── Config helpers ──────────────────────────────────────────────────
 
 void MainWindow::loadOrCreateConfig()
 {
@@ -1415,41 +1282,44 @@ void MainWindow::loadOrCreateConfig()
   if (std::filesystem::exists(cfgPath))
   {
     config_ = common::AppConfig::defaults();
-    if (!config_.load_from_json(cfgPath))
-    {
-      config_ = common::AppConfig::defaults();
-      config_.save_to_json(cfgPath);
-    }
+    if (!config_.load_from_json(cfgPath)) { config_ = common::AppConfig::defaults(); config_.save_to_json(cfgPath); }
   }
-  else
-  {
-    config_ = common::AppConfig::defaults();
-    common::AppConfig::ensure_config_file(cfgPath);
-  }
+  else { config_ = common::AppConfig::defaults(); common::AppConfig::ensure_config_file(cfgPath); }
 }
 
 void MainWindow::applyConfig()
 {
-  userTaskModel_->setPricingConfig(&config_.pricing);
+  billingService_->setPricingConfig(&config_.pricing);
+  billingService_->setPrinterProfiles(&config_.printers);
   const QString outputRoot = QString::fromStdString(config_.storage.output_root);
   outputDirLabel_->setText(compactPathText(outputRoot));
   outputDirLabel_->setToolTip(outputRoot);
+}
+
+void MainWindow::detectPrintersIfNeeded()
+{
+  if (!config_.printers.profiles.empty()) return;
+  config_.printers = common::detect_printer_capabilities();
+  if (!config_.printers.profiles.empty())
+    config_.save_to_json(common::AppConfig::default_config_path());
 }
 
 QString MainWindow::resolveOutputRoot() const
 {
   QString root = QString::fromStdString(config_.storage.output_root);
   if (QDir::isRelativePath(root))
-  {
-    const QString exeDir = QCoreApplication::applicationDirPath();
-    root = QDir(exeDir).filePath(root);
-  }
+  { const QString exeDir = QCoreApplication::applicationDirPath(); root = QDir(exeDir).filePath(root); }
   if (config_.storage.use_timestamp_subdir)
-  {
-    const QString ts = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss"));
-    root = QDir(root).filePath(QStringLiteral("capture-%1").arg(ts));
-  }
+  { const QString ts = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")); root = QDir(root).filePath(QStringLiteral("capture-%1").arg(ts)); }
   return QDir::toNativeSeparators(root);
+}
+
+QString MainWindow::resolveStateDir() const
+{
+  QString root = QString::fromStdString(config_.storage.output_root);
+  if (QDir::isRelativePath(root))
+  { const QString exeDir = QCoreApplication::applicationDirPath(); root = QDir(exeDir).filePath(root); }
+  return QDir::toNativeSeparators(QDir(root).filePath(QStringLiteral("_state")));
 }
 
 }  // namespace wpce::ui

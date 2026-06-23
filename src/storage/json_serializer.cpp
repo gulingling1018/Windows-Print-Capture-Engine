@@ -1,5 +1,6 @@
 #include "storage/json_serializer.h"
 
+#include <cstdio>
 #include <iomanip>
 #include <ostream>
 #include <sstream>
@@ -77,6 +78,14 @@ void append_json_property(std::ostream& output, const std::string_view name, con
   output << ": " << value;
 }
 
+void append_json_property(std::ostream& output, const std::string_view name, const double value)
+{
+  append_json_string(output, name);
+  char buf[64];
+  std::snprintf(buf, sizeof(buf), "%.2f", value);
+  output << ": " << buf;
+}
+
 void append_field_value(std::ostream& output, const std::string_view name, const core::FieldValue& field)
 {
   append_json_string(output, name);
@@ -152,6 +161,8 @@ std::string to_json(const core::MetadataSnapshot& snapshot)
   append_field_value(output, "media_type", snapshot.media_type);
   output << ",\n  ";
   append_field_value(output, "page_range", snapshot.page_range);
+  output << ",\n  ";
+  append_field_value(output, "file_extension", snapshot.file_extension);
   output << ",\n  ";
   append_json_property(output, "dm_fields_hex", snapshot.dm_fields_hex);
   output << "\n}\n";
@@ -292,6 +303,148 @@ std::string to_json(const core::PageArtifactIndex& index)
   append_json_property(output, "fixed_page", index.fixed_page);
   output << ",\n  ";
   append_json_property(output, "source", index.source);
+  output << "\n}\n";
+  return output.str();
+}
+
+// ── New pricing & settlement structs ────────────────────────────────────
+
+std::string to_json(const core::PricingRule& rule)
+{
+  std::ostringstream output;
+  output << "{\n  ";
+  append_json_property(output, "rule_id", rule.rule_id);
+  output << ",\n  ";
+  append_json_property(output, "paper_size", rule.paper_size);
+  output << ",\n  ";
+  append_json_property(output, "duplex_mode", rule.duplex_mode);
+  output << ",\n  ";
+  append_json_property(output, "color_mode", rule.color_mode);
+  output << ",\n  ";
+  append_json_property(output, "file_extension", rule.file_extension);
+  output << ",\n  ";
+  append_json_property(output, "price_per_sheet", rule.price_per_sheet);
+  output << ",\n  ";
+  append_json_property(output, "priority", rule.priority);
+  output << "\n}\n";
+  return output.str();
+}
+
+std::string to_json(const core::JobPricingEntry& entry)
+{
+  std::ostringstream output;
+  output << "{\n  ";
+  append_json_property(output, "job_id", entry.job_id);
+  output << ",\n  ";
+  append_json_property(output, "total_pages", entry.total_pages);
+  output << ",\n  ";
+  append_json_property(output, "copies", entry.copies);
+  output << ",\n  ";
+  append_json_property(output, "effective_sheets", entry.effective_sheets);
+  output << ",\n  ";
+  append_json_property(output, "duplex_full_sheets", entry.duplex_full_sheets);
+  output << ",\n  ";
+  append_json_property(output, "simplex_tail_pages", entry.simplex_tail_pages);
+  output << ",\n  ";
+  append_json_property(output, "matched_rule_id", entry.matched_rule_id);
+  output << ",\n  ";
+  append_json_property(output, "base_price", entry.base_price);
+  output << ",\n  ";
+  append_json_property(output, "total_price", entry.total_price);
+  output << ",\n  ";
+  output << "\"price_pending\": " << (entry.price_pending ? "true" : "false");
+  output << ",\n  ";
+  append_json_property(output, "pending_reason", entry.pending_reason);
+  output << "\n}\n";
+  return output.str();
+}
+
+namespace
+{
+
+void append_json_pricing_entry(std::ostream& output, const core::JobPricingEntry& entry)
+{
+  output << "    {\n      ";
+  append_json_property(output, "job_id", entry.job_id);
+  output << ",\n      ";
+  append_json_property(output, "total_pages", entry.total_pages);
+  output << ",\n      ";
+  append_json_property(output, "copies", entry.copies);
+  output << ",\n      ";
+  append_json_property(output, "effective_sheets", entry.effective_sheets);
+  output << ",\n      ";
+  append_json_property(output, "duplex_full_sheets", entry.duplex_full_sheets);
+  output << ",\n      ";
+  append_json_property(output, "simplex_tail_pages", entry.simplex_tail_pages);
+  output << ",\n      ";
+  append_json_property(output, "matched_rule_id", entry.matched_rule_id);
+  output << ",\n      ";
+  append_json_property(output, "base_price", entry.base_price);
+  output << ",\n      ";
+  append_json_property(output, "total_price", entry.total_price);
+  output << ",\n      ";
+  output << "\"price_pending\": " << (entry.price_pending ? "true" : "false");
+  output << ",\n      ";
+  append_json_property(output, "pending_reason", entry.pending_reason);
+  output << "\n    }";
+}
+
+}  // namespace
+
+std::string to_json(const core::SettlementOrder& order)
+{
+  std::ostringstream output;
+  output << "{\n  ";
+  append_json_property(output, "schema_version", order.schema_version);
+  output << ",\n  ";
+  append_json_property(output, "order_id", order.order_id);
+  output << ",\n  ";
+  append_json_property(output, "task_id", order.task_id);
+  output << ",\n  ";
+  append_json_property(output, "user_id", order.user_id);
+  output << ",\n  ";
+  append_json_property(output, "settled_by", order.settled_by);
+  output << ",\n  ";
+  append_json_property(output, "settled_at_utc", order.settled_at_utc);
+  output << ",\n  ";
+  append_json_property(output, "period_start_utc", order.period_start_utc);
+  output << ",\n  ";
+  append_json_property(output, "period_end_utc", order.period_end_utc);
+  output << ",\n  ";
+  append_json_property(output, "currency", order.currency);
+  output << ",\n  ";
+  append_json_property(output, "total_price", order.total_price);
+  output << ",\n  ";
+  output << "\"job_ids\": [";
+  for (std::size_t i = 0; i < order.job_ids.size(); ++i)
+  {
+    if (i > 0) output << ", ";
+    output << order.job_ids[i];
+  }
+  output << "],\n  ";
+  output << "\"pricing_entries\": [\n";
+  for (std::size_t i = 0; i < order.pricing_entries.size(); ++i)
+  {
+    append_json_pricing_entry(output, order.pricing_entries[i]);
+    if (i + 1 < order.pricing_entries.size())
+      output << ',';
+    output << '\n';
+  }
+  output << "  ],\n  ";
+  append_json_property(output, "pricing_snapshot_json", order.pricing_snapshot_json);
+  output << "\n}\n";
+  return output.str();
+}
+
+std::string to_json(const core::SheetBreakdown& breakdown)
+{
+  std::ostringstream output;
+  output << "{\n  ";
+  append_json_property(output, "full_duplex_sheets", breakdown.full_duplex_sheets);
+  output << ",\n  ";
+  append_json_property(output, "simplex_tail_pages", breakdown.simplex_tail_pages);
+  output << ",\n  ";
+  append_json_property(output, "total_sheets", breakdown.total_sheets);
   output << "\n}\n";
   return output.str();
 }

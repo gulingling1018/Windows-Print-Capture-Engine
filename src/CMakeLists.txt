@@ -2,9 +2,14 @@ add_library(wpce_core
   collector/metadata_collector.cpp
   common/app_config.cpp
   common/build_info.cpp
+  common/counter_store.cpp
   common/logger.cpp
+  common/pricing_engine.cpp
+  common/printer_profile.cpp
   core/data_contracts.cpp
   core/perf_monitor.cpp
+  domain/billing_batch.cpp
+  domain/billing_batch_repository.cpp
   ipc/named_event.cpp
   storage/file_utils.cpp
   storage/job_snapshot_writer.cpp
@@ -14,6 +19,7 @@ add_library(wpce_core
   watcher/print_watcher.cpp
   parser/print_ticket_parser.cpp
   bridge/metadata_merger.cpp
+  bridge/settlement_bridge.cpp
 )
 
 target_include_directories(wpce_core

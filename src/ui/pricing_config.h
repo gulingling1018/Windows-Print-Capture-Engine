@@ -19,12 +19,10 @@ using PricingConfig = common::PricingConfig;
 inline bool is_duplex_job(const core::MetadataSnapshot& metadata)
 {
   const std::string& duplex = metadata.duplex.value;
-  // Treat unknown/empty/not-reported as simplex.
   if (duplex.empty() || duplex == "simplex")
   {
     return false;
   }
-  // Recognised duplex values.
   if (duplex == "vertical" ||
       duplex == "horizontal" ||
       duplex == "duplex" ||
@@ -44,7 +42,6 @@ inline bool is_large_paper(const core::MetadataSnapshot& metadata)
   const std::string& paper = metadata.paper_size.value;
   if (paper.empty()) return false;
 
-  // Case-insensitive match against known large sizes.
   const auto icase_equals = [](const std::string& a, const std::string& b)
   {
     if (a.size() != b.size()) return false;
@@ -74,8 +71,6 @@ inline bool is_high_quality(const core::MetadataSnapshot& metadata)
 inline bool is_color_job(const core::MetadataSnapshot& metadata)
 {
   const std::string& color = metadata.color.value;
-  // psk:Grayscale is a colour-mode variant that some drivers report
-  // instead of "monochrome"; it is still monochrome for pricing.
   return color == "color";
 }
 
@@ -109,19 +104,7 @@ inline int parse_total_pages(const core::MetadataSnapshot& metadata)
 }
 
 /// Estimate the number of physical sheets the job will consume,
-/// accounting for duplex and copies.  Used by both the per-job cost
-/// calculation and the per-user group aggregation so they stay
-/// consistent.
-///
-///   copies       = metadata.copies (>= 1)
-///   logical_pages= total_pages × copies       (the pages the driver renders)
-///   sheets       = duplex ? ceil(logical_pages / 2) : logical_pages
-///
-/// Note: some drivers report total_pages already multiplied by copies
-/// (physical pages) while others report the logical page count.  We
-/// treat metadata.total_pages as the logical count and multiply by
-/// copies here, which matches the PrintTicket semantics where
-/// JobCopiesAllDocuments is a separate parameter.
+/// accounting for duplex and copies.
 inline int estimate_physical_sheets(const core::MetadataSnapshot& metadata)
 {
   const int logical = parse_total_pages(metadata);
@@ -133,91 +116,10 @@ inline int estimate_physical_sheets(const core::MetadataSnapshot& metadata)
   return rendered;
 }
 
-/// Calculate the volume discount multiplier for a given total page count.
-/// Returns 1.0 if no discount applies.
-inline double volume_discount_multiplier(int total_pages,
-                                          const std::vector<common::VolumeDiscountTier>& tiers)
-{
-  if (tiers.empty()) return 1.0;
-
-  double best_discount = 1.0;
-  for (const auto& tier : tiers)
-  {
-    if (total_pages >= tier.min_pages && tier.discount < best_discount)
-    {
-      best_discount = tier.discount;
-    }
-  }
-  return best_discount;
-}
-
-/// Calculate the cost for a single print job based on metadata and pricing config.
-///
-/// Pricing formula:
-///   rendered_pages = total_pages × copies      (logical pages the driver renders)
-///   base = duplex ? ceil(rendered_pages/2) × double_sided_per_sheet
-///                : rendered_pages × single_sided_per_page
-///   surcharges:
-///     + color_surcharge  × rendered_pages  (if color job)
-///     + large_surcharge  × rendered_pages  (if A3/Tabloid/Ledger/Legal)
-///     + hq_surcharge     × rendered_pages  (if high quality)
-///   subtotal = base + sum(surcharges)
-///   final    = subtotal × volume_discount_multiplier(rendered_pages)
-///
-/// The rendered page count (total_pages × copies) is used for every
-/// per-page charge so the price scales correctly with copy count.
-/// This matches the aggregation in UserGroupModel::recomputeGroupSummary.
-inline double calculate_job_cost(const core::MetadataSnapshot& metadata,
-                                  const PricingConfig& config)
-{
-  const int logical_pages = parse_total_pages(metadata);
-  if (logical_pages <= 0)
-  {
-    return 0.0;
-  }
-
-  const int copies = parse_copies(metadata);
-  const int rendered_pages = logical_pages * copies;
-  if (rendered_pages <= 0)
-  {
-    return 0.0;
-  }
-
-  // ── Base cost ──────────────────────────────────────────────────────────
-  double base_cost = 0.0;
-  if (is_duplex_job(metadata))
-  {
-    // Double-sided: each sheet holds 2 pages.
-    const int sheets = static_cast<int>(std::ceil(rendered_pages / 2.0));
-    base_cost = sheets * config.double_sided_per_sheet;
-  }
-  else
-  {
-    // Single-sided or unknown: charge per page.
-    base_cost = rendered_pages * config.single_sided_per_page;
-  }
-
-  // ── Surcharges (per rendered page) ─────────────────────────────────────
-  double surcharges = 0.0;
-  if (is_color_job(metadata))
-  {
-    surcharges += rendered_pages * config.color_surcharge;
-  }
-  if (is_large_paper(metadata))
-  {
-    surcharges += rendered_pages * config.large_paper_surcharge;
-  }
-  if (is_high_quality(metadata))
-  {
-    surcharges += rendered_pages * config.high_quality_surcharge;
-  }
-
-  const double subtotal = base_cost + surcharges;
-
-  // ── Volume discount (based on rendered page count) ─────────────────────
-  const double multiplier = volume_discount_multiplier(rendered_pages, config.volume_discounts);
-  return subtotal * multiplier;
-}
+// Legacy additive pricing functions (volume_discount_multiplier,
+// calculate_job_cost) have been removed.  All pricing is now handled
+// by common::compute_job_pricing() which uses the matrix-based rule
+// system with printer-aware color downgrade.
 
 /// @returns a human-readable description of the page selection used for
 /// this job, suitable for display in the detail panel and for cost

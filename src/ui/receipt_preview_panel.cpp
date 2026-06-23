@@ -22,17 +22,19 @@ ReceiptCard::ReceiptCard(const QString& taskId, const QString& userId,
                          const QString& firstDoc, const QString& lastDoc,
                          int totalPages, double totalPrice,
                          const QColor& userColor, QWidget* parent,
-                         bool completed)
+                         bool completed, bool hasPending)
     : QFrame(parent), userId_(userId)
 {
   setObjectName(QStringLiteral("ReceiptCard"));
-  setFixedSize(220, 130);
+  setFixedSize(220, 110);
   setFrameShape(QFrame::NoFrame);
 
   const bool dimmed = completed;
 
   // Rounded border via stylesheet (lightweight).
-  const QColor border = dimmed ? QColor(0xc0, 0xc0, 0xc0) : userColor.darker(120);
+  QColor border = dimmed ? QColor(0xc0, 0xc0, 0xc0) : userColor.darker(120);
+  if (hasPending && !dimmed)
+    border = QColor(0xf5, 0x9e, 0x0b); // amber warning border
   const QColor bg = dimmed ? QColor(0xf8, 0xf8, 0xf8) : QColor(0xff, 0xff, 0xff);
   const QString sheet = QStringLiteral(
     "QFrame#ReceiptCard {"
@@ -43,23 +45,14 @@ ReceiptCard::ReceiptCard(const QString& taskId, const QString& userId,
   setStyleSheet(sheet);
 
   auto* root = new QVBoxLayout(this);
-  root->setContentsMargins(12, 10, 12, 10);
+  root->setContentsMargins(12, 8, 12, 8);
   root->setSpacing(4);
 
-  // ── Top row: task id + user initial avatar ───────────────────────
+  // ── Top row: order id ────────────────────────────────────────────
   auto* topRow = new QHBoxLayout();
   topRow->setContentsMargins(0, 0, 0, 0);
-  topRow->setSpacing(8);
 
-  // Avatar circle with user initial or checkmark.
-  auto* avatar = new QLabel(dimmed ? QStringLiteral("✓") : (userId.isEmpty() ? QStringLiteral("?") : userId.at(0).toUpper()));
-  avatar->setFixedSize(26, 26);
-  avatar->setAlignment(Qt::AlignCenter);
-  avatar->setStyleSheet(dimmed
-    ? QStringLiteral("background: #16a34a; color: white; border-radius: 13px; font-weight: bold; font-size: 13px;")
-    : QStringLiteral("background: %1; color: white; border-radius: 13px; font-weight: bold; font-size: 11px;").arg(userColor.name()));
-
-  auto* idLabel = new QLabel(QStringLiteral("#%1").arg(taskId));
+  auto* idLabel = new QLabel(QStringLiteral("订单 #%1").arg(taskId));
   idLabel->setObjectName(QStringLiteral("ReceiptId"));
   QFont idFont;
   idFont.setPointSize(8);
@@ -67,20 +60,8 @@ ReceiptCard::ReceiptCard(const QString& taskId, const QString& userId,
   idLabel->setFont(idFont);
   idLabel->setStyleSheet(dimmed ? QStringLiteral("color: #cbd5e1;") : QStringLiteral("color: #94a3b8;"));
 
-  topRow->addWidget(avatar);
   topRow->addWidget(idLabel, 1);
   root->addLayout(topRow);
-
-  // ── User name ─────────────────────────────────────────────────────
-  auto* nameLabel = new QLabel(dimmed ? QStringLiteral("%1 ✓").arg(userId) : userId);
-  nameLabel->setObjectName(QStringLiteral("ReceiptUser"));
-  QFont nameFont;
-  nameFont.setPointSize(12);
-  nameFont.setWeight(QFont::DemiBold);
-  nameLabel->setFont(nameFont);
-  nameLabel->setStyleSheet(dimmed ? QStringLiteral("color: #94a3b8;") : QStringLiteral("color: #0f172a;"));
-  nameLabel->setWordWrap(false);
-  root->addWidget(nameLabel);
 
   // ── First ~ Last document names ───────────────────────────────────
   QString docHint;
@@ -94,9 +75,10 @@ ReceiptCard::ReceiptCard(const QString& taskId, const QString& userId,
   auto* docLabel = new QLabel(docHint);
   docLabel->setObjectName(QStringLiteral("ReceiptDocs"));
   QFont docFont;
-  docFont.setPointSize(8);
+  docFont.setPointSize(9);
+  docFont.setWeight(QFont::DemiBold);
   docLabel->setFont(docFont);
-  docLabel->setStyleSheet(dimmed ? QStringLiteral("color: #cbd5e1;") : QStringLiteral("color: #64748b;"));
+  docLabel->setStyleSheet(dimmed ? QStringLiteral("color: #94a3b8;") : QStringLiteral("color: #0f172a;"));
   docLabel->setWordWrap(false);
   root->addWidget(docLabel);
 
@@ -113,13 +95,13 @@ ReceiptCard::ReceiptCard(const QString& taskId, const QString& userId,
 
   const QString statsColor = dimmed ? QStringLiteral("color: #cbd5e1; font-size: 10px;")
                                     : QStringLiteral("color: #334155; font-size: 10px;");
-  const QString priceColor = dimmed ? QStringLiteral("color: #9ca3af; font-size: 11px; font-weight: bold;")
-                                    : QStringLiteral("color: #dc2626; font-size: 11px; font-weight: bold;");
+  const QString priceColor = dimmed ? QStringLiteral("color: #9ca3af; font-size: 12px; font-weight: bold;")
+                                    : QStringLiteral("color: #dc2626; font-size: 12px; font-weight: bold;");
 
-  auto* pagesLabel = new QLabel(QStringLiteral("📄 %1页").arg(totalPages));
+  auto* pagesLabel = new QLabel(QStringLiteral("%1 页").arg(totalPages));
   pagesLabel->setStyleSheet(statsColor);
 
-  auto* priceLabel = new QLabel(QStringLiteral("💰 ¥%1").arg(totalPrice, 0, 'f', 2));
+  auto* priceLabel = new QLabel(QStringLiteral("¥%1").arg(totalPrice, 0, 'f', 2));
   priceLabel->setStyleSheet(priceColor);
 
   statsRow->addWidget(pagesLabel);
@@ -150,7 +132,7 @@ ReceiptCard::ReceiptCard(const QString& taskId, const QString& userId,
       "QPushButton {"
       "  background: %1; color: white;"
       "  border: none; border-radius: 6px;"
-      "  padding: 5px 14px; font-weight: 600; font-size: 11px;"
+      "  padding: 4px 14px; font-weight: 600; font-size: 11px;"
       "}"
       "QPushButton:hover { background: %2; }"
       "QPushButton:pressed { background: %3; }"
@@ -173,8 +155,8 @@ ReceiptCard::ReceiptCard(const QString& taskId, const QString& userId,
 ReceiptPreviewPanel::ReceiptPreviewPanel(QWidget* parent) : QWidget(parent)
 {
   setObjectName(QStringLiteral("ReceiptPreviewPanel"));
-  setMinimumHeight(154);
-  setMaximumHeight(180);
+  setMinimumHeight(140);
+  setMaximumHeight(160);
   setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
 
   auto* root = new QVBoxLayout(this);
@@ -205,12 +187,12 @@ ReceiptPreviewPanel::ReceiptPreviewPanel(QWidget* parent) : QWidget(parent)
   scrollArea_->setHorizontalScrollBarPolicy(Qt::ScrollBarAsNeeded);
   scrollArea_->setVerticalScrollBarPolicy(Qt::ScrollBarAlwaysOff);
   scrollArea_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Fixed);
-  scrollArea_->setFixedHeight(136);
+  scrollArea_->setFixedHeight(116);
 
   cardsContainer_ = new QWidget();
   cardsContainer_->setObjectName(QStringLiteral("ReceiptCardsContainer"));
   cardsContainer_->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Fixed);
-  cardsContainer_->setFixedHeight(136);
+  cardsContainer_->setFixedHeight(116);
 
   cardsLayout_ = new QHBoxLayout(cardsContainer_);
   cardsLayout_->setContentsMargins(0, 0, 0, 0);
@@ -248,7 +230,8 @@ void ReceiptPreviewPanel::clearCards()
 void ReceiptPreviewPanel::addCard(const QString& taskId, const QString& userId,
                                   const QString& firstDoc, const QString& lastDoc,
                                   int totalPages, double totalPrice,
-                                  const QColor& userColor, bool completed)
+                                  const QColor& userColor, bool completed,
+                                  bool hasPending)
 {
   // Remove empty label if present.
   if (emptyLabel_ != nullptr)
@@ -260,7 +243,7 @@ void ReceiptPreviewPanel::addCard(const QString& taskId, const QString& userId,
 
   auto* card = new ReceiptCard(taskId, userId, firstDoc, lastDoc,
                                totalPages, totalPrice, userColor,
-                               cardsContainer_, completed);
+                               cardsContainer_, completed, hasPending);
 
   if (!completed)
   {

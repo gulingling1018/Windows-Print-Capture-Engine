@@ -283,7 +283,8 @@ static int scan_one_dir(const std::filesystem::path& dir,
 {
   if (!std::filesystem::exists(dir)) return 0;
   int count = 0;
-  for (const auto& entry : std::filesystem::directory_iterator(dir))
+  std::error_code ec;
+  for (const auto& entry : std::filesystem::directory_iterator(dir, ec))
   {
     if (!entry.is_regular_file()) continue;
     auto filename = entry.path().filename().string();
