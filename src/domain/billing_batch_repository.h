@@ -2,7 +2,7 @@
 /// Persistence for BillingBatch entities.
 ///
 /// The repository serialises the full batch list (Active, Suspended,
-/// Settled) to a single JSON file at `<output_root>/_state/batches.json`.
+/// Settled) to a single JSON file at `<output_root>/_state/today_active.json`.
 /// This is decoupled from the timestamped capture subdirectories so
 /// that batches survive across capture sessions and remain consistent
 /// with the global CounterStore.
@@ -31,10 +31,15 @@ class BillingBatchRepository
 
   /// Load all batches from the file.  Returns true on success (or when
   /// the file does not exist — empty batch list is valid).
+  /// Also populates saved_date with the date recorded in the file.
   bool load(std::vector<BillingBatch>& out);
+  bool load(std::vector<BillingBatch>& out, std::string& saved_date);
 
   /// Save all batches to the file (atomic).
+  /// Records today's date (YYYY-MM-DD) for cross-day detection.
   bool save(const std::vector<BillingBatch>& batches) const;
+  bool save(const std::vector<BillingBatch>& batches,
+            const std::string& date_yyyy_mm_dd) const;
 
  private:
   std::filesystem::path path_;

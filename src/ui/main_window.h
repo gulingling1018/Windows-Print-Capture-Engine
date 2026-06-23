@@ -68,6 +68,7 @@ class MainWindow : public QMainWindow
   void detectPrintersIfNeeded();
   QString resolveOutputRoot() const;
   QString resolveStateDir() const;
+  QString resolveHistoryRoot() const;
 
   common::AppConfig config_;
 

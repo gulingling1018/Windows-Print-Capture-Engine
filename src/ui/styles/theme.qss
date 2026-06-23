@@ -433,3 +433,31 @@ QFrame[cardType="receipt"][cardState="settled"] {
   background: #f8fafc;
   opacity: 0.7;
 }
+
+/* ── Quick Settle Dialog ────────────────────────────────────────── */
+
+QWidget#QsdTitleBar {
+  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,
+    stop:0 #1e293b, stop:1 #334155);
+}
+
+QWidget#QsdContent {
+  background: #f8fafc;
+}
+
+QWidget#QsdActionBar {
+  background: #f1f5f9;
+  border-top: 1px solid #e2e8f0;
+}
+
+/* ── Receipt Preview Panel ──────────────────────────────────────── */
+
+QWidget#ReceiptPreviewPanel {
+  background: white;
+  border: 1px solid #e2e8f0;
+  border-radius: 8px;
+}
+
+QScrollArea#ReceiptScroll {
+  background: transparent;
+}

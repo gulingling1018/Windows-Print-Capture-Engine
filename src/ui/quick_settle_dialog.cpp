@@ -3,9 +3,11 @@
 #include "domain/billing_batch.h"
 
 #include <QCloseEvent>
+#include <QGraphicsDropShadowEffect>
 #include <QHBoxLayout>
 #include <QHeaderView>
 #include <QMouseEvent>
+#include <QTimer>
 #include <QVBoxLayout>
 
 namespace wpce::ui
@@ -22,6 +24,7 @@ QuickSettleDialog::QuickSettleDialog(BillingBatchModel* model,
   setMaximumSize(900, 800);
   resize(460, 600);
   setWindowFlags(Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
+  setAttribute(Qt::WA_TranslucentBackground, false);
 
   buildUi();
 }
@@ -34,46 +37,56 @@ void QuickSettleDialog::buildUi()
 
   // ── Custom title bar (draggable) ────────────────────────────────
   titleBar_ = new QWidget(this);
-  titleBar_->setFixedHeight(40);
+  titleBar_->setFixedHeight(44);
   titleBar_->setObjectName(QStringLiteral("QsdTitleBar"));
   titleBar_->setStyleSheet(QStringLiteral(
-    "QWidget#QsdTitleBar { background: #1e293b; border-top-left-radius: 8px;"
-    "  border-top-right-radius: 8px; }"));
+    "QWidget#QsdTitleBar {"
+    "  background: qlineargradient(x1:0, y1:0, x2:1, y2:0,"
+    "    stop:0 #1e293b, stop:1 #334155);"
+    "  border-top-left-radius: 10px;"
+    "  border-top-right-radius: 10px;"
+    "}"));
 
   auto* titleLayout = new QHBoxLayout(titleBar_);
-  titleLayout->setContentsMargins(12, 0, 8, 0);
+  titleLayout->setContentsMargins(14, 0, 10, 0);
   titleLayout->setSpacing(8);
-
-  titleLabel_ = new QLabel(QStringLiteral("—"));
-  titleLabel_->setStyleSheet(QStringLiteral(
-    "color: #f1f5f9; font-size: 14px; font-weight: bold;"));
 
   stateBadgeLabel_ = new QLabel(QStringLiteral("●"));
   stateBadgeLabel_->setStyleSheet(QStringLiteral(
     "color: #3b82f6; font-size: 12px; font-weight: bold;"));
 
+  titleLabel_ = new QLabel(QStringLiteral("—"));
+  titleLabel_->setStyleSheet(QStringLiteral(
+    "color: #f1f5f9; font-size: 14px; font-weight: bold;"));
+
+  positionLabel_ = new QLabel(QStringLiteral("0/0"));
+  positionLabel_->setStyleSheet(QStringLiteral(
+    "color: #94a3b8; font-size: 11px; font-weight: 600;"
+    "background: #475569; border-radius: 8px; padding: 2px 8px;"));
+
   titleLayout->addWidget(stateBadgeLabel_);
   titleLayout->addWidget(titleLabel_, 1);
+  titleLayout->addWidget(positionLabel_);
 
-  pinBtn_ = new QPushButton(QStringLiteral("📌"));
-  pinBtn_->setFixedSize(28, 28);
+  pinBtn_ = new QPushButton(QStringLiteral("PIN"));
+  pinBtn_->setFixedSize(36, 26);
   pinBtn_->setToolTip(QStringLiteral("置顶窗口"));
   pinBtn_->setCheckable(true);
   pinBtn_->setChecked(pinned_);
   pinBtn_->setStyleSheet(QStringLiteral(
-    "QPushButton { border: none; background: transparent; font-size: 14px;"
-    "  border-radius: 4px; }"
-    "QPushButton:checked { background: #334155; color: #3b82f6; }"
-    "QPushButton:!checked { color: #64748b; }"
-    "QPushButton:hover { background: #334155; }"));
+    "QPushButton { border: 1px solid #475569; background: transparent;"
+    "  font-size: 9px; font-weight: bold; color: #64748b;"
+    "  border-radius: 4px; letter-spacing: 1px; }"
+    "QPushButton:checked { background: #475569; color: #38bdf8; border-color: #38bdf8; }"
+    "QPushButton:hover { background: #475569; }"));
   connect(pinBtn_, &QPushButton::toggled, this, &QuickSettleDialog::updatePinnedState);
   titleLayout->addWidget(pinBtn_);
 
-  closeBtn_ = new QPushButton(QStringLiteral("✕"));
+  closeBtn_ = new QPushButton(QStringLiteral("×"));
   closeBtn_->setFixedSize(28, 28);
   closeBtn_->setStyleSheet(QStringLiteral(
     "QPushButton { border: none; background: transparent; color: #94a3b8;"
-    "  font-size: 12px; border-radius: 4px; }"
+    "  font-size: 16px; font-weight: bold; border-radius: 4px; }"
     "QPushButton:hover { background: #dc2626; color: white; }"));
   connect(closeBtn_, &QPushButton::clicked, this, &QDialog::close);
   titleLayout->addWidget(closeBtn_);
@@ -84,9 +97,11 @@ void QuickSettleDialog::buildUi()
   auto* content = new QWidget(this);
   content->setObjectName(QStringLiteral("QsdContent"));
   content->setStyleSheet(QStringLiteral(
-    "QWidget#QsdContent { background: #f8fafc; }"));
+    "QWidget#QsdContent { background: #f8fafc;"
+    "  border-bottom-left-radius: 10px;"
+    "  border-bottom-right-radius: 10px; }"));
   auto* contentLayout = new QVBoxLayout(content);
-  contentLayout->setContentsMargins(12, 10, 12, 10);
+  contentLayout->setContentsMargins(14, 12, 14, 12);
   contentLayout->setSpacing(8);
 
   // ── First document anchor (top, blue) ───────────────────────────
@@ -140,7 +155,7 @@ void QuickSettleDialog::buildUi()
     "QTableWidget { border: 1px solid #e2e8f0; border-radius: 6px; background: white; }"
     "QTableWidget::item { padding: 4px 6px; font-size: 12px; }"
     "QHeaderView::section { background: #f1f5f9; color: #475569; font-weight: bold;"
-    "  padding: 4px 6px; font-size: 11px; border-bottom: 1px solid #cbd5e1; }"));
+    "  padding: 4px 6px; font-size: 11px; border: none; border-bottom: 1px solid #cbd5e1; }"));
   contentLayout->addWidget(jobTable_, 1);
 
   // ── Last document anchor (bottom, green) ────────────────────────
@@ -178,70 +193,73 @@ void QuickSettleDialog::buildUi()
   summaryLabel_->setAlignment(Qt::AlignCenter);
   contentLayout->addWidget(summaryLabel_);
 
-  // ── Bottom actions ──────────────────────────────────────────────
-  auto* actionRow = new QHBoxLayout();
+  // ── Bottom action bar ───────────────────────────────────────────
+  auto* actionBar = new QWidget();
+  actionBar->setObjectName(QStringLiteral("QsdActionBar"));
+  actionBar->setStyleSheet(QStringLiteral(
+    "QWidget#QsdActionBar { background: #f1f5f9;"
+    "  border-top: 1px solid #e2e8f0; border-radius: 0; }"));
+  actionBar->setFixedHeight(56);
+
+  auto* actionRow = new QHBoxLayout(actionBar);
+  actionRow->setContentsMargins(12, 8, 12, 8);
   actionRow->setSpacing(8);
 
   prevBtn_ = new QPushButton(QStringLiteral("◀"));
-  prevBtn_->setFixedSize(36, 36);
-  prevBtn_->setToolTip(QStringLiteral("上一个批次"));
+  prevBtn_->setFixedSize(38, 38);
+  prevBtn_->setToolTip(QStringLiteral("上一个 (←)"));
   prevBtn_->setStyleSheet(QStringLiteral(
-    "QPushButton { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px;"
-    "  font-size: 13px; color: #475569; }"
-    "QPushButton:hover { background: #e2e8f0; }"));
+    "QPushButton { background: white; border: 1px solid #cbd5e1; border-radius: 8px;"
+    "  font-size: 14px; color: #475569; }"
+    "QPushButton:hover { background: #e2e8f0; border-color: #94a3b8; }"
+    "QPushButton:pressed { background: #cbd5e1; }"));
 
-  hangUpBtn_ = new QPushButton(QStringLiteral("挂单"));
-  hangUpBtn_->setFixedSize(52, 36);
-  hangUpBtn_->setToolTip(QStringLiteral("挂起当前批次，切到新用户"));
-  hangUpBtn_->setCheckable(true);
-  hangUpBtn_->setStyleSheet(QStringLiteral(
+  actionBtn_ = new QPushButton(QStringLiteral("挂单"));
+  actionBtn_->setFixedHeight(36);
+  actionBtn_->setMinimumWidth(64);
+  actionBtn_->setToolTip(QStringLiteral("挂单/恢复 (H)"));
+  actionBtn_->setStyleSheet(QStringLiteral(
     "QPushButton { background: #fffbeb; border: 1px solid #f59e0b; border-radius: 6px;"
-    "  font-size: 11px; font-weight: 600; color: #92400e; }"
+    "  font-size: 12px; font-weight: 600; color: #92400e; padding: 0 12px; }"
     "QPushButton:hover { background: #fef3c7; }"
-    "QPushButton:checked { background: #f59e0b; color: white; }"));
-
-  resumeBtn_ = new QPushButton(QStringLiteral("恢复"));
-  resumeBtn_->setFixedSize(52, 36);
-  resumeBtn_->setToolTip(QStringLiteral("恢复挂单的批次"));
-  resumeBtn_->setStyleSheet(QStringLiteral(
-    "QPushButton { background: #f0fdf4; border: 1px solid #16a34a; border-radius: 6px;"
-    "  font-size: 11px; font-weight: 600; color: #166534; }"
-    "QPushButton:hover { background: #dcfce7; }"
-    "QPushButton:disabled { background: #f1f5f9; border-color: #cbd5e1; color: #94a3b8; }"));
-  resumeBtn_->setEnabled(false);
+    "QPushButton:disabled { background: #f9fafb; border-color: #e5e7eb; color: #d1d5db; }"));
 
   nextBtn_ = new QPushButton(QStringLiteral("▶"));
-  nextBtn_->setFixedSize(36, 36);
-  nextBtn_->setToolTip(QStringLiteral("下一个批次"));
+  nextBtn_->setFixedSize(38, 38);
+  nextBtn_->setToolTip(QStringLiteral("下一个 (→)"));
   nextBtn_->setStyleSheet(QStringLiteral(
-    "QPushButton { background: #f1f5f9; border: 1px solid #cbd5e1; border-radius: 6px;"
-    "  font-size: 13px; color: #475569; }"
-    "QPushButton:hover { background: #e2e8f0; }"));
+    "QPushButton { background: white; border: 1px solid #cbd5e1; border-radius: 8px;"
+    "  font-size: 14px; color: #475569; }"
+    "QPushButton:hover { background: #e2e8f0; border-color: #94a3b8; }"
+    "QPushButton:pressed { background: #cbd5e1; }"));
 
   settleBtn_ = new QPushButton(QStringLiteral("结算"));
-  settleBtn_->setMinimumHeight(36);
-  settleBtn_->setMinimumWidth(80);
+  settleBtn_->setFixedHeight(40);
+  settleBtn_->setMinimumWidth(100);
+  settleBtn_->setToolTip(QStringLiteral("结算当前批次 (Enter)"));
   settleBtn_->setStyleSheet(QStringLiteral(
-    "QPushButton { background: #2563eb; border: none; border-radius: 6px;"
-    "  color: white; font-size: 13px; font-weight: 700; padding: 6px 18px; }"
-    "QPushButton:hover { background: #1d4ed8; }"
-    "QPushButton:pressed { background: #1e40af; }"));
+    "QPushButton { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    "    stop:0 #3b82f6, stop:1 #2563eb);"
+    "  border: none; border-radius: 8px;"
+    "  color: white; font-size: 14px; font-weight: 700; padding: 0 20px; }"
+    "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+    "    stop:0 #2563eb, stop:1 #1d4ed8); }"
+    "QPushButton:pressed { background: #1e40af; }"
+    "QPushButton:disabled { background: #93c5fd; color: rgba(255,255,255,0.7); }"));
 
   actionRow->addWidget(prevBtn_);
-  actionRow->addWidget(hangUpBtn_);
-  actionRow->addWidget(resumeBtn_);
+  actionRow->addWidget(actionBtn_);
   actionRow->addWidget(nextBtn_);
   actionRow->addStretch(1);
   actionRow->addWidget(settleBtn_);
-  contentLayout->addLayout(actionRow);
+  contentLayout->addWidget(actionBar);
 
   root->addWidget(content, 1);
 
   connect(prevBtn_, &QPushButton::clicked, this, &QuickSettleDialog::switchToPrev);
   connect(nextBtn_, &QPushButton::clicked, this, &QuickSettleDialog::switchToNext);
   connect(settleBtn_, &QPushButton::clicked, this, &QuickSettleDialog::onSettleClicked);
-  connect(hangUpBtn_, &QPushButton::clicked, this, &QuickSettleDialog::onHangUpClicked);
-  connect(resumeBtn_, &QPushButton::clicked, this, &QuickSettleDialog::onResumeClicked);
+  connect(actionBtn_, &QPushButton::clicked, this, &QuickSettleDialog::onActionClicked);
 }
 
 void QuickSettleDialog::setCurrentBatchIndex(int index)
@@ -250,6 +268,21 @@ void QuickSettleDialog::setCurrentBatchIndex(int index)
   if (index < 0 || index >= model_->batchCount()) return;
   currentIndex_ = index;
   rebuildUi();
+
+  QModelIndex idx = model_->index(currentIndex_, 0);
+  QString batchId = model_->batchIdAt(idx);
+  if (!batchId.isEmpty())
+    emit batchFocusChanged(batchId);
+}
+
+void QuickSettleDialog::refresh()
+{
+  if (!isVisible()) return;
+  if (model_ == nullptr || currentIndex_ < 0) return;
+  if (currentIndex_ >= model_->batchCount())
+    currentIndex_ = model_->batchCount() - 1;
+  if (currentIndex_ >= 0)
+    rebuildUi();
 }
 
 void QuickSettleDialog::rebuildUi()
@@ -262,22 +295,46 @@ void QuickSettleDialog::rebuildUi()
 
   titleLabel_->setText(QString::fromStdString(batch->display_name));
 
-  // State badge color.
-  QString badgeColor, badgeText;
+  // State badge color + content background tint for visual distinction.
+  QString badgeColor, badgeText, contentBg;
   switch (batch->state)
   {
     case domain::BatchState::Active:
-      badgeColor = QStringLiteral("#3b82f6"); badgeText = QStringLiteral("●"); break;
+      badgeColor = QStringLiteral("#3b82f6");
+      badgeText = QStringLiteral("●");
+      contentBg = QStringLiteral("#f8fafc");
+      break;
     case domain::BatchState::Suspended:
-      badgeColor = QStringLiteral("#f59e0b"); badgeText = QStringLiteral("⏸"); break;
+      badgeColor = QStringLiteral("#f59e0b");
+      badgeText = QStringLiteral("⏸");
+      contentBg = QStringLiteral("#fffdf7");
+      break;
     case domain::BatchState::Settled:
-      badgeColor = QStringLiteral("#16a34a"); badgeText = QStringLiteral("✓"); break;
+      badgeColor = QStringLiteral("#16a34a");
+      badgeText = QStringLiteral("✓");
+      contentBg = QStringLiteral("#f0fdf4");
+      break;
     default:
-      badgeColor = QStringLiteral("#64748b"); badgeText = QStringLiteral("·"); break;
+      badgeColor = QStringLiteral("#64748b");
+      badgeText = QStringLiteral("·");
+      contentBg = QStringLiteral("#f8fafc");
+      break;
   }
   stateBadgeLabel_->setText(badgeText);
   stateBadgeLabel_->setStyleSheet(
     QStringLiteral("color: %1; font-size: 14px; font-weight: bold;").arg(badgeColor));
+
+  // Tint the content area to reflect state.
+  auto* contentWidget = findChild<QWidget*>(QStringLiteral("QsdContent"));
+  if (contentWidget != nullptr)
+  {
+    contentWidget->setStyleSheet(QStringLiteral(
+      "QWidget#QsdContent { background: %1;"
+      "  border-bottom-left-radius: 10px;"
+      "  border-bottom-right-radius: 10px; }").arg(contentBg));
+  }
+
+  updatePositionIndicator();
 
   // First/last doc anchors.
   auto formatTime = [](const std::string& iso) -> QString {
@@ -317,7 +374,6 @@ void QuickSettleDialog::rebuildUi()
     int copies = parse_copies(job->metadata);
     int pages = parse_total_pages(job->metadata);
 
-    // Duplex label: 长边/短边/单面
     QString duplexLabel;
     if (job->metadata.duplex.state == core::FieldState::Reported)
     {
@@ -339,18 +395,15 @@ void QuickSettleDialog::rebuildUi()
     jobTable_->setItem(r, 3, new QTableWidgetItem(duplexLabel));
     jobTable_->setItem(r, 4, new QTableWidgetItem(QString::number(pages)));
 
-    // Paper size
     QString paperStr = QStringLiteral("-");
     if (job->metadata.paper_size.state == core::FieldState::Reported)
       paperStr = QString::fromStdString(job->metadata.paper_size.value);
     jobTable_->setItem(r, 5, new QTableWidgetItem(paperStr));
 
-    // Printer name (short)
     QString printerStr = QString::fromStdString(job->snapshot.printer_name);
     if (printerStr.length() > 12) printerStr = printerStr.left(10) + QStringLiteral("..");
     jobTable_->setItem(r, 6, new QTableWidgetItem(printerStr));
 
-    // Price
     double price = job->pricing.total_price;
     if (job->pricing.price_pending) price = 0.0;
     auto* priceItem = new QTableWidgetItem(QStringLiteral("%1")
@@ -389,31 +442,92 @@ void QuickSettleDialog::rebuildUi()
       .arg(pendingText)
       .arg(QString::number(totalPrice, 'f', 2)));
 
-  // Button states.
-  updateHangUpState();
-  settleBtn_->setEnabled(!batch->is_settled());
+  // Update action buttons based on state.
+  updateActionButtons();
+  updateColumnVisibility();
+}
 
-  // Resume button: enabled only when there are suspended batches.
-  bool hasSuspended = false;
+void QuickSettleDialog::updateActionButtons()
+{
+  if (model_ == nullptr || currentIndex_ < 0) return;
+  const auto* batch = model_->batchAt(model_->index(currentIndex_, 0));
+  if (batch == nullptr) return;
+
+  bool settled = batch->is_settled();
+  bool suspended = batch->is_suspended();
+  bool active = batch->is_active();
+
+  // Suspended batches cannot be settled directly — must resume first.
+  settleBtn_->setEnabled(active);
+  if (suspended)
+    settleBtn_->setToolTip(QStringLiteral("需先恢复才能结算"));
+  else
+    settleBtn_->setToolTip(QStringLiteral("结算当前批次 (Enter)"));
+
+  if (settled)
+  {
+    actionBtn_->setText(QStringLiteral("已结"));
+    actionBtn_->setEnabled(false);
+    actionBtn_->setStyleSheet(QStringLiteral(
+      "QPushButton { background: #f9fafb; border: 1px solid #e5e7eb; border-radius: 6px;"
+      "  font-size: 12px; font-weight: 600; color: #d1d5db; padding: 0 12px; }"));
+    settleBtn_->setEnabled(false);
+  }
+  else if (suspended)
+  {
+    actionBtn_->setText(QStringLiteral("恢复"));
+    actionBtn_->setEnabled(true);
+    actionBtn_->setStyleSheet(QStringLiteral(
+      "QPushButton { background: #f0fdf4; border: 1px solid #16a34a; border-radius: 6px;"
+      "  font-size: 12px; font-weight: 600; color: #166534; padding: 0 12px; }"
+      "QPushButton:hover { background: #dcfce7; }"));
+  }
+  else if (active)
+  {
+    actionBtn_->setText(QStringLiteral("挂单"));
+    actionBtn_->setEnabled(true);
+    actionBtn_->setStyleSheet(QStringLiteral(
+      "QPushButton { background: #fffbeb; border: 1px solid #f59e0b; border-radius: 6px;"
+      "  font-size: 12px; font-weight: 600; color: #92400e; padding: 0 12px; }"
+      "QPushButton:hover { background: #fef3c7; }"));
+  }
+}
+
+void QuickSettleDialog::updatePositionIndicator()
+{
+  if (model_ == nullptr) { positionLabel_->setText(QStringLiteral("0/0")); return; }
+
+  int unsettledCount = 0;
+  int currentPos = 0;
   for (int i = 0; i < model_->batchCount(); ++i)
   {
     const auto* b = model_->batchAt(model_->index(i, 0));
-    if (b != nullptr && b->is_suspended()) { hasSuspended = true; break; }
+    if (b == nullptr || b->is_settled()) continue;
+    ++unsettledCount;
+    if (i == currentIndex_) currentPos = unsettledCount;
   }
-  resumeBtn_->setEnabled(hasSuspended);
 
-  updateColumnVisibility();
+  if (currentPos == 0)
+  {
+    // Current is a settled batch — show absolute position.
+    positionLabel_->setText(QStringLiteral("%1/%2")
+      .arg(currentIndex_ + 1).arg(model_->batchCount()));
+    positionLabel_->setStyleSheet(QStringLiteral(
+      "color: #6b7280; font-size: 11px; font-weight: 600;"
+      "background: #374151; border-radius: 8px; padding: 2px 8px;"));
+  }
+  else
+  {
+    positionLabel_->setText(QStringLiteral("%1/%2").arg(currentPos).arg(unsettledCount));
+    positionLabel_->setStyleSheet(QStringLiteral(
+      "color: #e0f2fe; font-size: 11px; font-weight: 600;"
+      "background: #475569; border-radius: 8px; padding: 2px 8px;"));
+  }
 }
 
 void QuickSettleDialog::updateColumnVisibility()
 {
   int w = width();
-  // Priority: price|pages > duplex > copies > printer > paper
-  // 460-580: # / doc / pages / duplex / price
-  // 581-680: + copies
-  // 681-800: + printer
-  // 801-900: + paper
-
   jobTable_->setColumnHidden(2, w < 581);  // copies
   jobTable_->setColumnHidden(5, w < 801);  // paper
   jobTable_->setColumnHidden(6, w < 681);  // printer
@@ -437,37 +551,78 @@ void QuickSettleDialog::onSettleClicked()
 {
   if (model_ == nullptr || currentIndex_ < 0) return;
   QModelIndex idx = model_->index(currentIndex_, 0);
+  const auto* batch = model_->batchAt(idx);
+  if (batch == nullptr) return;
+
+  if (batch->is_suspended())
+  {
+    // Flash the action button to hint: resume first.
+    actionBtn_->setStyleSheet(QStringLiteral(
+      "QPushButton { background: #fef3c7; border: 2px solid #f59e0b; border-radius: 6px;"
+      "  font-size: 12px; font-weight: 600; color: #92400e; padding: 0 12px; }"));
+    QTimer::singleShot(800, this, [this]() { updateActionButtons(); });
+    return;
+  }
+
+  if (batch->is_settled()) return;
+
   QString batchId = model_->batchIdAt(idx);
   if (!batchId.isEmpty())
     emit settleRequested(batchId);
+
+  // Flash settle button green to confirm.
+  settleBtn_->setStyleSheet(QStringLiteral(
+    "QPushButton { background: #16a34a; border: none; border-radius: 8px;"
+    "  color: white; font-size: 14px; font-weight: 700; padding: 0 20px; }"));
+  settleBtn_->setText(QStringLiteral("✓ 完成"));
+
+  QTimer::singleShot(600, this, [this]() {
+    settleBtn_->setText(QStringLiteral("结算"));
+    settleBtn_->setStyleSheet(QStringLiteral(
+      "QPushButton { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+      "    stop:0 #3b82f6, stop:1 #2563eb);"
+      "  border: none; border-radius: 8px;"
+      "  color: white; font-size: 14px; font-weight: 700; padding: 0 20px; }"
+      "QPushButton:hover { background: qlineargradient(x1:0, y1:0, x2:0, y2:1,"
+      "    stop:0 #2563eb, stop:1 #1d4ed8); }"
+      "QPushButton:pressed { background: #1e40af; }"
+      "QPushButton:disabled { background: #93c5fd; color: rgba(255,255,255,0.7); }"));
+    switchToNext();
+  });
 }
 
-void QuickSettleDialog::onHangUpClicked()
+void QuickSettleDialog::onActionClicked()
 {
   if (model_ == nullptr || currentIndex_ < 0) return;
   QModelIndex idx = model_->index(currentIndex_, 0);
-  QString batchId = model_->batchIdAt(idx);
-  if (!batchId.isEmpty())
-    emit hangUpRequested(batchId);
-  // Switch to next relevant batch.
-  switchToNext();
-}
+  const auto* batch = model_->batchAt(idx);
+  if (batch == nullptr) return;
 
-void QuickSettleDialog::onResumeClicked()
-{
-  // Find the most recent suspended batch and resume it.
-  if (model_ == nullptr) return;
-  for (int i = 0; i < model_->batchCount(); ++i)
+  QString batchId = model_->batchIdAt(idx);
+  if (batchId.isEmpty()) return;
+
+  if (batch->is_active())
   {
-    QModelIndex idx = model_->index(i, 0);
-    const auto* batch = model_->batchAt(idx);
-    if (batch != nullptr && batch->is_suspended())
-    {
-      QString batchId = model_->batchIdAt(idx);
-      emit resumeRequested(batchId);
-      setCurrentBatchIndex(i);
-      return;
-    }
+    emit hangUpRequested(batchId);
+    // Flash amber confirmation.
+    actionBtn_->setText(QStringLiteral("✓ 已挂"));
+    actionBtn_->setStyleSheet(QStringLiteral(
+      "QPushButton { background: #f59e0b; border: none; border-radius: 6px;"
+      "  font-size: 12px; font-weight: 600; color: white; padding: 0 12px; }"));
+    QTimer::singleShot(500, this, [this]() {
+      updateActionButtons();
+      switchToNext();
+    });
+  }
+  else if (batch->is_suspended())
+  {
+    emit resumeRequested(batchId);
+    // Flash green confirmation.
+    actionBtn_->setText(QStringLiteral("✓ 已恢复"));
+    actionBtn_->setStyleSheet(QStringLiteral(
+      "QPushButton { background: #16a34a; border: none; border-radius: 6px;"
+      "  font-size: 12px; font-weight: 600; color: white; padding: 0 12px; }"));
+    QTimer::singleShot(500, this, [this]() { updateActionButtons(); });
   }
 }
 
@@ -483,15 +638,36 @@ void QuickSettleDialog::updatePinnedState()
   show();
 }
 
-void QuickSettleDialog::updateHangUpState()
+void QuickSettleDialog::keyPressEvent(QKeyEvent* event)
 {
-  if (model_ == nullptr || currentIndex_ < 0) return;
-  const auto* batch = model_->batchAt(model_->index(currentIndex_, 0));
-  if (batch == nullptr) return;
-  bool isSuspended = batch->is_suspended();
-  hangUpBtn_->setChecked(isSuspended);
-  hangUpBtn_->setText(isSuspended ? QStringLiteral("已挂") : QStringLiteral("挂单"));
-  hangUpBtn_->setEnabled(!batch->is_settled());
+  switch (event->key())
+  {
+    case Qt::Key_Left:
+      switchToPrev();
+      event->accept();
+      return;
+    case Qt::Key_Right:
+      switchToNext();
+      event->accept();
+      return;
+    case Qt::Key_Return:
+    case Qt::Key_Enter:
+      onSettleClicked();
+      event->accept();
+      return;
+    case Qt::Key_H:
+      if (actionBtn_->isEnabled())
+        onActionClicked();
+      event->accept();
+      return;
+    case Qt::Key_Escape:
+      close();
+      event->accept();
+      return;
+    default:
+      break;
+  }
+  QDialog::keyPressEvent(event);
 }
 
 void QuickSettleDialog::closeEvent(QCloseEvent* event)
@@ -509,7 +685,6 @@ void QuickSettleDialog::mousePressEvent(QMouseEvent* event)
 {
   if (event->button() == Qt::LeftButton && titleBar_ != nullptr)
   {
-    // Check if click is in title bar area.
     if (event->pos().y() < titleBar_->height())
     {
       dragging_ = true;
@@ -524,6 +699,15 @@ void QuickSettleDialog::mouseMoveEvent(QMouseEvent* event)
   if (dragging_ && (event->buttons() & Qt::LeftButton))
   {
     move(event->globalPosition().toPoint() - dragStartPos_);
+    event->accept();
+  }
+}
+
+void QuickSettleDialog::mouseReleaseEvent(QMouseEvent* event)
+{
+  if (event->button() == Qt::LeftButton)
+  {
+    dragging_ = false;
     event->accept();
   }
 }

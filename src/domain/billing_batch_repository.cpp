@@ -160,7 +160,14 @@ void BillingBatchRepository::setFilePath(const std::filesystem::path& path)
 
 bool BillingBatchRepository::load(std::vector<BillingBatch>& out)
 {
+  std::string ignored_date;
+  return load(out, ignored_date);
+}
+
+bool BillingBatchRepository::load(std::vector<BillingBatch>& out, std::string& saved_date)
+{
   out.clear();
+  saved_date.clear();
   if (path_.empty()) return false;
   try
   {
@@ -171,7 +178,11 @@ bool BillingBatchRepository::load(std::vector<BillingBatch>& out)
     while (r.endObjectOrNext())
     {
       const std::string key = r.readKey();
-      if (key == "batches")
+      if (key == "date")
+      {
+        saved_date = r.readString();
+      }
+      else if (key == "batches")
       {
         r.beginArray();
         while (r.endArrayOrNext())
@@ -219,6 +230,12 @@ bool BillingBatchRepository::load(std::vector<BillingBatch>& out)
 
 bool BillingBatchRepository::save(const std::vector<BillingBatch>& batches) const
 {
+  return save(batches, std::string{});
+}
+
+bool BillingBatchRepository::save(const std::vector<BillingBatch>& batches,
+                                   const std::string& date_yyyy_mm_dd) const
+{
   if (path_.empty()) return false;
   try
   {
@@ -229,7 +246,11 @@ bool BillingBatchRepository::save(const std::vector<BillingBatch>& batches) cons
       if (!out) return false;
       JsonWriter w(out);
       w.beginObject();
-      w.key("schema_version"); w.writeInt(1);
+      w.key("schema_version"); w.writeInt(2);
+      if (!date_yyyy_mm_dd.empty())
+      {
+        w.key("date"); w.writeString(date_yyyy_mm_dd);
+      }
       w.key("batches");
       w.beginArray();
       for (const auto& batch : batches)

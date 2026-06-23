@@ -547,30 +547,15 @@ int BillingBatchModel::nextRelevantRow(int fromRow) const
   int n = static_cast<int>(orderedBatchIds_.size());
   if (n == 0) return -1;
 
-  // Search for the next Suspended batch first (operator priority), then
-  // the next Active batch.  Start from fromRow+1 and wrap.
-  auto isRelevant = [&](int i) -> int {
-    const auto* b = service_->batchById(orderedBatchIds_[static_cast<std::size_t>(i)]);
-    if (b == nullptr) return 0;
-    if (b->is_suspended()) return 2;
-    if (b->is_active()) return 1;
-    return 0;
-  };
-
-  int bestRow = -1;
-  int bestScore = 0;
+  // Sequential forward cycle through Active + Suspended batches.
   for (int offset = 1; offset <= n; ++offset)
   {
     int i = (fromRow + offset) % n;
-    int score = isRelevant(i);
-    if (score > bestScore)
-    {
-      bestScore = score;
-      bestRow = i;
-      if (score == 2) break;  // suspended wins immediately
-    }
+    const auto* b = service_->batchById(orderedBatchIds_[static_cast<std::size_t>(i)]);
+    if (b != nullptr && !b->is_settled())
+      return i;
   }
-  return bestRow;
+  return -1;
 }
 
 int BillingBatchModel::prevRelevantRow(int fromRow) const
@@ -578,28 +563,15 @@ int BillingBatchModel::prevRelevantRow(int fromRow) const
   int n = static_cast<int>(orderedBatchIds_.size());
   if (n == 0) return -1;
 
-  auto isRelevant = [&](int i) -> int {
-    const auto* b = service_->batchById(orderedBatchIds_[static_cast<std::size_t>(i)]);
-    if (b == nullptr) return 0;
-    if (b->is_suspended()) return 2;
-    if (b->is_active()) return 1;
-    return 0;
-  };
-
-  int bestRow = -1;
-  int bestScore = 0;
+  // Sequential backward cycle through Active + Suspended batches.
   for (int offset = 1; offset <= n; ++offset)
   {
     int i = ((fromRow - offset) % n + n) % n;
-    int score = isRelevant(i);
-    if (score > bestScore)
-    {
-      bestScore = score;
-      bestRow = i;
-      if (score == 2) break;
-    }
+    const auto* b = service_->batchById(orderedBatchIds_[static_cast<std::size_t>(i)]);
+    if (b != nullptr && !b->is_settled())
+      return i;
   }
-  return bestRow;
+  return -1;
 }
 
 }  // namespace wpce::ui

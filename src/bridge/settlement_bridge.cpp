@@ -4,10 +4,12 @@
 #include "bridge/settlement_bridge.h"
 #include "common/pricing_engine.h"
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <ctime>
 #include <fstream>
+#include <functional>
 #include <iomanip>
 #include <sstream>
 #include <stdexcept>
@@ -382,6 +384,135 @@ std::optional<core::SettlementOrder> SettlementBridge::loadFromFile(
     return fromJson(oss.str());
   }
   catch (...) { return std::nullopt; }
+}
+
+// ── Date-based storage helpers ──────────────────────────────────────────
+
+namespace
+{
+
+std::string sanitise_filename_part(const std::string& s, std::size_t max_len = 20)
+{
+  std::string out;
+  out.reserve(std::min(s.size(), max_len));
+  for (std::size_t i = 0; i < s.size() && out.size() < max_len; ++i)
+  {
+    char c = s[i];
+    if (c == '/' || c == '\\' || c == ':' || c == '*' ||
+        c == '?' || c == '"' || c == '<' || c == '>' || c == '|')
+      c = '_';
+    out += c;
+  }
+  return out;
+}
+
+}  // namespace
+
+std::string SettlementBridge::makeOrderFilename(
+    const std::string& order_id,
+    const std::string& first_doc,
+    const std::string& last_doc)
+{
+  std::string name = order_id;
+  std::string first = sanitise_filename_part(first_doc);
+  std::string last = sanitise_filename_part(last_doc);
+
+  if (!first.empty())
+  {
+    name += "_";
+    name += first;
+    if (!last.empty() && last != first)
+    {
+      name += "~";
+      name += last;
+    }
+  }
+  name += ".json";
+  return name;
+}
+
+bool SettlementBridge::saveToDateDir(
+    const core::SettlementOrder& order,
+    const std::filesystem::path& history_root,
+    const std::string& date_yyyy_mm_dd,
+    const std::string& first_doc,
+    const std::string& last_doc)
+{
+  try
+  {
+    const auto date_dir = history_root / date_yyyy_mm_dd;
+    std::filesystem::create_directories(date_dir);
+
+    const std::string filename = makeOrderFilename(order.order_id, first_doc, last_doc);
+    const auto file_path = date_dir / filename;
+    const auto temp_path = std::filesystem::path(file_path.string() + ".tmp");
+
+    {
+      std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
+      if (!out) return false;
+      out << toJson(order);
+      if (!out) return false;
+    }
+
+    std::error_code ec;
+    std::filesystem::rename(temp_path, file_path, ec);
+    if (ec)
+    {
+      std::filesystem::copy_file(temp_path, file_path,
+                                 std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) return false;
+      std::filesystem::remove(temp_path, ec);
+    }
+    return true;
+  }
+  catch (...) { return false; }
+}
+
+std::vector<std::string> SettlementBridge::listDateDirs(
+    const std::filesystem::path& history_root)
+{
+  std::vector<std::string> dates;
+  try
+  {
+    if (!std::filesystem::exists(history_root)) return dates;
+    for (const auto& entry : std::filesystem::directory_iterator(history_root))
+    {
+      if (!entry.is_directory()) continue;
+      std::string name = entry.path().filename().string();
+      if (name.size() == 10 && name[4] == '-' && name[7] == '-')
+        dates.push_back(name);
+    }
+    std::sort(dates.begin(), dates.end(), std::greater<std::string>());
+  }
+  catch (...) {}
+  return dates;
+}
+
+std::vector<core::SettlementOrder> SettlementBridge::loadOrdersForDate(
+    const std::filesystem::path& history_root,
+    const std::string& date_yyyy_mm_dd)
+{
+  std::vector<core::SettlementOrder> orders;
+  try
+  {
+    const auto date_dir = history_root / date_yyyy_mm_dd;
+    if (!std::filesystem::exists(date_dir)) return orders;
+
+    for (const auto& entry : std::filesystem::directory_iterator(date_dir))
+    {
+      if (!entry.is_regular_file()) continue;
+      if (entry.path().extension() != ".json") continue;
+      auto order = loadFromFile(entry.path());
+      if (order.has_value())
+        orders.push_back(std::move(*order));
+    }
+    std::sort(orders.begin(), orders.end(),
+              [](const core::SettlementOrder& a, const core::SettlementOrder& b) {
+                return a.settled_at_utc < b.settled_at_utc;
+              });
+  }
+  catch (...) {}
+  return orders;
 }
 
 }  // namespace wpce::bridge

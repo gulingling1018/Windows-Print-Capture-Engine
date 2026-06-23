@@ -57,6 +57,10 @@ class BillingService : public QObject
   ///   stateDir = <output_root>/_state
   void setStateDirectory(const QString& stateDir);
 
+  /// Set the history root directory (for date-based settlement storage).
+  ///   historyRoot = <output_root>/history
+  void setHistoryRoot(const QString& historyRoot);
+
   /// Configure pricing & printer profiles (live references; the caller
   /// must keep them alive for the lifetime of the service).
   void setPricingConfig(const wpce::common::PricingConfig* pricing);
@@ -160,6 +164,9 @@ class BillingService : public QObject
   std::string settleBatchInternal(domain::BillingBatch& batch,
                                    const std::string& orderId);
 
+  /// Get today's date as YYYY-MM-DD (local time).
+  static std::string todayDateString();
+
   std::vector<domain::BillingBatch> batches_;
   std::unordered_map<std::uint32_t, domain::PrintJobRecord> jobRegistry_;
   std::string currentActiveBatchId_;
@@ -175,6 +182,7 @@ class BillingService : public QObject
   wpce::common::CounterStore counterStore_;
   domain::BillingBatchRepository repository_;
   QString stateDir_;
+  QString historyRoot_;
 
   QTimer saveTimer_;
   bool dirty_{false};

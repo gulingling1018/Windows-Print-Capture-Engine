@@ -65,8 +65,14 @@ void BillingService::setStateDirectory(const QString& stateDir)
   const QString counterPath = stateDir_ + QDir::separator() + QStringLiteral("counters.json");
   counterStore_.setStatePath(counterPath.toStdWString());
 
-  const QString batchesPath = stateDir_ + QDir::separator() + QStringLiteral("batches.json");
+  const QString batchesPath = stateDir_ + QDir::separator() + QStringLiteral("today_active.json");
   repository_.setFilePath(batchesPath.toStdWString());
+}
+
+void BillingService::setHistoryRoot(const QString& historyRoot)
+{
+  historyRoot_ = historyRoot;
+  QDir().mkpath(historyRoot_);
 }
 
 void BillingService::setPricingConfig(const wpce::common::PricingConfig* pricing)
@@ -82,17 +88,28 @@ void BillingService::setPrinterProfiles(const wpce::common::PrinterProfileConfig
 void BillingService::load()
 {
   std::vector<domain::BillingBatch> loaded;
-  if (repository_.load(loaded))
+  std::string savedDate;
+  if (repository_.load(loaded, savedDate))
   {
+    const std::string today = todayDateString();
+
+    // Cross-day detection: if the saved date is from a different day,
+    // archive settled batches and discard them from active state.
+    if (!savedDate.empty() && savedDate != today && !loaded.empty())
+    {
+      // Remove already-settled batches from the loaded set (they belong
+      // to yesterday's history and should already be persisted there).
+      loaded.erase(
+        std::remove_if(loaded.begin(), loaded.end(),
+                       [](const domain::BillingBatch& b) { return b.is_settled(); }),
+        loaded.end());
+    }
+
     batches_ = std::move(loaded);
-    // Rebuild index + job registry reference (job records themselves
-    // are not persisted; they'll be repopulated as new snapshots arrive
-    // — but for already-settled batches we keep the cached totals from
-    // the JSON).
     batchIndex_.clear();
     for (std::size_t i = 0; i < batches_.size(); ++i)
       batchIndex_[batches_[i].batch_id] = i;
-    // Pick the most recent active batch as currentActive.
+
     currentActiveBatchId_.clear();
     std::string mostRecentActive;
     std::string mostRecentActiveTime;
@@ -114,7 +131,7 @@ void BillingService::flushSave()
 {
   if (!dirty_) return;
   dirty_ = false;
-  (void)repository_.save(batches_);
+  (void)repository_.save(batches_, todayDateString());
 }
 
 void BillingService::clear()
@@ -510,8 +527,8 @@ std::string BillingService::settleBatchInternal(domain::BillingBatch& batch,
 
   core::SettlementOrder order = bridge::SettlementBridge::createSettlementOrder(
     orderId,
-    batch.batch_id,        // task_id field repurposed as batch_id (v2)
-    batch.display_name,    // user_id field repurposed as display_name
+    batch.batch_id,
+    batch.display_name,
     jobIds,
     pricingEntries,
     pc,
@@ -519,16 +536,24 @@ std::string BillingService::settleBatchInternal(domain::BillingBatch& batch,
     utcNowIso8601(),
     "operator");
 
-  // Persist to the _state/settlement_orders/ directory.
+  order.batch_id = batch.batch_id;
+
+  // Persist to legacy _state/settlement_orders/ directory.
   if (!stateDir_.isEmpty())
   {
     std::filesystem::path stateDir(stateDir_.toStdWString());
     bridge::SettlementBridge::saveToFile(order, stateDir);
   }
 
-  // Update the order's batch_id field via the v2 schema (the create
-  // call above used the legacy signature; we patch it here).
-  order.batch_id = batch.batch_id;
+  // Persist to date-based history directory.
+  if (!historyRoot_.isEmpty())
+  {
+    std::filesystem::path historyRoot(historyRoot_.toStdWString());
+    bridge::SettlementBridge::saveToDateDir(
+      order, historyRoot, todayDateString(),
+      batch.first_doc_anchor.document_name,
+      batch.last_doc_anchor.document_name);
+  }
 
   return order.order_id;
 }
@@ -721,6 +746,22 @@ bool BillingService::deleteJob(std::uint32_t jobId)
   jobRegistry_.erase(it);
   scheduleSave();
   return true;
+}
+
+std::string BillingService::todayDateString()
+{
+  const auto now = std::chrono::system_clock::now();
+  const auto t = std::chrono::system_clock::to_time_t(now);
+  std::tm tm{};
+#ifdef _WIN32
+  localtime_s(&tm, &t);
+#else
+  localtime_r(&t, &tm);
+#endif
+  char buf[16];
+  std::snprintf(buf, sizeof(buf), "%04d-%02d-%02d",
+                tm.tm_year + 1900, tm.tm_mon + 1, tm.tm_mday);
+  return buf;
 }
 
 }  // namespace wpce::ui

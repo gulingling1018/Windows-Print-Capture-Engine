@@ -537,7 +537,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   makeIconButton(historyBtn, QStringLiteral("结算历史"));
   connect(historyBtn, &QPushButton::clicked, this, [this]() {
     if (historyDialog_ == nullptr)
-      historyDialog_ = new HistoryExplorerDialog(resolveStateDir(), this);
+      historyDialog_ = new HistoryExplorerDialog(resolveHistoryRoot(), this);
     historyDialog_->loadOrders();
     historyDialog_->show();
     historyDialog_->raise();
@@ -810,13 +810,24 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   connect(quickSettleBtn_, &QPushButton::clicked, this, [this]() {
     if (quickSettleDialog_ == nullptr)
     {
-      quickSettleDialog_ = new QuickSettleDialog(batchModel_, billingService_, &config_.pricing, this);
+      quickSettleDialog_ = new QuickSettleDialog(batchModel_, billingService_, &config_.pricing, nullptr);
       connect(quickSettleDialog_, &QuickSettleDialog::settleRequested,
               this, [this](const QString& batchId) { billingService_->settle(batchId); });
       connect(quickSettleDialog_, &QuickSettleDialog::hangUpRequested,
               this, [this](const QString& batchId) { billingService_->suspend(batchId); });
       connect(quickSettleDialog_, &QuickSettleDialog::resumeRequested,
               this, [this](const QString& batchId) { billingService_->resume(batchId); });
+      connect(quickSettleDialog_, &QuickSettleDialog::batchFocusChanged,
+              this, [this](const QString& batchId) {
+        QModelIndex idx = batchModel_->batchIndex(batchId);
+        if (idx.isValid())
+        {
+          treeView_->selectionModel()->setCurrentIndex(idx,
+            QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+          treeView_->expand(idx);
+          treeView_->scrollTo(idx, QAbstractItemView::PositionAtCenter);
+        }
+      });
     }
     int targetIndex = -1;
     QModelIndex current = treeView_->currentIndex();
@@ -881,14 +892,27 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   // ── BillingService → UI refresh ───────────────────────────────────
   connect(billingService_, &BillingService::batchesChanged, this, [this]() {
     refreshSummaryCards(); refreshEmptyState(); refreshGroupRowSpans(); refreshReceiptPanel();
+    if (quickSettleDialog_ != nullptr) quickSettleDialog_->refresh();
   });
   connect(billingService_, &BillingService::batchUpdated, this, [this](const QString&) {
     refreshSummaryCards(); refreshReceiptPanel(); refreshSelectedDetail();
+    if (quickSettleDialog_ != nullptr) quickSettleDialog_->refresh();
   });
   connect(billingService_, &BillingService::orderSettled, this, &MainWindow::onBatchSettled);
 
   connect(receiptPanel_, &ReceiptPreviewPanel::settleRequested,
           this, [this](const QString& batchId) { billingService_->settle(batchId); });
+  connect(receiptPanel_, &ReceiptPreviewPanel::cardClicked,
+          this, [this](const QString& batchId) {
+    QModelIndex idx = batchModel_->batchIndex(batchId);
+    if (idx.isValid())
+    {
+      treeView_->selectionModel()->setCurrentIndex(idx,
+        QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+      treeView_->expand(idx);
+      treeView_->scrollTo(idx, QAbstractItemView::PositionAtCenter);
+    }
+  });
 
   // ── Heartbeat timer ───────────────────────────────────────────────
   heartbeatCheckTimer_ = new QTimer(this);
@@ -913,6 +937,13 @@ MainWindow::~MainWindow()
   config_.save_to_json(common::AppConfig::default_config_path());
   billingService_->flushSave();
   bridge_->stopWatching();
+
+  if (quickSettleDialog_ != nullptr)
+  {
+    quickSettleDialog_->close();
+    delete quickSettleDialog_;
+    quickSettleDialog_ = nullptr;
+  }
 }
 
 void MainWindow::resizeEvent(QResizeEvent* event)
@@ -985,7 +1016,6 @@ void MainWindow::onStartClicked()
 {
   if (bridge_->isRunning()) return;
   billingService_->flushSave();
-  billingService_->clear();
   detailPanel_->clear();
   refreshReceiptPanel();
 
@@ -994,6 +1024,11 @@ void MainWindow::onStartClicked()
   const QString stateDir = resolveStateDir();
   QDir().mkpath(stateDir);
   billingService_->setStateDirectory(stateDir);
+
+  const QString historyRoot = resolveHistoryRoot();
+  QDir().mkpath(historyRoot);
+  billingService_->setHistoryRoot(historyRoot);
+
   billingService_->load();
 
   const QString nativeOutputDir = QDir::toNativeSeparators(lastOutputDir_);
@@ -1254,25 +1289,28 @@ void MainWindow::refreshReceiptPanel()
   for (const auto& batch : batches)
   {
     if (batch.is_settled()) continue;
+    QString batchId = QString::fromStdString(batch.batch_id);
+    QString displayName = QString::fromStdString(batch.display_name);
     QString firstDoc = QString::fromStdString(batch.first_doc_anchor.document_name);
     QString lastDoc = QString::fromStdString(batch.last_doc_anchor.document_name);
     int totalPages = batch.simplex_pages + batch.duplex_pages;
-    QColor userColor = userBackgroundColor(QString::fromStdString(batch.batch_id));
+    QColor userColor = userBackgroundColor(batchId);
     bool hasPending = batch.pending_count > 0;
-    receiptPanel_->addCard(QString::fromStdString(batch.batch_id),
-      QString::fromStdString(batch.display_name), firstDoc, lastDoc,
-      totalPages, batch.total_price, userColor, false, hasPending);
+    bool suspended = batch.is_suspended();
+    receiptPanel_->addCard(batchId, displayName, firstDoc, lastDoc,
+      totalPages, batch.total_price, userColor, false, hasPending, suspended);
   }
   for (auto it = batches.rbegin(); it != batches.rend(); ++it)
   {
     if (!it->is_settled()) continue;
+    QString batchId = QString::fromStdString(it->batch_id);
+    QString displayName = QString::fromStdString(it->display_name);
     QString firstDoc = QString::fromStdString(it->first_doc_anchor.document_name);
     QString lastDoc = QString::fromStdString(it->last_doc_anchor.document_name);
     int totalPages = it->simplex_pages + it->duplex_pages;
-    QColor userColor = userBackgroundColor(QString::fromStdString(it->batch_id));
-    receiptPanel_->addCard(QString::fromStdString(it->batch_id),
-      QString::fromStdString(it->display_name), firstDoc, lastDoc,
-      totalPages, it->total_price, userColor, true, false);
+    QColor userColor = userBackgroundColor(batchId);
+    receiptPanel_->addCard(batchId, displayName, firstDoc, lastDoc,
+      totalPages, it->total_price, userColor, true, false, false);
   }
 }
 
@@ -1320,6 +1358,14 @@ QString MainWindow::resolveStateDir() const
   if (QDir::isRelativePath(root))
   { const QString exeDir = QCoreApplication::applicationDirPath(); root = QDir(exeDir).filePath(root); }
   return QDir::toNativeSeparators(QDir(root).filePath(QStringLiteral("_state")));
+}
+
+QString MainWindow::resolveHistoryRoot() const
+{
+  QString root = QString::fromStdString(config_.storage.output_root);
+  if (QDir::isRelativePath(root))
+  { const QString exeDir = QCoreApplication::applicationDirPath(); root = QDir(exeDir).filePath(root); }
+  return QDir::toNativeSeparators(QDir(root).filePath(QStringLiteral("history")));
 }
 
 }  // namespace wpce::ui

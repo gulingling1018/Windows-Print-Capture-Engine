@@ -85,6 +85,35 @@ public:
   /// Returns std::nullopt if the file doesn't exist or parse fails.
   static std::optional<core::SettlementOrder> loadFromFile(
       const std::filesystem::path& file_path);
+
+  // ── Date-based storage (history/) ─────────────────────────────────
+
+  /// Build a filesystem-safe filename for an order.
+  /// Format: "<order_id>_<firstDoc>~<lastDoc>.json"
+  /// Special chars are sanitised, names truncated to 20 chars.
+  static std::string makeOrderFilename(const std::string& order_id,
+                                       const std::string& first_doc,
+                                       const std::string& last_doc);
+
+  /// Save an order to the date-based history directory.
+  /// Path: <history_root>/<date_yyyy_mm_dd>/<filename>.json
+  /// Creates directories as needed. Returns true on success.
+  static bool saveToDateDir(const core::SettlementOrder& order,
+                            const std::filesystem::path& history_root,
+                            const std::string& date_yyyy_mm_dd,
+                            const std::string& first_doc,
+                            const std::string& last_doc);
+
+  /// List available date directories under the history root.
+  /// Returns sorted date strings (YYYY-MM-DD) in descending order.
+  static std::vector<std::string> listDateDirs(
+      const std::filesystem::path& history_root);
+
+  /// Load all settlement orders for a given date.
+  /// Returns orders sorted by settled_at_utc ascending.
+  static std::vector<core::SettlementOrder> loadOrdersForDate(
+      const std::filesystem::path& history_root,
+      const std::string& date_yyyy_mm_dd);
 };
 
 }  // namespace wpce::bridge

@@ -4,6 +4,7 @@
 #include "ui/pricing_config.h"
 
 #include <QDialog>
+#include <QKeyEvent>
 #include <QLabel>
 #include <QPushButton>
 #include <QTableWidget>
@@ -14,16 +15,14 @@ namespace wpce::ui
 
 class BillingService;
 
-/// Compact floating settlement window for rapid operator workflow.
-/// Shows a single batch's jobs with first/last document anchors,
-/// scrollable job list, summary bar, and prev/hang-up/next/settle controls.
+/// Compact floating settlement window — card flipper style.
+/// Operator navigates left/right between batches (Active + Suspended).
+/// Context-sensitive action button changes based on current batch state:
+///   Active    → "挂单" + "结算"
+///   Suspended → "恢复" + "结算"
+///   Settled   → both disabled
 ///
 /// Size: 460×600 default, draggable, expandable to 900×800.
-/// Column visibility is width-driven:
-///   460-580: # / doc / pages / duplex / price
-///   581-680: + copies
-///   681-800: + printer
-///   801-900: + paper + full doc name + time
 class QuickSettleDialog : public QDialog
 {
   Q_OBJECT
@@ -36,16 +35,22 @@ class QuickSettleDialog : public QDialog
 
   void setCurrentBatchIndex(int index);
 
+ public slots:
+  void refresh();
+
  signals:
   void settleRequested(const QString& batchId);
   void hangUpRequested(const QString& batchId);
   void resumeRequested(const QString& batchId);
+  void batchFocusChanged(const QString& batchId);
 
  protected:
   void closeEvent(QCloseEvent* event) override;
   void resizeEvent(QResizeEvent* event) override;
   void mousePressEvent(QMouseEvent* event) override;
   void mouseMoveEvent(QMouseEvent* event) override;
+  void mouseReleaseEvent(QMouseEvent* event) override;
+  void keyPressEvent(QKeyEvent* event) override;
 
  private:
   void buildUi();
@@ -54,11 +59,10 @@ class QuickSettleDialog : public QDialog
   void switchToPrev();
   void switchToNext();
   void onSettleClicked();
-  void onHangUpClicked();
-  void onResumeClicked();
+  void onActionClicked();
   void updatePinnedState();
-  void updateHangUpState();
-  void updateResumeMenu();
+  void updateActionButtons();
+  void updatePositionIndicator();
 
   BillingBatchModel* model_ = nullptr;
   BillingService* service_ = nullptr;
@@ -70,13 +74,15 @@ class QuickSettleDialog : public QDialog
   QPoint dragStartPos_;
   bool dragging_ = false;
 
-  // UI widgets
+  // UI widgets — title bar
   QWidget* titleBar_ = nullptr;
   QLabel* titleLabel_ = nullptr;
   QLabel* stateBadgeLabel_ = nullptr;
+  QLabel* positionLabel_ = nullptr;
   QPushButton* pinBtn_ = nullptr;
   QPushButton* closeBtn_ = nullptr;
 
+  // Content
   QLabel* firstDocLabel_ = nullptr;
   QLabel* firstTimeLabel_ = nullptr;
   QLabel* firstPagesLabel_ = nullptr;
@@ -89,9 +95,9 @@ class QuickSettleDialog : public QDialog
 
   QLabel* summaryLabel_ = nullptr;
 
+  // Action bar
   QPushButton* prevBtn_ = nullptr;
-  QPushButton* hangUpBtn_ = nullptr;
-  QPushButton* resumeBtn_ = nullptr;
+  QPushButton* actionBtn_ = nullptr;
   QPushButton* nextBtn_ = nullptr;
   QPushButton* settleBtn_ = nullptr;
 };
