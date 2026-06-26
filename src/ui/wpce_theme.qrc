@@ -1,5 +1,6 @@
 <RCC>
   <qresource prefix="/">
     <file>styles/theme.qss</file>
+    <file alias="icons/app_icon">../../img/app_icon.png</file>
   </qresource>
 </RCC>

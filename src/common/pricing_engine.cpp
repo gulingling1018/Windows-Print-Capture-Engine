@@ -44,6 +44,7 @@ int rule_specificity(const core::PricingRule& rule)
   // and fall back to the string form for older configs.
   if (!rule.paper_size_set.empty() || !rule.paper_size.empty()) ++score;
   if (!rule.duplex_mode.empty()) ++score;
+  if (!rule.printer_name_set.empty() || !rule.printer_name.empty()) ++score;
   if (!rule.color_mode.empty()) ++score;
   if (!rule.file_extension_set.empty() || !rule.file_extension.empty()) ++score;
   return score;
@@ -83,8 +84,8 @@ bool dimension_matches_set(
   return icase_equals(rule_string, job_value);
 }
 
-/// Single-string dimension match (used for duplex_mode / color_mode which
-/// remain single-value).  Empty rule value = wildcard.
+/// Single-string dimension match (used for duplex_mode which
+/// remains single-value).  Empty rule value = wildcard.
 bool dimension_matches(std::string_view rule_value,
                         std::string_view job_value)
 {
@@ -104,24 +105,37 @@ std::string normalize_duplex_for_matching(std::string_view duplex_value)
 
 std::string normalize_color_for_matching(std::string_view color_value)
 {
-  if (color_value.empty()) return {};
-  if (color_value == "color") return "color";
-  if (color_value == "monochrome" || color_value == "grayscale")
+  const auto first = color_value.find_first_not_of(" \t\r\n");
+  if (first == std::string_view::npos) return {};
+  const auto last = color_value.find_last_not_of(" \t\r\n");
+  const std::string_view value = color_value.substr(first, last - first + 1);
+
+  if (value.empty() || value == "-") return {};
+  if (icase_equals(value, "color") ||
+      icase_equals(value, "colour") ||
+      icase_equals(value, "clolor"))
+    return "color";
+  if (icase_equals(value, "monochrome") ||
+      icase_equals(value, "monchorme") ||
+      icase_equals(value, "grayscale") ||
+      icase_equals(value, "greyscale") ||
+      icase_equals(value, "bw") ||
+      icase_equals(value, "b&w"))
     return "monochrome";
-  return std::string(color_value);
+  return std::string(value);
 }
 
 const core::PricingRule* find_best_rule(
     const core::MetadataSnapshot& metadata,
     const std::vector<core::PricingRule>& rules,
-    std::string_view effective_color)
+    const std::string& effective_color)
 {
   if (rules.empty()) return nullptr;
 
   const std::string job_duplex = normalize_duplex_for_matching(metadata.duplex.value);
-  const std::string job_color(effective_color.begin(), effective_color.end());
   const std::string& job_paper = metadata.paper_size.value;
   const std::string& job_ext = metadata.file_extension.value;
+  const std::string& job_printer = metadata.printer_name;
 
   const core::PricingRule* best = nullptr;
   int best_specificity = -1;
@@ -134,7 +148,9 @@ const core::PricingRule* find_best_rule(
     if (!dimension_matches_set(rule.paper_size_set, rule.paper_size, job_paper))
       continue;
     if (!dimension_matches(rule.duplex_mode, job_duplex)) continue;
-    if (!dimension_matches(rule.color_mode, job_color)) continue;
+    if (!dimension_matches_set(rule.printer_name_set, rule.printer_name, job_printer))
+      continue;
+    if (!dimension_matches(rule.color_mode, effective_color)) continue;
     if (!dimension_matches_set(rule.file_extension_set, rule.file_extension, job_ext))
       continue;
 
@@ -202,8 +218,7 @@ bool is_duplex_job(const core::MetadataSnapshot& metadata)
 
 bool is_color_job(const core::MetadataSnapshot& metadata)
 {
-  const std::string& color = metadata.color.value;
-  return color == "color";
+  return normalize_color_for_matching(metadata.color.value) == "color";
 }
 
 bool is_large_paper(const core::MetadataSnapshot& metadata)
@@ -258,13 +273,20 @@ std::string effective_color_mode(
   if (raw == "color")
   {
     const bool printer_color = lookup_color_capability(printers, metadata.printer_name);
-    if (!printer_color)
+    if (printer_color)
+      return "color";
+    else
     {
       downgraded = true;
       return "monochrome";
     }
   }
-  return raw;
+
+  // Driver values such as "-" or not-reported are not evidence of a
+  // colour job.  For billing they match monochrome rules; only an
+  // explicit colour parameter on a colour-capable printer enters the
+  // operator-filled split-pricing path.
+  return "monochrome";
 }
 
 // ── Full pricing calculation ─────────────────────────────────────────────
@@ -290,7 +312,8 @@ const std::vector<core::PricingRule>& resolve_rules(
 core::JobPricingEntry compute_job_pricing(
     const core::MetadataSnapshot& metadata,
     const PricingConfig& config,
-    const PrinterProfileConfig& printers)
+    const PrinterProfileConfig& printers,
+    int color_pages)
 {
   core::JobPricingEntry entry;
   entry.job_id = metadata.job_id;
@@ -301,15 +324,23 @@ core::JobPricingEntry compute_job_pricing(
   const int copies = parse_copies(metadata);
   entry.copies = copies;
 
-  const int rendered_pages = logical_pages * copies;
-  if (rendered_pages <= 0)
+  // Store the operator-filled color page count for UI round-trip.
+  entry.color_pages = std::max(0, std::min(color_pages, logical_pages));
+  entry.mono_pages = std::max(0, logical_pages - entry.color_pages);
+
+  if (logical_pages <= 0)
   {
     entry.price_pending = true;
     entry.pending_reason = "unknown_pages";
     return entry;
   }
 
-  const bool duplex = is_duplex_job(metadata);
+  // Single-page documents cannot physically use both sides of a sheet,
+  // so they are always priced as simplex regardless of duplex setting.
+  const bool duplex = is_duplex_job(metadata) && logical_pages > 1;
+  core::MetadataSnapshot pricing_metadata = metadata;
+  pricing_metadata.duplex.value = duplex ? "duplex" : "simplex";
+  pricing_metadata.duplex.state = core::FieldState::Reported;
 
   // Effective color (printer-aware downgrade).
   bool color_downgraded = false;
@@ -318,37 +349,195 @@ core::JobPricingEntry compute_job_pricing(
   if (color_downgraded)
     entry.note = "color_on_bw_printer";
 
-  // Compute physical sheet breakdown.
-  const core::SheetBreakdown sheets = compute_sheet_breakdown(rendered_pages, duplex);
+  // Compute physical sheet breakdown per copy, then scale by copies.
+  const core::SheetBreakdown perCopy = compute_sheet_breakdown(logical_pages, duplex);
+  core::SheetBreakdown sheets;
+  sheets.full_duplex_sheets = perCopy.full_duplex_sheets * copies;
+  sheets.simplex_tail_pages = perCopy.simplex_tail_pages * copies;
+  sheets.total_sheets       = sheets.full_duplex_sheets + sheets.simplex_tail_pages;
   entry.duplex_full_sheets = sheets.full_duplex_sheets;
   entry.simplex_tail_pages = sheets.simplex_tail_pages;
   entry.effective_sheets   = sheets.total_sheets;
 
   const std::vector<core::PricingRule>& rules = resolve_rules(config);
 
-  // ── Match the main rule for the duplex (or simplex) body ──────────
-  // We pass the effective color so that color-downgraded jobs match
-  // monochrome rules.
-  const core::PricingRule* matched = find_best_rule(metadata, rules, eff_color);
+  // Determine matching color for rule lookup.  The effective colour
+  // already accounts for printer capability and unknown driver values.
+  const std::string match_color = eff_color;
+
+  // ── Match the main rule ───────────────────────────────────────────
+  const core::PricingRule* matched = find_best_rule(pricing_metadata, rules, match_color);
 
   if (matched == nullptr)
   {
-    // No rule matched at all → pending.
     entry.price_pending = true;
-    entry.pending_reason = eff_color == "color"
-      ? "unmatched_rule_color"
-      : "unmatched_rule";
+    entry.pending_reason = "unmatched_rule";
     return entry;
   }
 
   entry.matched_rule_id = matched->rule_id;
 
-  // For duplex jobs, the body sheets are charged at the matched duplex
-  // rule's price.  The simplex tail (if any) is priced separately by a
-  // simplex rule below.
-  //
-  // For simplex jobs, the matched rule already targets simplex and
-  // simplex_tail_pages == rendered_pages, so we just charge them all.
+  if (!matched->printer_name_set.empty())
+  {
+    for (std::size_t pi = 0; pi < matched->printer_name_set.size(); ++pi)
+    {
+      if (pi > 0) entry.matched_printer_name += "|";
+      entry.matched_printer_name += matched->printer_name_set[pi];
+    }
+  }
+  else
+  {
+    entry.matched_printer_name = matched->printer_name;
+  }
+
+  // ── Color job split pricing ───────────────────────────────────────
+  const bool is_color = is_color_job(metadata);
+  if (is_color && !color_downgraded)
+  {
+    if (entry.color_pages <= 0)
+    {
+      // Operator hasn't filled color pages → price=0, pending.
+      entry.total_price = 0.0;
+      entry.base_price = 0.0;
+      entry.tail_price = 0.0;
+      entry.price_pending = true;
+      entry.pending_reason = "awaiting_color_pages";
+      return entry;
+    }
+
+    // Split: color and mono portions calculated independently through
+    // duplex sheet breakdown, each finding their own matching rules.
+    const core::PricingRule* color_rule = find_best_rule(pricing_metadata, rules, "color");
+    const core::PricingRule* mono_rule  = find_best_rule(pricing_metadata, rules, "monochrome");
+
+    if (!color_rule) color_rule = find_best_rule(pricing_metadata, rules, "");
+    if (!mono_rule)  mono_rule  = find_best_rule(pricing_metadata, rules, "");
+
+    if (!color_rule)
+    {
+      entry.price_pending = true;
+      entry.pending_reason = "no_color_rule";
+      return entry;
+    }
+    if (!mono_rule)
+    {
+      entry.price_pending = true;
+      entry.pending_reason = "no_mono_rule";
+      return entry;
+    }
+
+    // Helper: find a simplex rule for a given color mode (for tail pricing).
+    auto find_simplex_rule = [&](const std::string& color_for_tail) -> const core::PricingRule*
+    {
+      const std::string& job_paper = metadata.paper_size.value;
+      const std::string& job_ext = metadata.file_extension.value;
+      const std::string& job_printer = metadata.printer_name;
+
+      const core::PricingRule* best = nullptr;
+      int best_spec = -1;
+      std::size_t best_idx = static_cast<std::size_t>(-1);
+
+      for (std::size_t i = 0; i < rules.size(); ++i)
+      {
+        const auto& rule = rules[i];
+        if (rule.duplex_mode != "simplex") continue;
+        if (!dimension_matches(rule.color_mode, color_for_tail)) continue;
+        if (!dimension_matches_set(rule.paper_size_set, rule.paper_size, job_paper)) continue;
+        if (!dimension_matches_set(rule.printer_name_set, rule.printer_name, job_printer)) continue;
+        if (!dimension_matches_set(rule.file_extension_set, rule.file_extension, job_ext)) continue;
+
+        const int spec = rule.priority > 0 ? rule.priority : rule_specificity(rule);
+        if (spec > best_spec || (spec == best_spec && i < best_idx))
+        {
+          best_spec = spec;
+          best = &rule;
+          best_idx = i;
+        }
+      }
+      return best;
+    };
+
+    // ── Color portion: independent duplex sheet breakdown ──────────
+    const bool color_duplex = duplex && entry.color_pages > 1;
+    const core::SheetBreakdown color_bd = compute_sheet_breakdown(entry.color_pages, color_duplex);
+    double color_price = 0.0;
+
+    if (color_duplex)
+    {
+      color_price = static_cast<double>(color_bd.full_duplex_sheets) *
+                    color_rule->price_per_sheet;
+      if (color_bd.simplex_tail_pages > 0)
+      {
+        const core::PricingRule* color_tail = find_simplex_rule("color");
+        if (!color_tail) color_tail = find_simplex_rule("");
+        if (color_tail)
+          color_price += static_cast<double>(color_bd.simplex_tail_pages) *
+                         color_tail->price_per_sheet;
+        else
+          color_price += static_cast<double>(color_bd.simplex_tail_pages) *
+                         color_rule->price_per_sheet;
+      }
+    }
+    else
+    {
+      // ≤1 color page in a duplex job → physically simplex.
+      // Use the simplex color rule, not the duplex-matched color_rule.
+      const core::PricingRule* eff_color_rule = color_rule;
+      if (duplex)
+      {
+        const core::PricingRule* csr = find_simplex_rule("color");
+        if (!csr) csr = find_simplex_rule("");
+        if (csr) eff_color_rule = csr;
+      }
+      color_price = static_cast<double>(color_bd.simplex_tail_pages) *
+                    eff_color_rule->price_per_sheet;
+    }
+
+    // ── Mono portion: independent duplex sheet breakdown ──────────
+    const bool mono_duplex = duplex && entry.mono_pages > 1;
+    const core::SheetBreakdown mono_bd = compute_sheet_breakdown(entry.mono_pages, mono_duplex);
+    double mono_price = 0.0;
+
+    if (mono_duplex)
+    {
+      mono_price = static_cast<double>(mono_bd.full_duplex_sheets) *
+                   mono_rule->price_per_sheet;
+      if (mono_bd.simplex_tail_pages > 0)
+      {
+        const core::PricingRule* mono_tail = find_simplex_rule("monochrome");
+        if (!mono_tail) mono_tail = find_simplex_rule("");
+        if (mono_tail)
+          mono_price += static_cast<double>(mono_bd.simplex_tail_pages) *
+                        mono_tail->price_per_sheet;
+        else
+          mono_price += static_cast<double>(mono_bd.simplex_tail_pages) *
+                        mono_rule->price_per_sheet;
+      }
+    }
+    else
+    {
+      // ≤1 mono page in a duplex job → physically simplex.
+      const core::PricingRule* eff_mono_rule = mono_rule;
+      if (duplex)
+      {
+        const core::PricingRule* msr = find_simplex_rule("monochrome");
+        if (!msr) msr = find_simplex_rule("");
+        if (msr) eff_mono_rule = msr;
+      }
+      mono_price = static_cast<double>(mono_bd.simplex_tail_pages) *
+                   eff_mono_rule->price_per_sheet;
+    }
+
+    entry.color_subtotal = color_price * copies;
+    entry.mono_subtotal  = mono_price * copies;
+    entry.base_price     = entry.mono_subtotal;
+    entry.tail_price     = 0.0;
+    entry.total_price    = entry.color_subtotal + entry.mono_subtotal;
+    entry.matched_rule_id = mono_rule->rule_id;
+    return entry;
+  }
+
+  // ── Standard (monochrome or downgraded) pricing ───────────────────
   if (duplex)
   {
     entry.base_price = static_cast<double>(sheets.full_duplex_sheets) *
@@ -363,14 +552,9 @@ core::JobPricingEntry compute_job_pricing(
   // ── Duplex odd-page tail: separately priced as simplex ────────────
   if (duplex && sheets.simplex_tail_pages > 0)
   {
-    // Find a simplex rule with the same paper/color/filetype dimensions.
-    // We do this by temporarily treating the job as simplex for the
-    // matching pass.  The simplest way is to call find_best_rule with a
-    // synthetic "simplex" duplex — but find_best_rule reads
-    // metadata.duplex directly.  So instead we inline a simplex-targeted
-    // search using the same matching logic.
     const std::string job_paper = metadata.paper_size.value;
     const std::string job_ext = metadata.file_extension.value;
+    const std::string& job_printer = metadata.printer_name;
 
     const core::PricingRule* tail_rule = nullptr;
     int tail_spec = -1;
@@ -379,12 +563,13 @@ core::JobPricingEntry compute_job_pricing(
     for (std::size_t i = 0; i < rules.size(); ++i)
     {
       const auto& rule = rules[i];
-      // Must explicitly be a simplex rule to qualify as the tail rule.
       if (rule.duplex_mode != "simplex") continue;
+      if (!dimension_matches(rule.color_mode, eff_color)) continue;
 
       if (!dimension_matches_set(rule.paper_size_set, rule.paper_size, job_paper))
         continue;
-      if (!dimension_matches(rule.color_mode, eff_color)) continue;
+      if (!dimension_matches_set(rule.printer_name_set, rule.printer_name, job_printer))
+        continue;
       if (!dimension_matches_set(rule.file_extension_set, rule.file_extension, job_ext))
         continue;
 
@@ -405,8 +590,6 @@ core::JobPricingEntry compute_job_pricing(
     }
     else
     {
-      // No simplex rule for the tail → flag as pending so the operator
-      // can fill a price for this single tail page.
       entry.tail_price = 0.0;
       entry.price_pending = true;
       entry.pending_reason = "no_simplex_rule_for_tail";
@@ -414,20 +597,6 @@ core::JobPricingEntry compute_job_pricing(
   }
 
   entry.total_price = entry.base_price + entry.tail_price;
-
-  // ── Color pending ──────────────────────────────────────────────────
-  // Only flag color-pending when the job is genuinely color (i.e. not
-  // downgraded by a B&W printer) and the matched rule was not itself a
-  // color-specific rule.
-  if (eff_color == "color" && config.color_price_pending && !color_downgraded)
-  {
-    if (matched->color_mode != "color")
-    {
-      entry.price_pending = true;
-      if (entry.pending_reason.empty()) entry.pending_reason = "color";
-    }
-  }
-
   return entry;
 }
 

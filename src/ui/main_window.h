@@ -12,6 +12,7 @@
 #include <QTimer>
 #include <QTreeView>
 
+class QCloseEvent;
 class QLineEdit;
 class QResizeEvent;
 class QStackedWidget;
@@ -37,6 +38,7 @@ class MainWindow : public QMainWindow
 
  protected:
   void resizeEvent(QResizeEvent* event) override;
+  void closeEvent(QCloseEvent* event) override;
 
  private slots:
   void onStartClicked();
@@ -66,9 +68,12 @@ class MainWindow : public QMainWindow
   void loadOrCreateConfig();
   void applyConfig();
   void detectPrintersIfNeeded();
+  void detectPrintersAsync();
   QString resolveOutputRoot() const;
   QString resolveStateDir() const;
   QString resolveHistoryRoot() const;
+  QString resolveUserDir(const QString& displayName) const;
+  void ensureUserDirectories(const QString& displayName);
 
   common::AppConfig config_;
 
@@ -108,6 +113,7 @@ class MainWindow : public QMainWindow
 
   QHash<QString, QDateTime> printerHeartbeats_;
   QTimer* heartbeatCheckTimer_ = nullptr;
+  QTimer* batchUpdateDebounce_ = nullptr;
 
   QString lastOutputDir_;
 };

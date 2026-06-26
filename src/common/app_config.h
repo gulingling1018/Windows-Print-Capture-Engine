@@ -17,14 +17,11 @@ namespace wpce::common
 
 struct StorageConfig
 {
-  /// Root directory for captured output.
-  /// Relative paths resolve relative to the executable directory.
+  /// Root directory for captured output. Relative paths resolve
+  /// relative to the executable directory. A daily subdirectory
+  /// (YYYY-MM-DD) is automatically appended at runtime.
   /// Default: "./data" (portable, next to exe).
   std::string output_root{"./data"};
-
-  /// When true, each capture session creates a timestamped subdirectory
-  /// (e.g. "capture-20260620-143052") under output_root.
-  bool use_timestamp_subdir{true};
 
   /// Maximum number of pending snapshot items before backpressure.
   std::size_t queue_capacity{256};
@@ -79,6 +76,15 @@ struct MonitoringConfig
   /// 0 disables stall detection.
   int stall_timeout_seconds{30};
 
+  /// Interval (seconds) for periodic full rescan of spooler queue.
+  /// Safety net for drivers that drop or coalesce change notifications.
+  /// 0 disables periodic rescan.
+  int rescan_interval_seconds{5};
+
+  /// WaitForSingleObject polling timeout in milliseconds.
+  /// Lower = more responsive but higher CPU. 250 ms is a good balance.
+  int poll_timeout_ms{250};
+
   /// When true, a performance CSV log is written alongside captured data.
   bool perf_log_enabled{false};
 };
@@ -87,6 +93,14 @@ struct WindowLayoutConfig
 {
   int width{1280};
   int height{760};
+
+  int settings_width{560};
+  int settings_height{480};
+
+  int quick_settle_width{560};
+  int quick_settle_height{360};
+  int quick_settle_collapsed_height{0};
+  bool quick_settle_collapsed{false};
 };
 
 // ── Master configuration ───────────────────────────────────────────────────

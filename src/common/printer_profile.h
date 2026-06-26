@@ -9,10 +9,11 @@
 /// flagging it as price_pending.
 ///
 /// This module provides:
-///   - PrinterProfile: per-printer color capability record
+///   - PrinterProfile: per-printer color capability + paper sizes
 ///   - PrinterProfileConfig: collection of profiles + default fallback
 ///   - detect_printer_capabilities(): Win32 probe of local printers
 ///   - lookup_color_capability(): fast query for the pricing engine
+///   - Paper size query helpers for settings dialog context-sensitive UI
 ///
 /// Configuration persistence is handled by AppConfig (this header
 /// only defines the data structures and pure query logic).
@@ -36,6 +37,11 @@ struct PrinterProfile
   /// True if this printer is a color-capable device.
   /// False → color jobs sent here are downgraded to monochrome pricing.
   bool is_color_capable{false};
+
+  /// Paper sizes supported by this printer.
+  /// Populated via DeviceCapabilitiesW(DC_PAPERNAMES) during detection.
+  /// Empty before detection or when detection fails.
+  std::vector<std::string> supported_paper_sizes;
 };
 
 struct PrinterProfileConfig
@@ -64,5 +70,23 @@ PrinterProfileConfig detect_printer_capabilities();
 
 /// Case-insensitive name match (used by lookup_color_capability).
 bool printer_name_matches(std::string_view a, std::string_view b) noexcept;
+
+/// Look up a PrinterProfile by name (case-insensitive).
+/// Returns nullptr if no match is found.
+const PrinterProfile* lookup_printer_profile(
+    const PrinterProfileConfig& config,
+    std::string_view printer_name) noexcept;
+
+/// Get the paper sizes supported by a specific printer.
+/// Returns the supported_paper_sizes for the matched printer,
+/// or an empty vector if the printer is not found.
+std::vector<std::string> get_paper_sizes_for_printer(
+    const PrinterProfileConfig& config,
+    std::string_view printer_name);
+
+/// Get the union of all paper sizes across all printer profiles.
+/// Duplicates are removed (case-insensitive dedup).
+std::vector<std::string> get_all_paper_sizes(
+    const PrinterProfileConfig& config);
 
 }  // namespace wpce::common

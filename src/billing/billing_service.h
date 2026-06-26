@@ -92,6 +92,7 @@ class BillingService : public QObject
   /// The batch that will receive the next incoming job.  May be null.
   [[nodiscard]] const domain::BillingBatch* currentActiveBatch() const;
 
+
   // ── Operator actions ────────────────────────────────────────────────
 
   /// Settle a batch: freeze its jobs into a SettlementOrder, mark
@@ -122,6 +123,10 @@ class BillingService : public QObject
   /// Only allowed before settlement on both batches.
   bool moveJobToBatch(const QString& srcBatchId, std::uint32_t jobId,
                        const QString& dstBatchId);
+
+  /// Set the operator-filled color page count for a job, then recompute
+  /// pricing and batch totals.  Emits batchUpdated on success.
+  void setColorPages(std::uint32_t jobId, int colorPages);
 
   /// Delete a job entirely from the registry (operator correction).
   bool deleteJob(std::uint32_t jobId);
@@ -185,6 +190,7 @@ class BillingService : public QObject
   QString historyRoot_;
 
   QTimer saveTimer_;
+  QTimer periodicSaveTimer_;
   bool dirty_{false};
 };
 

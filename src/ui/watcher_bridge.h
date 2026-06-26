@@ -38,6 +38,13 @@ class WatcherBridge : public QObject
   /// 0 disables stall detection.  Must be called before startWatching().
   void setStallTimeout(std::chrono::seconds timeout) noexcept;
 
+  /// Set the periodic rescan interval (safety net for dropped notifications).
+  /// 0 disables.  Must be called before startWatching().
+  void setRescanInterval(std::chrono::seconds interval) noexcept;
+
+  /// Set the WaitForSingleObject polling timeout (ms).
+  void setPollTimeout(std::chrono::milliseconds timeout) noexcept;
+
   /// Discover local printers and start a watcher for each one.
   void startWatching(const QString& outputDir);
 
@@ -94,6 +101,8 @@ class WatcherBridge : public QObject
   std::vector<QThread*> watcherThreads_;
   std::atomic_bool running_{false};
   std::chrono::seconds stallTimeout_{30};
+  std::chrono::seconds rescanInterval_{5};
+  std::chrono::milliseconds pollTimeout_{250};
 
   std::mutex restartStateMutex_;
   std::unordered_map<std::wstring, WatcherRestartState> restartStates_;

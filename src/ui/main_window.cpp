@@ -33,6 +33,7 @@
 #include <QLabel>
 #include <QLineEdit>
 #include <QMenu>
+#include <QMessageBox>
 #include <QResizeEvent>
 #include <QStackedWidget>
 #include <QStandardPaths>
@@ -45,6 +46,7 @@
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -446,6 +448,7 @@ QString ensureFilterInstalled()
 #include <chrono>
 #include <iomanip>
 #include <sstream>
+#include <unordered_map>
 
 #ifdef _WIN32
 #include <windows.h>
@@ -461,7 +464,7 @@ namespace wpce::ui
 MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 {
   loadOrCreateConfig();
-  detectPrintersIfNeeded();
+  // Printer detection deferred to background after UI is interactive.
 
   setWindowTitle(QStringLiteral("WPCE 打印捕获控制台"));
   resize(config_.window.width, config_.window.height);
@@ -472,6 +475,25 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   billingService_->setPricingConfig(&config_.pricing);
   billingService_->setPrinterProfiles(&config_.printers);
   batchModel_ = new BillingBatchModel(billingService_, this);
+
+  // Restore persisted state before building UI so the tree has data on first paint.
+  {
+    // Create daily root directory first.
+    const QString dailyRoot = resolveOutputRoot();
+    QDir().mkpath(dailyRoot);
+
+    const QString stateDir = resolveStateDir();
+    QDir().mkpath(stateDir);
+    billingService_->setStateDirectory(stateDir);
+    const QString historyRoot = resolveHistoryRoot();
+    QDir().mkpath(historyRoot);
+    billingService_->setHistoryRoot(historyRoot);
+    billingService_->load();
+
+    // Ensure per-user directories exist for any loaded batches.
+    for (const auto& batch : billingService_->batches())
+      ensureUserDirectories(QString::fromStdString(batch.display_name));
+  }
 
   auto* central = new QWidget(this);
   central->setObjectName(QStringLiteral("AppRoot"));
@@ -810,7 +832,19 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   connect(quickSettleBtn_, &QPushButton::clicked, this, [this]() {
     if (quickSettleDialog_ == nullptr)
     {
-      quickSettleDialog_ = new QuickSettleDialog(batchModel_, billingService_, &config_.pricing, nullptr);
+      quickSettleDialog_ = new QuickSettleDialog(batchModel_, billingService_, &config_.pricing,
+                                                  config_.window.quick_settle_width,
+                                                  config_.window.quick_settle_height,
+                                                  config_.window.quick_settle_collapsed_height,
+                                                  config_.window.quick_settle_collapsed,
+                                                  nullptr);
+      connect(quickSettleDialog_, &QuickSettleDialog::geometryChanged,
+              this, [this](int w, int h, int ch, bool collapsed) {
+        config_.window.quick_settle_width = w;
+        config_.window.quick_settle_height = h;
+        config_.window.quick_settle_collapsed_height = ch;
+        config_.window.quick_settle_collapsed = collapsed;
+      });
       connect(quickSettleDialog_, &QuickSettleDialog::settleRequested,
               this, [this](const QString& batchId) { billingService_->settle(batchId); });
       connect(quickSettleDialog_, &QuickSettleDialog::hangUpRequested,
@@ -835,8 +869,6 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
       current = current.parent();
     if (current.isValid())
       targetIndex = current.row();
-    else
-      targetIndex = batchModel_->currentActiveRow();
     if (targetIndex < 0)
       targetIndex = batchModel_->nextRelevantRow(-1);
     if (targetIndex >= 0)
@@ -892,13 +924,36 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   // ── BillingService → UI refresh ───────────────────────────────────
   connect(billingService_, &BillingService::batchesChanged, this, [this]() {
     refreshSummaryCards(); refreshEmptyState(); refreshGroupRowSpans(); refreshReceiptPanel();
-    if (quickSettleDialog_ != nullptr) quickSettleDialog_->refresh();
+    if (quickSettleDialog_ != nullptr) {
+      quickSettleDialog_->refresh();
+      quickSettleDialog_->ensurePriorityView();
+    }
   });
-  connect(billingService_, &BillingService::batchUpdated, this, [this](const QString&) {
+
+  // Debounce batchUpdated: rapid metadata/lifecycle events for the same
+  // batch should not each trigger a full UI repaint (receipt panel rebuild,
+  // detail panel update, etc.).  Coalesce within 80 ms.
+  batchUpdateDebounce_ = new QTimer(this);
+  batchUpdateDebounce_->setSingleShot(true);
+  batchUpdateDebounce_->setInterval(80);
+  connect(batchUpdateDebounce_, &QTimer::timeout, this, [this]() {
     refreshSummaryCards(); refreshReceiptPanel(); refreshSelectedDetail();
     if (quickSettleDialog_ != nullptr) quickSettleDialog_->refresh();
   });
+  connect(billingService_, &BillingService::batchUpdated, this, [this](const QString&) {
+    if (!batchUpdateDebounce_->isActive())
+      batchUpdateDebounce_->start();
+  });
   connect(billingService_, &BillingService::orderSettled, this, &MainWindow::onBatchSettled);
+
+  // Create per-user data subdirectories when a new batch is created.
+  connect(billingService_, &BillingService::batchCreated, this, [this](const QString& batchId) {
+    const auto* batch = billingService_->batchById(batchId.toStdString());
+    if (batch != nullptr)
+      ensureUserDirectories(QString::fromStdString(batch->display_name));
+    if (quickSettleDialog_ != nullptr)
+      quickSettleDialog_->onBatchCreated(batchId);
+  });
 
   connect(receiptPanel_, &ReceiptPreviewPanel::settleRequested,
           this, [this](const QString& batchId) { billingService_->settle(batchId); });
@@ -927,6 +982,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   if (!filterMsg.isEmpty()) statusBar()->showMessage(filterMsg, 10000);
 
   QTimer::singleShot(100, this, &MainWindow::autoStart);
+  QTimer::singleShot(800, this, &MainWindow::detectPrintersAsync);
 }
 
 MainWindow::~MainWindow()
@@ -969,15 +1025,34 @@ void MainWindow::rebalanceWorkspaceSplitters()
   if (treeView_ != nullptr)
   {
     const int treeWidth = treeView_->viewport() != nullptr ? treeView_->viewport()->width() : treeView_->width();
-    const bool compactTree = treeWidth > 0 && treeWidth < 760;
-    treeView_->setColumnWidth(BillingBatchModel::ColName,       compactTree ? 160 : 200);
-    treeView_->setColumnWidth(BillingBatchModel::ColState,      compactTree ? 56 : 62);
-    treeView_->setColumnWidth(BillingBatchModel::ColProgress,   compactTree ? 90 : 110);
-    treeView_->setColumnWidth(BillingBatchModel::ColPages,      compactTree ? 40 : 48);
-    treeView_->setColumnWidth(BillingBatchModel::ColDuplex,     compactTree ? 56 : 70);
-    treeView_->setColumnWidth(BillingBatchModel::ColPaper,      compactTree ? 58 : 70);
-    treeView_->setColumnWidth(BillingBatchModel::ColSubmitTime, compactTree ? 110 : 130);
-    treeView_->setColumnWidth(BillingBatchModel::ColPrice,      compactTree ? 56 : 70);
+    if (treeWidth > 0)
+    {
+      const bool compactTree = treeWidth < 760;
+      // Only force column widths when the tree is very narrow and columns
+      // look broken; otherwise respect user or header-auto sizing.
+      if (compactTree)
+      {
+        treeView_->setColumnWidth(BillingBatchModel::ColName,       160);
+        treeView_->setColumnWidth(BillingBatchModel::ColState,      56);
+        treeView_->setColumnWidth(BillingBatchModel::ColProgress,   90);
+        treeView_->setColumnWidth(BillingBatchModel::ColPages,      40);
+        treeView_->setColumnWidth(BillingBatchModel::ColDuplex,     56);
+        treeView_->setColumnWidth(BillingBatchModel::ColPaper,      58);
+        treeView_->setColumnWidth(BillingBatchModel::ColSubmitTime, 110);
+        treeView_->setColumnWidth(BillingBatchModel::ColPrice,      56);
+      }
+      else
+      {
+        treeView_->setColumnWidth(BillingBatchModel::ColName,       200);
+        treeView_->setColumnWidth(BillingBatchModel::ColState,      62);
+        treeView_->setColumnWidth(BillingBatchModel::ColProgress,   110);
+        treeView_->setColumnWidth(BillingBatchModel::ColPages,      48);
+        treeView_->setColumnWidth(BillingBatchModel::ColDuplex,     70);
+        treeView_->setColumnWidth(BillingBatchModel::ColPaper,      70);
+        treeView_->setColumnWidth(BillingBatchModel::ColSubmitTime, 130);
+        treeView_->setColumnWidth(BillingBatchModel::ColPrice,      70);
+      }
+    }
   }
 
   const int workspaceWidth = workspaceSplitter_->width();
@@ -986,7 +1061,9 @@ void MainWindow::rebalanceWorkspaceSplitters()
     const QList<int> sizes = workspaceSplitter_->sizes();
     const int currentSideWidth = sizes.size() > 1 ? sizes.at(1) : 0;
     const int minimumUsefulSideWidth = std::min(400, std::max(340, workspaceWidth / 3));
-    if (currentSideWidth < minimumUsefulSideWidth)
+    // Only snap the splitter back when the side panel is unreasonably
+    // narrow (below 200 px) or below the useful threshold with a tolerance.
+    if (currentSideWidth < minimumUsefulSideWidth && currentSideWidth < 250)
     {
       const int targetSideWidth = std::clamp((workspaceWidth * 36) / 100,
                                              minimumUsefulSideWidth, 480);
@@ -1000,7 +1077,7 @@ void MainWindow::rebalanceWorkspaceSplitters()
   {
     const QList<int> sizes = verticalSplitter_->sizes();
     const int minimumWorkspaceHeight = std::min(480, std::max(360, (verticalHeight * 65) / 100));
-    if (sizes.size() > 1 && sizes.at(0) < minimumWorkspaceHeight)
+    if (sizes.size() > 1 && sizes.at(0) < minimumWorkspaceHeight && sizes.at(0) < 250)
     {
       const int maxWorkspaceHeight = std::max(200, verticalHeight - 170);
       const int workspaceHeight = std::clamp((verticalHeight * 72) / 100,
@@ -1021,23 +1098,34 @@ void MainWindow::onStartClicked()
 
   lastOutputDir_ = resolveOutputRoot();
   QDir().mkpath(lastOutputDir_);
-  const QString stateDir = resolveStateDir();
-  QDir().mkpath(stateDir);
-  billingService_->setStateDirectory(stateDir);
 
-  const QString historyRoot = resolveHistoryRoot();
-  QDir().mkpath(historyRoot);
-  billingService_->setHistoryRoot(historyRoot);
+  // Also ensure per-user dirs for any loaded batches are re-created.
+  for (const auto& batch : billingService_->batches())
+    ensureUserDirectories(QString::fromStdString(batch.display_name));
 
-  billingService_->load();
+  // Always reload state — load() is idempotent (reads same file).
+  {
+    const QString stateDir = resolveStateDir();
+    QDir().mkpath(stateDir);
+    billingService_->setStateDirectory(stateDir);
+
+    const QString historyRoot = resolveHistoryRoot();
+    QDir().mkpath(historyRoot);
+    billingService_->setHistoryRoot(historyRoot);
+
+    billingService_->load();
+  }
 
   const QString nativeOutputDir = QDir::toNativeSeparators(lastOutputDir_);
   outputDirLabel_->setText(compactPathText(nativeOutputDir));
   outputDirLabel_->setToolTip(nativeOutputDir);
 
   bridge_->setStallTimeout(std::chrono::seconds{config_.monitoring.stall_timeout_seconds});
+  bridge_->setRescanInterval(std::chrono::seconds{config_.monitoring.rescan_interval_seconds});
+  bridge_->setPollTimeout(std::chrono::milliseconds{config_.monitoring.poll_timeout_ms});
   bridge_->startWatching(lastOutputDir_);
   updateButtonStates(); updatePrinterLabel(); refreshSummaryCards();
+  refreshEmptyState(); refreshGroupRowSpans();
   statusBar()->showMessage(QStringLiteral("监听中 -> %1").arg(QDir::toNativeSeparators(lastOutputDir_)));
 }
 
@@ -1065,6 +1153,8 @@ void MainWindow::onSettingsClicked()
     applyConfig();
     statusBar()->showMessage(QStringLiteral("设置已保存"), 3000);
   }
+  config_.window.settings_width = dialog.width();
+  config_.window.settings_height = dialog.height();
 }
 
 void MainWindow::onCompleteClicked()
@@ -1124,7 +1214,7 @@ void MainWindow::onTreeSelectionChanged()
   bool canSettle = current.isValid() && batchModel_->batchAt(current) != nullptr &&
                    !batchModel_->batchAt(current)->is_settled();
   completeUserBtn_->setEnabled(canSettle);
-  quickSettleBtn_->setEnabled(canSettle || batchModel_->batchCount() > 0);
+  quickSettleBtn_->setEnabled(true);
   scheduleWorkspaceRebalance();
 }
 
@@ -1188,7 +1278,15 @@ void MainWindow::refreshSummaryCards()
   resultCountLabel_->setText(QStringLiteral("%1 批次 / %2 作业").arg(totalBatches).arg(totalJobs));
   const bool filtersActive = !searchEdit_->text().trimmed().isEmpty();
   clearFilterBtn_->setEnabled(filtersActive);
-  onTreeSelectionChanged();
+
+  // Update settle button state based on current selection.
+  QModelIndex current = treeView_->currentIndex();
+  while (current.isValid() && !batchModel_->isBatchRow(current))
+    current = current.parent();
+  bool canSettle = current.isValid() && batchModel_->batchAt(current) != nullptr &&
+                   !batchModel_->batchAt(current)->is_settled();
+  completeUserBtn_->setEnabled(canSettle);
+  quickSettleBtn_->setEnabled(true);
 }
 
 void MainWindow::applySearchFilter()
@@ -1342,30 +1440,76 @@ void MainWindow::detectPrintersIfNeeded()
     config_.save_to_json(common::AppConfig::default_config_path());
 }
 
+void MainWindow::detectPrintersAsync()
+{
+  auto* thread = QThread::create([this]() {
+    auto detected = common::detect_printer_capabilities();
+    QMetaObject::invokeMethod(this, [this, detected = std::move(detected)]() mutable {
+      if (detected.profiles.empty()) return;
+
+      // Merge: preserve user-configured color capability for known printers.
+      std::unordered_map<std::string, bool> existing;
+      for (const auto& p : config_.printers.profiles)
+        existing[p.printer_name] = p.is_color_capable;
+
+      config_.printers = std::move(detected);
+      for (auto& p : config_.printers.profiles)
+      {
+        auto it = existing.find(p.printer_name);
+        if (it != existing.end())
+          p.is_color_capable = it->second;
+      }
+
+      billingService_->setPrinterProfiles(&config_.printers);
+      config_.save_to_json(common::AppConfig::default_config_path());
+    }, Qt::QueuedConnection);
+  });
+  connect(thread, &QThread::finished, thread, &QObject::deleteLater);
+  thread->start();
+}
+
 QString MainWindow::resolveOutputRoot() const
 {
   QString root = QString::fromStdString(config_.storage.output_root);
   if (QDir::isRelativePath(root))
   { const QString exeDir = QCoreApplication::applicationDirPath(); root = QDir(exeDir).filePath(root); }
-  if (config_.storage.use_timestamp_subdir)
-  { const QString ts = QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")); root = QDir(root).filePath(QStringLiteral("capture-%1").arg(ts)); }
-  return QDir::toNativeSeparators(root);
+  // Daily subdirectory: ./data/2026-06-24/
+  const QString today = QDate::currentDate().toString(QStringLiteral("yyyy-MM-dd"));
+  return QDir::toNativeSeparators(QDir(root).filePath(today));
 }
 
 QString MainWindow::resolveStateDir() const
 {
-  QString root = QString::fromStdString(config_.storage.output_root);
-  if (QDir::isRelativePath(root))
-  { const QString exeDir = QCoreApplication::applicationDirPath(); root = QDir(exeDir).filePath(root); }
-  return QDir::toNativeSeparators(QDir(root).filePath(QStringLiteral("_state")));
+  return QDir::toNativeSeparators(QDir(resolveOutputRoot()).filePath(QStringLiteral("_state")));
 }
 
 QString MainWindow::resolveHistoryRoot() const
 {
-  QString root = QString::fromStdString(config_.storage.output_root);
-  if (QDir::isRelativePath(root))
-  { const QString exeDir = QCoreApplication::applicationDirPath(); root = QDir(exeDir).filePath(root); }
-  return QDir::toNativeSeparators(QDir(root).filePath(QStringLiteral("history")));
+  return QDir::toNativeSeparators(QDir(resolveOutputRoot()).filePath(QStringLiteral("history")));
+}
+
+QString MainWindow::resolveUserDir(const QString& displayName) const
+{
+  return QDir::toNativeSeparators(QDir(resolveOutputRoot()).filePath(displayName));
+}
+
+void MainWindow::ensureUserDirectories(const QString& displayName)
+{
+  const QString userDir = resolveUserDir(displayName);
+  QDir().mkpath(userDir);
+  QDir().mkpath(userDir + QStringLiteral("/jobs"));
+  QDir().mkpath(userDir + QStringLiteral("/pages"));
+}
+
+void MainWindow::closeEvent(QCloseEvent* event)
+{
+  auto reply = QMessageBox::question(this, QStringLiteral("确认退出"),
+                                     QStringLiteral("确定要退出 WPCE 吗？"),
+                                     QMessageBox::Yes | QMessageBox::No);
+  if (reply == QMessageBox::Yes)
+    event->accept();
+  else
+    event->ignore();
 }
 
 }  // namespace wpce::ui

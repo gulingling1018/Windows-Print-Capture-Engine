@@ -171,14 +171,19 @@ struct PricingRule
   std::string rule_id;           // Unique identifier, e.g. "rule-001"
   std::string paper_size;        // Empty = match all; may be "A4|B5"
   std::string duplex_mode;       // "simplex" | "duplex" | "" = all
+  std::string printer_name;      // Printer name, or "" = match all printers; may be pipe-separated
   std::string color_mode;        // "color" | "monochrome" | "" = all
   std::string file_extension;    // Empty = match all; may be "pdf|dwg"
-  double price_per_sheet{0.0};   // Price per physical sheet of paper
-  int priority{0};               // Specificity: count of non-empty dimensions
+  double price_per_sheet{0.0};         // Price per physical sheet
+  int priority{0};                     // Specificity: count of non-empty dimensions
 
   /// Multi-value expansions of paper_size (lowercased, no surrounding pipes).
   /// Empty means "match all paper sizes".
   std::vector<std::string> paper_size_set;
+
+  /// Multi-value expansions of printer_name (case-insensitive matching).
+  /// Empty means "match all printers".
+  std::vector<std::string> printer_name_set;
 
   /// Multi-value expansions of file_extension (lowercased).
   /// Empty means "match all file types".
@@ -205,13 +210,18 @@ struct JobPricingEntry
   int effective_sheets{0};       // Total physical sheets consumed
   int duplex_full_sheets{0};     // Complete duplex sheets
   int simplex_tail_pages{0};     // Odd-page tail (simplex)
-  std::string matched_rule_id;   // ID of the rule that matched, or empty
-  std::string tail_rule_id;      // ID of the rule used for simplex tail, or empty
+  std::string matched_rule_id;      // ID of the rule that matched, or empty
+  std::string tail_rule_id;         // ID of the rule used for simplex tail, or empty
+  std::string matched_printer_name; // Printer name from the matched rule, or empty if wildcard
   double base_price{0.0};        // Full duplex sheets price
   double tail_price{0.0};        // Simplex tail pages price
   double total_price{0.0};
+  int color_pages{0};           // Operator-filled: count of color pages (0 = not filled)
+  int mono_pages{0};            // B&W pages = total_pages - color_pages
+  double color_subtotal{0.0};   // Color portion subtotal
+  double mono_subtotal{0.0};    // B&W portion subtotal
   bool price_pending{false};     // Requires operator to manually enter a price
-  std::string pending_reason;    // "color" | "unmatched_rule" | "no_simplex_rule_for_tail" | ...
+  std::string pending_reason;    // "awaiting_color_pages" | "unmatched_rule" | "no_simplex_rule_for_tail" | ...
   bool color_downgraded{false};  // True if color job on B&W printer → charged as monochrome
   std::string note;              // Human-readable note (e.g. "color_on_bw_printer")
 };

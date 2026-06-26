@@ -253,6 +253,16 @@ void WatcherBridge::setStallTimeout(std::chrono::seconds timeout) noexcept
   stallTimeout_ = timeout;
 }
 
+void WatcherBridge::setRescanInterval(std::chrono::seconds interval) noexcept
+{
+  rescanInterval_ = interval;
+}
+
+void WatcherBridge::setPollTimeout(std::chrono::milliseconds timeout) noexcept
+{
+  pollTimeout_ = timeout;
+}
+
 void WatcherBridge::startWatching(const QString& outputDir)
 {
   if (running_) return;
@@ -635,8 +645,9 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
     watcher::PrintWatcher watcher(
       watcher::WatcherConfig{
         .printer_name = printerName,
-        .wait_timeout = std::chrono::milliseconds{250},
+        .wait_timeout = pollTimeout_,
         .stall_timeout = stallTimeout_,
+        .rescan_interval = rescanInterval_,
         .log_callback = std::move(log_callback),
       },
       std::move(jobCallback),

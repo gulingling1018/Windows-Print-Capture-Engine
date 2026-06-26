@@ -422,7 +422,6 @@ AppConfig AppConfig::defaults()
 
   // Storage defaults
   config.storage.output_root = "./data";
-  config.storage.use_timestamp_subdir = true;
   config.storage.queue_capacity = 256;
   config.storage.retention_days = 90;
 
@@ -434,12 +433,13 @@ AppConfig AppConfig::defaults()
   config.pricing.rules.clear();
 
   auto addRule = [&](std::string id, std::string paper, std::string duplex,
-                     std::string color, std::string ext, double price)
+                     std::string printer, std::string color, std::string ext, double price)
   {
     core::PricingRule r;
     r.rule_id = std::move(id);
     r.paper_size = paper;
     r.duplex_mode = duplex;
+    r.printer_name = printer;
     r.color_mode = color;
     r.file_extension = ext;
     r.price_per_sheet = price;
@@ -457,6 +457,15 @@ AppConfig AppConfig::defaults()
       if (!cur.empty()) r.paper_size_set.push_back(cur);
     }
     {
+      std::string cur;
+      for (char c : printer)
+      {
+        if (c == '|') { if (!cur.empty()) { r.printer_name_set.push_back(cur); cur.clear(); } }
+        else cur += c;
+      }
+      if (!cur.empty()) r.printer_name_set.push_back(cur);
+    }
+    {
       std::string lower;
       lower.reserve(ext.size());
       for (char c : ext) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
@@ -472,14 +481,18 @@ AppConfig AppConfig::defaults()
     config.pricing.rules.push_back(std::move(r));
   };
 
-  // The 6 factory default rules per project spec.
-  // paper|duplex|color|filetype|price  (empty ext = all file types)
-  addRule("default-1", "A4|B5", "simplex", "monochrome", "",      0.15);
-  addRule("default-2", "A4|B5", "duplex",  "monochrome", "",      0.25);
-  addRule("default-3", "A3",    "simplex", "monochrome", "",      0.50);
-  addRule("default-4", "A3",    "duplex",  "monochrome", "",      1.00);
-  addRule("default-5", "A3",    "simplex", "monochrome", "dwg",   1.00);
-  addRule("default-6", "A4|B5", "simplex", "monochrome", "dwg",   0.50);
+  // Factory default rules: {paper, duplex, printer, color, filetype | price}
+  // Monochrome rules (base pricing for B&W jobs).
+  addRule("default-1", "A4|B5", "simplex", "", "monochrome", "",    0.15);
+  addRule("default-2", "A4|B5", "duplex",  "", "monochrome", "",    0.25);
+  addRule("default-3", "A3",    "simplex", "", "monochrome", "",    0.50);
+  addRule("default-4", "A3",    "duplex",  "", "monochrome", "",    1.00);
+  addRule("default-5", "A3",    "simplex", "", "monochrome", "dwg", 1.00);
+  addRule("default-6", "A4|B5", "simplex", "", "monochrome", "dwg", 0.50);
+  // Color rules (higher rate for color pages).
+  addRule("default-7", "A4|B5", "simplex", "", "color",      "",    1.00);
+  addRule("default-8", "A4|B5", "duplex",  "", "color",      "",    2.00);
+  addRule("default-9", "A3",    "simplex", "", "color",      "",    2.00);
 
   sort_rules_by_priority(config.pricing.rules);
 
@@ -494,11 +507,19 @@ AppConfig AppConfig::defaults()
 
   // Monitoring defaults
   config.monitoring.stall_timeout_seconds = 30;
+  config.monitoring.rescan_interval_seconds = 5;
+  config.monitoring.poll_timeout_ms = 250;
   config.monitoring.perf_log_enabled = false;
 
   // Window defaults
   config.window.width = 1280;
   config.window.height = 760;
+
+  config.window.settings_width = 560;
+  config.window.settings_height = 480;
+
+  config.window.quick_settle_width = 560;
+  config.window.quick_settle_height = 360;
 
   return config;
 }
@@ -569,8 +590,6 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
       w.begin_object();
       w.key("output_root");
       w.write_string(storage.output_root);
-      w.key("use_timestamp_subdir");
-      w.write_bool(storage.use_timestamp_subdir);
       w.key("queue_capacity");
       w.write_uint(storage.queue_capacity);
       w.key("retention_days");
@@ -596,6 +615,8 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
         w.write_string(rule.paper_size);
         w.key("duplex_mode");
         w.write_string(rule.duplex_mode);
+        w.key("printer_name");
+        w.write_string(rule.printer_name);
         w.key("color_mode");
         w.write_string(rule.color_mode);
         w.key("file_extension");
@@ -607,6 +628,11 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
         w.key("paper_size_set");
         w.begin_array();
         for (const auto& s : rule.paper_size_set) w.write_string(s);
+        w.end_array();
+
+        w.key("printer_name_set");
+        w.begin_array();
+        for (const auto& s : rule.printer_name_set) w.write_string(s);
         w.end_array();
 
         w.key("file_extension_set");
@@ -633,6 +659,10 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
         w.write_string(p.printer_name);
         w.key("is_color_capable");
         w.write_bool(p.is_color_capable);
+        w.key("paper_sizes");
+        w.begin_array();
+        for (const auto& ps : p.supported_paper_sizes) w.write_string(ps);
+        w.end_array();
         w.end_object();
       }
       w.end_array();
@@ -654,6 +684,10 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
       w.begin_object();
       w.key("stall_timeout_seconds");
       w.write_int(monitoring.stall_timeout_seconds);
+      w.key("rescan_interval_seconds");
+      w.write_int(monitoring.rescan_interval_seconds);
+      w.key("poll_timeout_ms");
+      w.write_int(monitoring.poll_timeout_ms);
       w.key("perf_log_enabled");
       w.write_bool(monitoring.perf_log_enabled);
       w.end_object();
@@ -665,6 +699,18 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
       w.write_int(window.width);
       w.key("height");
       w.write_int(window.height);
+      w.key("settings_width");
+      w.write_int(window.settings_width);
+      w.key("settings_height");
+      w.write_int(window.settings_height);
+      w.key("quick_settle_width");
+      w.write_int(window.quick_settle_width);
+      w.key("quick_settle_height");
+      w.write_int(window.quick_settle_height);
+      w.key("quick_settle_collapsed_height");
+      w.write_int(window.quick_settle_collapsed_height);
+      w.key("quick_settle_collapsed");
+      w.write_bool(window.quick_settle_collapsed);
       w.end_object();
 
       w.end_object();
@@ -715,7 +761,6 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
         {
           const std::string sk = r.read_key();
           if (sk == "output_root")            storage.output_root = r.read_string();
-          else if (sk == "use_timestamp_subdir") storage.use_timestamp_subdir = r.read_bool();
           else if (sk == "queue_capacity")    storage.queue_capacity = static_cast<std::size_t>(r.read_int());
           else if (sk == "retention_days")    storage.retention_days = r.read_int();
           else (void)r.read_string(); // skip unknown
@@ -759,12 +804,19 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
                 else if (rk == "paper_size")      rule.paper_size = r.read_string();
                 else if (rk == "duplex_mode")     rule.duplex_mode = r.read_string();
                 else if (rk == "color_mode")      rule.color_mode = r.read_string();
+                else if (rk == "printer_name")    rule.printer_name = r.read_string();
                 else if (rk == "file_extension")  rule.file_extension = r.read_string();
-                else if (rk == "price_per_sheet") rule.price_per_sheet = r.read_number();
+                else if (rk == "price_per_sheet")       rule.price_per_sheet = r.read_number();
+                else if (rk == "color_price_per_sheet") (void)r.read_number(); // legacy, ignored
                 else if (rk == "paper_size_set")
                 {
                   r.begin_array();
                   while (r.end_array_or_next()) rule.paper_size_set.push_back(r.read_string());
+                }
+                else if (rk == "printer_name_set")
+                {
+                  r.begin_array();
+                  while (r.end_array_or_next()) rule.printer_name_set.push_back(r.read_string());
                 }
                 else if (rk == "file_extension_set")
                 {
@@ -777,8 +829,14 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
               // set was missing (e.g. older config files).
               if (rule.paper_size_set.empty() && !rule.paper_size.empty())
                 rule.paper_size_set = split_pipe_lower(rule.paper_size);
+              if (rule.printer_name_set.empty() && !rule.printer_name.empty())
+                rule.printer_name_set = split_pipe_lower(rule.printer_name);
               if (rule.file_extension_set.empty() && !rule.file_extension.empty())
                 rule.file_extension_set = split_pipe_lower(rule.file_extension);
+              // Migrate: old configs stored empty color_mode as wildcard;
+              // non-color rules should explicitly match monochrome only.
+              if (rule.color_mode.empty())
+                rule.color_mode = "monochrome";
               rule.priority = rule_specificity(rule);
               pricing.rules.push_back(std::move(rule));
             }
@@ -807,6 +865,11 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
                 const std::string ppk = r.read_key();
                 if (ppk == "printer_name")        profile.printer_name = r.read_string();
                 else if (ppk == "is_color_capable") profile.is_color_capable = r.read_bool();
+                else if (ppk == "paper_sizes")
+                {
+                  r.begin_array();
+                  while (r.end_array_or_next()) profile.supported_paper_sizes.push_back(r.read_string());
+                }
                 else (void)r.read_string();
               }
               printers.profiles.push_back(std::move(profile));
@@ -834,6 +897,8 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
         {
           const std::string mk = r.read_key();
           if (mk == "stall_timeout_seconds") monitoring.stall_timeout_seconds = r.read_int();
+          else if (mk == "rescan_interval_seconds") monitoring.rescan_interval_seconds = r.read_int();
+          else if (mk == "poll_timeout_ms") monitoring.poll_timeout_ms = r.read_int();
           else if (mk == "perf_log_enabled") monitoring.perf_log_enabled = r.read_bool();
           else (void)r.read_string();
         }
@@ -846,6 +911,12 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
           const std::string wk = r.read_key();
           if (wk == "width")       window.width = r.read_int();
           else if (wk == "height") window.height = r.read_int();
+          else if (wk == "settings_width")       window.settings_width = r.read_int();
+          else if (wk == "settings_height")      window.settings_height = r.read_int();
+          else if (wk == "quick_settle_width")            window.quick_settle_width = r.read_int();
+          else if (wk == "quick_settle_height")           window.quick_settle_height = r.read_int();
+          else if (wk == "quick_settle_collapsed_height") window.quick_settle_collapsed_height = r.read_int();
+          else if (wk == "quick_settle_collapsed")        window.quick_settle_collapsed = r.read_bool();
           else (void)r.read_string();
         }
       }

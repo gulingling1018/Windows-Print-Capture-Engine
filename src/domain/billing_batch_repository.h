@@ -17,6 +17,7 @@
 #include <filesystem>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 namespace wpce::domain
@@ -35,10 +36,20 @@ class BillingBatchRepository
   bool load(std::vector<BillingBatch>& out);
   bool load(std::vector<BillingBatch>& out, std::string& saved_date);
 
+  /// Load batches plus per-batch job records (restores full registry).
+  bool load(std::vector<BillingBatch>& out,
+            std::unordered_map<std::uint32_t, PrintJobRecord>& jobs,
+            std::string& saved_date);
+
   /// Save all batches to the file (atomic).
   /// Records today's date (YYYY-MM-DD) for cross-day detection.
   bool save(const std::vector<BillingBatch>& batches) const;
   bool save(const std::vector<BillingBatch>& batches,
+            const std::string& date_yyyy_mm_dd) const;
+
+  /// Save batches plus per-batch job records (full registry persistence).
+  bool save(const std::vector<BillingBatch>& batches,
+            const std::unordered_map<std::uint32_t, PrintJobRecord>& jobs,
             const std::string& date_yyyy_mm_dd) const;
 
  private:

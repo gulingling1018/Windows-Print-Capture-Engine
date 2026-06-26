@@ -319,6 +319,8 @@ std::string to_json(const core::PricingRule& rule)
   output << ",\n  ";
   append_json_property(output, "duplex_mode", rule.duplex_mode);
   output << ",\n  ";
+  append_json_property(output, "printer_name", rule.printer_name);
+  output << ",\n  ";
   append_json_property(output, "color_mode", rule.color_mode);
   output << ",\n  ";
   append_json_property(output, "file_extension", rule.file_extension);
@@ -350,6 +352,14 @@ std::string to_json(const core::JobPricingEntry& entry)
   output << ",\n  ";
   append_json_property(output, "base_price", entry.base_price);
   output << ",\n  ";
+  append_json_property(output, "color_pages", entry.color_pages);
+  output << ",\n  ";
+  append_json_property(output, "mono_pages", entry.mono_pages);
+  output << ",\n  ";
+  append_json_property(output, "color_subtotal", entry.color_subtotal);
+  output << ",\n  ";
+  append_json_property(output, "mono_subtotal", entry.mono_subtotal);
+  output << ",\n  ";
   append_json_property(output, "total_price", entry.total_price);
   output << ",\n  ";
   output << "\"price_pending\": " << (entry.price_pending ? "true" : "false");
@@ -380,6 +390,14 @@ void append_json_pricing_entry(std::ostream& output, const core::JobPricingEntry
   append_json_property(output, "matched_rule_id", entry.matched_rule_id);
   output << ",\n      ";
   append_json_property(output, "base_price", entry.base_price);
+  output << ",\n      ";
+  append_json_property(output, "color_pages", entry.color_pages);
+  output << ",\n      ";
+  append_json_property(output, "mono_pages", entry.mono_pages);
+  output << ",\n      ";
+  append_json_property(output, "color_subtotal", entry.color_subtotal);
+  output << ",\n      ";
+  append_json_property(output, "mono_subtotal", entry.mono_subtotal);
   output << ",\n      ";
   append_json_property(output, "total_price", entry.total_price);
   output << ",\n      ";

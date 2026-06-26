@@ -198,7 +198,7 @@ core::SettlementOrder SettlementBridge::createSettlementOrder(
     const std::string& settled_by)
 {
   core::SettlementOrder order;
-  order.schema_version = 1;
+  order.schema_version = 2;
   order.order_id = order_id;
   order.task_id = task_id;
   order.user_id = user_id;

@@ -95,10 +95,9 @@ class BillingBatchModel : public QAbstractItemModel
   [[nodiscard]] const domain::BillingBatch* batchAt(const QModelIndex& index) const;
   [[nodiscard]] const domain::PrintJobRecord* jobAt(const QModelIndex& index) const;
 
-  /// Index of the current active batch in the model's row order.
-  [[nodiscard]] int currentActiveRow() const;
-
-  /// Index of the next batch to switch to (Suspended first, then Active).
+  /// Index of the next/previous non-settled batch (Active + Suspended).
+  /// Returns -1 when no such batch exists in the search direction
+  /// (non-cyclic — stops at the list boundary).
   [[nodiscard]] int nextRelevantRow(int fromRow) const;
   [[nodiscard]] int prevRelevantRow(int fromRow) const;
 

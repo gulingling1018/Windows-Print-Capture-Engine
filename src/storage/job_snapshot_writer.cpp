@@ -158,9 +158,22 @@ bool AsyncJobSnapshotWriter::enqueue(core::JobSnapshot job, core::MetadataSnapsh
 {
   {
     std::scoped_lock lock(queue_mutex_);
-    if (!running_ || stop_requested_ || queue_.size() >= config_.queue_capacity)
+    if (!running_ || stop_requested_)
     {
       return false;
+    }
+    if (queue_.size() >= config_.queue_capacity)
+    {
+      (void)fprintf(stderr,
+                    "[WPCE] JobSnapshotWriter queue FULL (%zu/%zu), dropping snapshot\n",
+                    queue_.size(), config_.queue_capacity);
+      return false;
+    }
+    if (queue_.size() >= config_.queue_capacity * 8 / 10)
+    {
+      (void)fprintf(stderr,
+                    "[WPCE] JobSnapshotWriter queue high-water (%zu/%zu)\n",
+                    queue_.size(), config_.queue_capacity);
     }
 
     queue_.push_back(SnapshotPair{std::move(job), std::move(metadata)});

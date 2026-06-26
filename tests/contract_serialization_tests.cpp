@@ -304,35 +304,6 @@ TEST(Watcher, PreservesTransientUnknownForNonTerminalPhases)
   EXPECT_FALSE(should_preserve_transient_unknown_status(Phase::Cancelled, true));
 }
 
-TEST(AppConfig, SavesAndLoadsVolumeDiscounts)
-{
-  const auto dir = make_test_directory("app-config");
-  const auto path = dir / "wpce_config.json";
-  std::filesystem::create_directories(dir);
-
-  auto config = wpce::common::AppConfig::defaults();
-  ASSERT_TRUE(config.save_to_json(path));
-
-  const std::string json = read_file(path);
-  expect_contains(json, "\"volume_discounts\":[");
-  expect_contains(json, "{\"min_pages\":100,\"discount\":0.95},{\"min_pages\":500");
-
-  auto loaded = wpce::common::AppConfig::defaults();
-  loaded.pricing.volume_discounts.clear();
-  ASSERT_TRUE(loaded.load_from_json(path));
-
-  ASSERT_EQ(3u, loaded.pricing.volume_discounts.size());
-  EXPECT_EQ(100, loaded.pricing.volume_discounts.at(0).min_pages);
-  EXPECT_DOUBLE_EQ(0.95, loaded.pricing.volume_discounts.at(0).discount);
-  EXPECT_EQ(500, loaded.pricing.volume_discounts.at(1).min_pages);
-  EXPECT_DOUBLE_EQ(0.90, loaded.pricing.volume_discounts.at(1).discount);
-  EXPECT_EQ(1000, loaded.pricing.volume_discounts.at(2).min_pages);
-  EXPECT_DOUBLE_EQ(0.85, loaded.pricing.volume_discounts.at(2).discount);
-
-  std::error_code ignored;
-  std::filesystem::remove_all(dir, ignored);
-}
-
 // ── Storage tests ────────────────────────────────────────────────────────
 
 TEST(Storage, AtomicJobSnapshotWriter)

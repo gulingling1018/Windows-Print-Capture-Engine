@@ -318,7 +318,7 @@ std::string to_utf8_buffer(const void* value, const DWORD size_bytes)
   return to_utf8(bounded.c_str());
 }
 
-std::string format_system_time_utc(const SYSTEMTIME& submitted)
+std::string format_system_time_iso(const SYSTEMTIME& submitted)
 {
   if (submitted.wYear == 0)
   {
@@ -328,7 +328,7 @@ std::string format_system_time_utc(const SYSTEMTIME& submitted)
   std::ostringstream output;
   output << std::setfill('0') << std::setw(4) << submitted.wYear << '-' << std::setw(2) << submitted.wMonth << '-'
          << std::setw(2) << submitted.wDay << 'T' << std::setw(2) << submitted.wHour << ':' << std::setw(2)
-         << submitted.wMinute << ':' << std::setw(2) << submitted.wSecond << 'Z';
+         << submitted.wMinute << ':' << std::setw(2) << submitted.wSecond;
   return output.str();
 }
 
@@ -340,7 +340,7 @@ core::JobSnapshot to_snapshot(const JOB_INFO_2W& job)
     .user = to_utf8(job.pUserName),
     .document_name = to_utf8(job.pDocument),
     .printer_name = to_utf8(job.pPrinterName),
-    .submit_time_utc = format_system_time_utc(job.Submitted),
+    .submit_time_utc = format_system_time_iso(job.Submitted),
     .status = describe_job_status(job.Status),
     .raw_status_flags = job.Status,
     .source = "winspool",
@@ -453,7 +453,7 @@ void apply_job_notification_field(JobNotificationSnapshot& snapshot, const PRINT
       if (data.NotifyData.Data.pBuf != nullptr && data.NotifyData.Data.cbBuf >= sizeof(SYSTEMTIME))
       {
         const auto* submitted = static_cast<const SYSTEMTIME*>(data.NotifyData.Data.pBuf);
-        snapshot.submit_time_utc = format_system_time_utc(*submitted);
+        snapshot.submit_time_utc = format_system_time_iso(*submitted);
       }
       break;
     case JOB_NOTIFY_FIELD_TOTAL_PAGES:
@@ -767,12 +767,22 @@ std::vector<JobSnapshotWithMetadata> enumerate_printer_jobs(const std::wstring& 
     throw std::runtime_error(format_win32_error("EnumJobsW", probe_error));
   }
 
+  // Guard against corrupt/extreme spooler responses before allocating.
+  // Soft failure: return empty instead of throw — the periodic rescan will
+  // retry on the next cycle without killing the watcher thread.
+  constexpr DWORD kMaxEnumJobsBuffer = 128 * 1024 * 1024;  // 128 MB
+  if (bytes_needed > kMaxEnumJobsBuffer)
+  {
+    return {};
+  }
+
   // Add headroom — the spooler may add jobs between probe and fetch during
   // high-concurrency scenarios (e.g. simulator stress tests).
-  std::vector<BYTE> buffer(bytes_needed + (sizeof(JOB_INFO_2W) * 64));
+  const DWORD alloc_size = bytes_needed + static_cast<DWORD>(sizeof(JOB_INFO_2W) * 64);
+  std::vector<BYTE> buffer(alloc_size);
   DWORD buffer_size = static_cast<DWORD>(buffer.size());
 
-  for (int attempt = 0; attempt < 2; ++attempt)
+  for (int attempt = 0; attempt < 4; ++attempt)
   {
     if (EnumJobsW(
           printer.get(),
@@ -788,15 +798,19 @@ std::vector<JobSnapshotWithMetadata> enumerate_printer_jobs(const std::wstring& 
     }
 
     const DWORD err = GetLastError();
-    if (err == ERROR_INSUFFICIENT_BUFFER && attempt == 0)
+    if (err == ERROR_INSUFFICIENT_BUFFER && attempt < 3)
     {
-      // Retry once with the new size reported by the failed call.
+      if (bytes_needed > kMaxEnumJobsBuffer)
+      {
+        return {};
+      }
       buffer.resize(bytes_needed + (sizeof(JOB_INFO_2W) * 64));
       buffer_size = static_cast<DWORD>(buffer.size());
       continue;
     }
 
-    throw std::runtime_error(format_win32_error("EnumJobsW", err));
+    // Soft failure: return empty rather than kill the watcher thread.
+    return {};
   }
 
   const auto* jobs = reinterpret_cast<const JOB_INFO_2W*>(buffer.data());
@@ -967,6 +981,7 @@ void PrintWatcher::run()
                                          const std::string& document_name,
                                          const std::string& printer_name,
                                          const std::string& submit_time_utc) -> InternalJobState& {
+    std::scoped_lock lk(summaries_mutex_);
     auto& state = job_states_[job_id];
     if (state.summary.job_id == 0)
     {
@@ -1345,9 +1360,14 @@ void PrintWatcher::run()
         const auto now = std::chrono::steady_clock::now();
         if (now - last_rescan > config_.rescan_interval)
         {
+          const core::PerfSample perf = perf_monitor_.sample();
           log(LogLevel::Info, "rescan",
               "Periodic rescan triggered (interval=" +
-              std::to_string(config_.rescan_interval.count()) + "s)");
+              std::to_string(config_.rescan_interval.count()) + "s)"
+              " | mem=" + std::to_string(perf.working_set_bytes / 1024 / 1024) + "MB"
+              " | q_snap=" + std::to_string(perf.snapshot_writer_queue_depth) +
+              " q_page=" + std::to_string(perf.page_writer_queue_depth) +
+              " jobs_tracked=" + std::to_string(job_states_.size()));
           emit_changed_jobs();
           last_rescan = now;
         }
@@ -1363,12 +1383,17 @@ void PrintWatcher::run()
       }
       if (wait_result != WAIT_OBJECT_0)
       {
-        throw std::runtime_error(format_win32_error("WaitForSingleObject", GetLastError()));
+        log(LogLevel::Error, "notify",
+            "WaitForSingleObject failed: " + format_win32_error("WaitForSingleObject", GetLastError()));
+        std::this_thread::sleep_for(std::chrono::seconds{1});
+        continue;
       }
 
       perf_monitor_.set_last_notification_time(std::chrono::steady_clock::now());
       const auto processing_start = std::chrono::steady_clock::now();
 
+      try
+      {
       DWORD change_flags = 0;
       PPRINTER_NOTIFY_INFO raw_info = nullptr;
       if (!FindNextPrinterChangeNotification(
@@ -1377,7 +1402,11 @@ void PrintWatcher::run()
             nullptr,
             reinterpret_cast<LPVOID*>(&raw_info)))
       {
-        throw_last_error("FindNextPrinterChangeNotification");
+        log(LogLevel::Warn, "notify",
+            "FindNextPrinterChangeNotification failed: " +
+            format_win32_error("FindNextPrinterChangeNotification", GetLastError()));
+        std::this_thread::sleep_for(std::chrono::milliseconds{200});
+        continue;
       }
 
       NotifyInfoHandle info(raw_info);
@@ -1475,8 +1504,12 @@ void PrintWatcher::run()
               &refresh_options,
               reinterpret_cast<LPVOID*>(&refresh_raw_info)))
         {
-          throw_last_error("FindNextPrinterChangeNotification refresh");
+          log(LogLevel::Warn, "notify",
+              "DISCARDED refresh failed: " +
+              format_win32_error("FindNextPrinterChangeNotification refresh", GetLastError()));
         }
+        else
+        {
         NotifyInfoHandle refresh_info(refresh_raw_info);
         const std::vector<JobNotificationSnapshot> refresh_notifications =
           parse_job_notifications(refresh_info.get(), change_flags);
@@ -1512,6 +1545,7 @@ void PrintWatcher::run()
             emit_snapshot(stub_job, std::move(refresh_meta));
           }
         }
+        }  // else (refresh succeeded)
       }
 
       if (has_job_change_flags(change_flags))
@@ -1532,6 +1566,40 @@ void PrintWatcher::run()
       const double processing_ms =
         std::chrono::duration<double, std::milli>(processing_end - processing_start).count();
       perf_monitor_.set_last_event_processing_ms(processing_ms);
+
+      // Periodic cleanup of terminal job states to bound memory growth.
+      {
+        std::scoped_lock lk(summaries_mutex_);
+        if (job_states_.size() > 256)
+        {
+          const auto cutoff = now - std::chrono::minutes{10};
+          for (auto it = job_states_.begin(); it != job_states_.end(); )
+          {
+            if (is_terminal_phase(it->second.current_phase) &&
+                it->second.last_event_time < cutoff)
+            {
+              it = job_states_.erase(it);
+            }
+            else
+            {
+              ++it;
+            }
+          }
+        }
+      }
+
+      }  // try (per-iteration)
+      catch (const std::exception& iter_error)
+      {
+        log(LogLevel::Error, "loop",
+            "Per-iteration error (continuing): " + std::string(iter_error.what()));
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+      }
+      catch (...)
+      {
+        log(LogLevel::Error, "loop", "Unknown per-iteration error (continuing)");
+        std::this_thread::sleep_for(std::chrono::milliseconds{500});
+      }
     }
 #else
     throw std::runtime_error("Win32 print watching is only supported on Windows");
@@ -1543,7 +1611,7 @@ void PrintWatcher::run()
     if (config_.log_callback)
     {
       config_.log_callback(LogLevel::Error, "init",
-        "Watcher error: " + std::string(error.what()));
+        "Watcher fatal error: " + std::string(error.what()));
     }
   }
   catch (...)

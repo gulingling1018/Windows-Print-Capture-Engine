@@ -22,15 +22,22 @@ namespace
 common::PricingConfig make_test_pricing_config()
 {
   common::PricingConfig config;
-  config.single_sided_per_page = 0.15;
-  config.double_sided_per_sheet = 0.25;
-  config.color_surcharge = 0.50;
   config.currency = "CNY";
   config.color_price_pending = true;
-  config.rules = {
-    {"r1", "A4", "simplex", "monochrome", "", 0.15, 0},
-    {"r2", "", "duplex", "", "", 0.25, 0},
-  };
+
+  core::PricingRule r1;
+  r1.rule_id = "r1"; r1.paper_size = "A4"; r1.duplex_mode = "simplex";
+  r1.printer_name = ""; r1.color_mode = "monochrome"; r1.file_extension = "";
+  r1.price_per_sheet = 0.15;
+  r1.priority = common::rule_specificity(r1);
+
+  core::PricingRule r2;
+  r2.rule_id = "r2"; r2.paper_size = ""; r2.duplex_mode = "duplex";
+  r2.printer_name = ""; r2.color_mode = ""; r2.file_extension = "";
+  r2.price_per_sheet = 0.25;
+  r2.priority = common::rule_specificity(r2);
+
+  config.rules = {r1, r2};
   common::sort_rules_by_priority(config.rules);
   return config;
 }
@@ -65,9 +72,8 @@ TEST(SettlementBridge, SnapshotPricingConfig_ProducesValidJson)
 
   EXPECT_FALSE(json.empty());
   EXPECT_NE(json, "{}");
-  // Should contain key fields.
   EXPECT_NE(json.find("pricing"), std::string::npos);
-  EXPECT_NE(json.find("single_sided_per_page"), std::string::npos);
+  EXPECT_NE(json.find("rules"), std::string::npos);
 }
 
 // ── createSettlementOrder ──────────────────────────────────────────────────

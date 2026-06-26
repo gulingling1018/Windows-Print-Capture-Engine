@@ -260,6 +260,9 @@ HRESULT STDMETHODCALLTYPE XpsCaptureFilter::StartOperation()
       break;
     }
 
+    try
+    {
+
     // ── Try to extract PrintTicket from known XPS part types ────────────
 
     // IFixedDocumentSequence → Job-level PrintTicket
@@ -446,7 +449,20 @@ HRESULT STDMETHODCALLTYPE XpsCaptureFilter::StartOperation()
       }
     }
 
-    part->Release();
+      part->Release();
+    }
+    catch (const std::bad_alloc&)
+    {
+      ::OutputDebugStringA("[WPCE] StartOperation: OOM processing XPS part, skipping part\n");
+      if (part) { part->Release(); }
+    }
+    catch (const std::exception& ex)
+    {
+      char dbg[256];
+      std::snprintf(dbg, sizeof(dbg), "[WPCE] StartOperation: exception: %s\n", ex.what());
+      ::OutputDebugStringA(dbg);
+      if (part) { part->Release(); }
+    }
   }
 
   // ── Persist captured artifacts (synchronous, after pipeline loop) ──────

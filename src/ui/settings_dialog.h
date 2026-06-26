@@ -58,7 +58,6 @@ class SettingsDialog : public QDialog
   // ── Storage tab ──
   QLineEdit* outputRoot_ = nullptr;
   QPushButton* browseOutputBtn_ = nullptr;
-  QCheckBox* useTimestampSubdir_ = nullptr;
   QSpinBox* queueCapacity_ = nullptr;
   QSpinBox* retentionDays_ = nullptr;
   QSpinBox* stallTimeout_ = nullptr;

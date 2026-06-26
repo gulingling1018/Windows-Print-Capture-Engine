@@ -1,5 +1,10 @@
 #include <winver.h>
 
+// ── Icon ─────────────────────────────────────────────────────────────────────
+
+#define IDI_ICON1 1
+IDI_ICON1 ICON "wpce_icon.ico"
+
 // ── Version ─────────────────────────────────────────────────────────────────
 
 VS_VERSION_INFO VERSIONINFO

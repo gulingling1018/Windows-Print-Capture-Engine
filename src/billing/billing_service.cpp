@@ -50,6 +50,12 @@ BillingService::BillingService(QObject* parent)
   saveTimer_.setSingleShot(true);
   saveTimer_.setInterval(1500);
   connect(&saveTimer_, &QTimer::timeout, this, &BillingService::flushSave);
+
+  // Periodic safety flush every 30s to guard against crash data loss.
+  periodicSaveTimer_.setInterval(30000);
+  periodicSaveTimer_.setSingleShot(false);
+  connect(&periodicSaveTimer_, &QTimer::timeout, this, &BillingService::flushSave);
+  periodicSaveTimer_.start();
 }
 
 BillingService::~BillingService()
@@ -88,8 +94,9 @@ void BillingService::setPrinterProfiles(const wpce::common::PrinterProfileConfig
 void BillingService::load()
 {
   std::vector<domain::BillingBatch> loaded;
+  std::unordered_map<std::uint32_t, domain::PrintJobRecord> loadedJobs;
   std::string savedDate;
-  if (repository_.load(loaded, savedDate))
+  if (repository_.load(loaded, loadedJobs, savedDate))
   {
     const std::string today = todayDateString();
 
@@ -99,13 +106,22 @@ void BillingService::load()
     {
       // Remove already-settled batches from the loaded set (they belong
       // to yesterday's history and should already be persisted there).
+      // Also remove those batches' jobs from the registry.
       loaded.erase(
         std::remove_if(loaded.begin(), loaded.end(),
-                       [](const domain::BillingBatch& b) { return b.is_settled(); }),
+                       [&loadedJobs](const domain::BillingBatch& b) {
+                         if (b.is_settled())
+                         {
+                           for (auto jid : b.job_ids) loadedJobs.erase(jid);
+                           return true;
+                         }
+                         return false;
+                       }),
         loaded.end());
     }
 
     batches_ = std::move(loaded);
+    jobRegistry_ = std::move(loadedJobs);
     batchIndex_.clear();
     for (std::size_t i = 0; i < batches_.size(); ++i)
       batchIndex_[batches_[i].batch_id] = i;
@@ -123,6 +139,15 @@ void BillingService::load()
       }
     }
     currentActiveBatchId_ = mostRecentActive;
+
+    // If we loaded legacy-format data (batches exist but job records don't),
+    // mark dirty so flushSave() upgrades the file to schema_v3 + jobs array.
+    if (!batches_.empty() && jobRegistry_.empty())
+    {
+      dirty_ = true;
+      scheduleSave();
+    }
+
     emit batchesChanged();
   }
 }
@@ -131,7 +156,20 @@ void BillingService::flushSave()
 {
   if (!dirty_) return;
   dirty_ = false;
-  (void)repository_.save(batches_, todayDateString());
+
+  // Only persist jobs that belong to a known batch (excludes unassigned jobs).
+  std::unordered_map<std::uint32_t, domain::PrintJobRecord> batchJobs;
+  for (const auto& batch : batches_)
+  {
+    for (auto jid : batch.job_ids)
+    {
+      auto it = jobRegistry_.find(jid);
+      if (it != jobRegistry_.end())
+        batchJobs[jid] = it->second;
+    }
+  }
+
+  (void)repository_.save(batches_, batchJobs, todayDateString());
 }
 
 void BillingService::clear()
@@ -418,10 +456,11 @@ void BillingService::onMetadata(core::MetadataSnapshot metadata)
   it->second.metadata = std::move(metadata);
   it->second.last_updated_utc = utcNowIso8601();
 
-  // Recompute pricing.
+  // Recompute pricing — preserve operator-set color_pages.
+  const int existing_color_pages = it->second.pricing.color_pages;
   const wpce::common::PricingConfig& pc = pricingConfig_ ? *pricingConfig_ : defaultPricing_;
   const wpce::common::PrinterProfileConfig& pp = printerProfiles_ ? *printerProfiles_ : defaultPrinters_;
-  it->second.pricing = wpce::common::compute_job_pricing(it->second.metadata, pc, pp);
+  it->second.pricing = wpce::common::compute_job_pricing(it->second.metadata, pc, pp, existing_color_pages);
 
   // Recompute the owning batch's totals.
   for (auto& batch : batches_)
@@ -454,10 +493,11 @@ void BillingService::onLifecycleEvent(core::JobLifecycleEvent event)
   it->second.metadata.pages_printed =
     core::FieldValue{std::to_string(event.pages_printed), core::FieldState::Reported};
 
-  // Recompute pricing in case page count changed.
+  // Recompute pricing in case page count changed — preserve operator-set color_pages.
+  const int existing_color_pages = it->second.pricing.color_pages;
   const wpce::common::PricingConfig& pc = pricingConfig_ ? *pricingConfig_ : defaultPricing_;
   const wpce::common::PrinterProfileConfig& pp = printerProfiles_ ? *printerProfiles_ : defaultPrinters_;
-  it->second.pricing = wpce::common::compute_job_pricing(it->second.metadata, pc, pp);
+  it->second.pricing = wpce::common::compute_job_pricing(it->second.metadata, pc, pp, existing_color_pages);
 
   for (auto& batch : batches_)
   {
@@ -724,6 +764,39 @@ bool BillingService::moveJobToBatch(const QString& srcBatchId, std::uint32_t job
   emit batchUpdated(srcBatchId);
   emit batchUpdated(dstBatchId);
   return true;
+}
+
+void BillingService::setColorPages(std::uint32_t jobId, int colorPages)
+{
+  auto it = jobRegistry_.find(jobId);
+  if (it == jobRegistry_.end()) return;
+
+  if (colorPages < 0) colorPages = 0;
+
+  // Clamp to total_pages (color pages can't exceed total pages).
+  const int totalPages = common::parse_total_pages(it->second.metadata);
+  if (colorPages > totalPages) colorPages = totalPages;
+
+  it->second.pricing.color_pages = colorPages;
+
+  // Recompute pricing with the new color_pages value.
+  const common::PricingConfig& pc = pricingConfig_ ? *pricingConfig_ : defaultPricing_;
+  const common::PrinterProfileConfig& pp = printerProfiles_ ? *printerProfiles_ : defaultPrinters_;
+  it->second.pricing = common::compute_job_pricing(it->second.metadata, pc, pp, colorPages);
+  it->second.last_updated_utc = utcNowIso8601();
+
+  // Find the owning batch and recompute its totals.
+  for (auto& batch : batches_)
+  {
+    auto jidIt = std::find(batch.job_ids.begin(), batch.job_ids.end(), jobId);
+    if (jidIt != batch.job_ids.end())
+    {
+      recomputeBatchTotals(batch);
+      emit batchUpdated(QString::fromStdString(batch.batch_id));
+      scheduleSave();
+      return;
+    }
+  }
 }
 
 bool BillingService::deleteJob(std::uint32_t jobId)

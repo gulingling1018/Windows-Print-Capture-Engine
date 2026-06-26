@@ -1,5 +1,38 @@
 # WPCE Development Archive
 
+## 2026-06-25: Billing Matrix Color Fallback, Single-Page Duplex Pricing, Quick Settle Idle Recenter
+
+### Context
+
+- Some printer drivers report the color parameter as `"-"` instead of `color`/`monochrome`, causing color-specific or monochrome-specific matrix rules to miss unless the rule used the wildcard "all" color dimension.
+- A one-page document submitted with duplex enabled matched the duplex pricing rule and was charged at the duplex sheet price instead of the simplex page price.
+- The quick settlement window could jump back to the priority card immediately after manual navigation because regular refresh and batch-structure callbacks performed eager priority correction instead of waiting for the 10-second inactivity window.
+
+### Changes
+
+**Pricing engine (`src/common/pricing_engine.cpp/.h`):**
+- Normalized color values before billing; `"-"` and empty/unknown driver values no longer count as color evidence.
+- `effective_color_mode()` now treats only explicit `color` on a color-capable printer as a color job. All other cases price as monochrome; explicit color on a B&W printer still sets `color_downgraded`.
+- Built a pricing-only metadata snapshot so one-page duplex jobs match `simplex` rules before price calculation.
+- Rule lookup now receives the effective color dimension so monochrome/color matrix rules remain independent.
+
+**Quick settlement window (`src/ui/quick_settle_dialog.cpp/.h`):**
+- Added an application event filter scoped to the quick-settle dialog and its child widgets, resetting the inactivity timer on mouse, key, wheel, touch, drag, resize, and color-page edits.
+- Removed eager priority jumps from ordinary `refresh()`; regular model updates now repaint without stealing the operator's current card.
+- `ensurePriorityView()` now respects the inactivity timer and only performs fallback correction after the idle window has elapsed.
+- `onBatchCreated()` remains the active correction path for newly monitored print tasks.
+
+**Regression tests (`tests/pricing_engine_tests.cpp`):**
+- Added coverage for `"-"` color values pricing through monochrome matrix rules.
+- Added coverage for single-page duplex jobs charging the simplex rule price.
+
+### Verification
+
+- `cmake --build build\vs2026-x64-qt --config Debug --target wpce_pricing_engine_tests`: passed.
+- `build\vs2026-x64-qt\tests\Debug\wpce_pricing_engine_tests.exe`: 44/44 tests passed.
+- `cmake --build build\vs2026-x64-qt --config Debug --target wpce_ui`: passed; Qt deployment emitted an existing `VCINSTALLDIR is not set` warning only.
+- Added a 50-case matrix verification test for `{mono/color} x {simplex/duplex}` pricing (`0.15/0.25/1.00/2.00`), including m=0 pending, m clamping, copies, duplex tails, driver `"-"` color values, and B&W-printer downgrade. Full pricing test suite now passes 45/45 tests.
+
 ## 2026-06-20: UI Polish — Multi-User Coloring, Clickable Docs, Splitter UX, Color Hierarchy
 
 ### Changes
@@ -1183,4 +1216,3 @@ src/ui/
 - The `Winspool.lib` dependency in `wpce_core` means `wpce_ui` implicitly links Winspool — no issue but worth noting.
 - `qtbase[gui,widgets]` does not include `qtbase[network]` or `qtbase[sql]` — not needed for this UI.
 - Cross-thread signal for `JobSnapshot` and `MetadataSnapshot` passes by value (deep copy) — acceptable for these small structs but could be optimized with shared_ptr in future.
-

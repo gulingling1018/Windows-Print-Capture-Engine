@@ -150,9 +150,23 @@ bool AsyncPageArtifactWriter::enqueue(PageArtifactPayload payload)
 {
   {
     std::scoped_lock lock(queue_mutex_);
-    if (!running_ || stop_requested_ || queue_.size() >= config_.queue_capacity)
+    if (!running_ || stop_requested_)
     {
       return false;
+    }
+    if (queue_.size() >= config_.queue_capacity)
+    {
+      // Log drop so diagnostics can confirm queue backpressure under large-file load.
+      (void)fprintf(stderr,
+                    "[WPCE] PageArtifactWriter queue FULL (%zu/%zu), dropping payload\n",
+                    queue_.size(), config_.queue_capacity);
+      return false;
+    }
+    if (queue_.size() >= config_.queue_capacity * 8 / 10)
+    {
+      (void)fprintf(stderr,
+                    "[WPCE] PageArtifactWriter queue high-water (%zu/%zu)\n",
+                    queue_.size(), config_.queue_capacity);
     }
 
     queue_.push_back(std::move(payload));

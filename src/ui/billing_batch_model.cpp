@@ -120,10 +120,26 @@ BillingBatchModel::BillingBatchModel(BillingService* service, QObject* parent)
 bool BillingBatchModel::orderLess(const domain::BillingBatch& a,
                                    const domain::BillingBatch& b) const
 {
-  // Order: Active (current first) → Suspended (recent first) → Settled (recent first)
-  const auto rank = [](domain::BatchState s) -> int {
-    switch (s)
+  // Sort strictly by user number extracted from display_name ("用户#N" → N).
+  // This keeps the list order stable regardless of state changes (hang-up, settle).
+  auto userNumber = [](const std::string& name) -> int {
+    constexpr std::string_view prefix = "用户#";
+    if (name.size() > prefix.size() &&
+        std::string_view(name).substr(0, prefix.size()) == prefix)
     {
+      try { return std::stoi(name.substr(prefix.size())); }
+      catch (...) { return 0; }
+    }
+    return 0; // renamed batch — groups at the top
+  };
+
+  int na = userNumber(a.display_name);
+  int nb = userNumber(b.display_name);
+  if (na != nb) return na < nb;
+
+  // Same user number (e.g. renamed batches): Active before Suspended before Settled.
+  const auto rank = [](domain::BatchState s) -> int {
+    switch (s) {
       case domain::BatchState::Active:    return 0;
       case domain::BatchState::Suspended: return 1;
       case domain::BatchState::Settled:   return 2;
@@ -131,25 +147,7 @@ bool BillingBatchModel::orderLess(const domain::BillingBatch& a,
     }
     return 4;
   };
-  const int ra = rank(a.state), rb = rank(b.state);
-  if (ra != rb) return ra < rb;
-
-  // Within Active: current active batch first, then by period_start desc.
-  const auto* cur = service_->currentActiveBatch();
-  const bool aCur = cur != nullptr && a.batch_id == cur->batch_id;
-  const bool bCur = cur != nullptr && b.batch_id == cur->batch_id;
-  if (aCur != bCur) return aCur;
-
-  // Within Suspended: by suspend_time desc.
-  if (a.state == domain::BatchState::Suspended)
-    return a.suspend_time_utc > b.suspend_time_utc;
-
-  // Within Settled: by period_end desc.
-  if (a.state == domain::BatchState::Settled)
-    return a.period_end_utc > b.period_end_utc;
-
-  // Within Active (non-current): by period_start desc.
-  return a.period_start_utc > b.period_start_utc;
+  return rank(a.state) < rank(b.state);
 }
 
 void BillingBatchModel::rebuildOrdering()
@@ -288,7 +286,26 @@ QVariant BillingBatchModel::data(const QModelIndex& index, int role) const
         switch (col)
         {
           case ColName:
-            return QString::fromStdString(batch->display_name);
+          {
+            QString name = QString::fromStdString(batch->display_name);
+            if (!batch->first_doc_anchor.document_name.empty())
+            {
+              QString first = QString::fromStdString(batch->first_doc_anchor.document_name);
+              if (first.length() > 20) first = first.left(18) + QStringLiteral("..");
+              if (!batch->last_doc_anchor.document_name.empty() &&
+                  batch->last_doc_anchor.document_name != batch->first_doc_anchor.document_name)
+              {
+                QString last = QString::fromStdString(batch->last_doc_anchor.document_name);
+                if (last.length() > 20) last = last.left(18) + QStringLiteral("..");
+                name += QStringLiteral("  [%1 … %2]").arg(first, last);
+              }
+              else
+              {
+                name += QStringLiteral("  [%1]").arg(first);
+              }
+            }
+            return name;
+          }
           case ColState:
             return stateBadge(batch->state);
           case ColProgress:
@@ -312,7 +329,11 @@ QVariant BillingBatchModel::data(const QModelIndex& index, int role) const
           case ColSubmitTime:
             return formatDisplayTime(QString::fromStdString(batch->period_start_utc));
           case ColPrice:
-            return QString::number(batch->total_price, 'f', 2);
+            if (batch->pending_count > 0)
+              return QStringLiteral("¥%1 (%2待)")
+                .arg(QString::number(batch->total_price, 'f', 2))
+                .arg(batch->pending_count);
+            return QStringLiteral("¥%1").arg(QString::number(batch->total_price, 'f', 2));
           default: return {};
         }
       }
@@ -530,27 +551,15 @@ const domain::PrintJobRecord* BillingBatchModel::jobAt(const QModelIndex& index)
   return service_->jobRecord(jid);
 }
 
-int BillingBatchModel::currentActiveRow() const
-{
-  const auto* cur = service_->currentActiveBatch();
-  if (cur == nullptr) return -1;
-  for (int i = 0; i < static_cast<int>(orderedBatchIds_.size()); ++i)
-  {
-    if (orderedBatchIds_[static_cast<std::size_t>(i)] == cur->batch_id)
-      return i;
-  }
-  return -1;
-}
-
 int BillingBatchModel::nextRelevantRow(int fromRow) const
 {
   int n = static_cast<int>(orderedBatchIds_.size());
   if (n == 0) return -1;
 
-  // Sequential forward cycle through Active + Suspended batches.
-  for (int offset = 1; offset <= n; ++offset)
+  // Linear forward search through Active + Suspended batches.
+  // Non-cyclic — stops at the list boundary.
+  for (int i = fromRow + 1; i < n; ++i)
   {
-    int i = (fromRow + offset) % n;
     const auto* b = service_->batchById(orderedBatchIds_[static_cast<std::size_t>(i)]);
     if (b != nullptr && !b->is_settled())
       return i;
@@ -563,10 +572,10 @@ int BillingBatchModel::prevRelevantRow(int fromRow) const
   int n = static_cast<int>(orderedBatchIds_.size());
   if (n == 0) return -1;
 
-  // Sequential backward cycle through Active + Suspended batches.
-  for (int offset = 1; offset <= n; ++offset)
+  // Linear backward search through Active + Suspended batches.
+  // Non-cyclic — stops at the list boundary.
+  for (int i = fromRow - 1; i >= 0; --i)
   {
-    int i = ((fromRow - offset) % n + n) % n;
     const auto* b = service_->batchById(orderedBatchIds_[static_cast<std::size_t>(i)]);
     if (b != nullptr && !b->is_settled())
       return i;

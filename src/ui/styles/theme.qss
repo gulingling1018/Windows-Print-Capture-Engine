@@ -196,9 +196,14 @@ QHeaderView::section {
   color: #475569;
   font-weight: 600;
   font-size: 12px;
-  padding: 6px 8px;
+  padding: 6px 4px;
   border: none;
   border-bottom: 1px solid #e2e8f0;
+  border-right: 1px solid #e2e8f0;
+}
+
+QHeaderView::section:last {
+  border-right: none;
 }
 
 /* ── Search box ──────────────────────────────────────────────────── */
@@ -314,7 +319,7 @@ QHeaderView::section {
   background: #f1f5f9;
   color: #475569;
   font-weight: bold;
-  padding: 5px 8px;
+  padding: 5px 4px;
   font-size: 11px;
   border-bottom: 1px solid #cbd5e1;
 }

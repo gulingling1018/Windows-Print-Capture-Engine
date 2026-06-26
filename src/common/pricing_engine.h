@@ -1,24 +1,28 @@
 /// @file pricing_engine.h
 /// Rule-based print-job pricing engine.
 ///
-/// Each PricingRule specifies {paper, duplex, color, filetype} → price,
+/// Each PricingRule specifies {paper, duplex, printer, color, filetype} → price,
 /// and the engine finds the best-matching rule for each job.  Paper
-/// size and file extension dimensions support multi-value matching
-/// (e.g. "A4|B5" or "pdf|dwg") via the paper_size_set / file_extension_set
-/// fields on PricingRule.
+/// size, printer name, and file extension dimensions support multi-value
+/// matching (e.g. "A4|B5", "HP|Canon", or "pdf|dwg") via the
+/// paper_size_set / printer_name_set / file_extension_set fields
+/// on PricingRule.
 ///
 /// Key behaviours:
 ///   - Duplex odd-page tail is correctly split into simplex pages and
 ///     charged at a separately-matched simplex rule, not the duplex
 ///     rule's per-sheet price.
-///   - Color jobs on monochrome printers are downgraded to the
-///     monochrome rate (color_downgraded flag set on the result) and
-///     never flagged as price_pending, regardless of color_price_pending.
-///   - Color jobs on color printers with no matching color rule are
-///     flagged as price_pending (operator must fill the price).
+///   - Color jobs on monochrome printers are downgraded (color_downgraded
+///     flag set on the result) and priced as monochrome.
+///   - Color jobs on color printers with color_pages==0 are flagged as
+///     price_pending ("awaiting_color_pages") until the operator fills in
+///     the color page count.
+///   - Color jobs with color_pages>0 are split-priced: color and mono
+///     portions independently go through duplex sheet breakdown, each
+///     matched to their own color_mode rule.
 ///   - Unmatched rule combinations are flagged as price_pending.
 ///   - When rules is empty, the engine uses AppConfig::defaults().rules
-///     (the 6 factory default rules) instead of falling back to legacy.
+///     (the factory default rules) instead of falling back to legacy.
 
 #pragma once
 
@@ -47,12 +51,17 @@ std::string extract_file_extension(std::string_view document_name);
 
 /// Compute the specificity (priority) of a pricing rule.
 /// Returns the count of non-empty dimension fields:
-///   0 = catch-all, 4 = fully specific (paper+duplex+color+filetype).
+///   0 = catch-all, 5 = fully specific (paper+duplex+printer+color+filetype).
 /// Multi-value set fields count as 1 dimension (not N).
 int rule_specificity(const core::PricingRule& rule);
 
-/// Find the best-matching pricing rule for a given job, using the
-/// effective color mode (after printer-capability downgrade).
+/// Find the best-matching pricing rule for a given job.
+/// Matches metadata.printer_name against rule.printer_name /
+/// rule.printer_name_set (case-insensitive).  Empty printer_name on a
+/// rule means "match any printer" (wildcard).
+/// The effective_color parameter is matched against rule.color_mode
+/// ("color", "monochrome", or "" for wildcard).
+///
 /// Returns a pointer to the rule with the highest specificity among all
 /// matching rules, or nullptr if no rule matches.
 /// When multiple rules have the same specificity, the first one in the
@@ -60,7 +69,7 @@ int rule_specificity(const core::PricingRule& rule);
 const core::PricingRule* find_best_rule(
     const core::MetadataSnapshot& metadata,
     const std::vector<core::PricingRule>& rules,
-    std::string_view effective_color);
+    const std::string& effective_color = {});
 
 /// Sort rules by priority descending (most specific first).
 /// Call this after loading rules from config to ensure correct ordering.
@@ -110,8 +119,10 @@ std::string normalize_color_for_matching(std::string_view color_value);
 std::string normalize_duplex_for_matching(std::string_view duplex_value);
 
 /// Compute the effective color mode for a job, taking printer capability
-/// into account.  A "color" job on a B&W printer is downgraded to
-/// "monochrome" and the `downgraded` out-parameter is set to true.
+/// into account.  Only an explicit "color" job on a color-capable
+/// printer remains "color"; all other values are priced as monochrome.
+/// A "color" job on a B&W printer is downgraded and the `downgraded`
+/// out-parameter is set to true.
 std::string effective_color_mode(
     const core::MetadataSnapshot& metadata,
     const PrinterProfileConfig& printers,
@@ -121,29 +132,30 @@ std::string effective_color_mode(
 
 /// Compute the complete pricing breakdown for a single print job.
 ///
-/// Uses matrix-based matching:
+/// Uses matrix-based matching with dimensions {paper, duplex, printer, color, filetype}:
 ///   1. Compute effective color (downgrade color on B&W printers).
 ///   2. Compute sheet breakdown (with duplex tail correction).
-///   3. Find best-matching PricingRule for the duplex (or simplex) sheets.
+///   3. Find best-matching PricingRule by all 5 dimensions.
 ///   4. For duplex odd-page tail: find best-matching simplex rule and
 ///      price the tail separately.  No simplex rule → price_pending
 ///      with reason "no_simplex_rule_for_tail".
-///   5. Flag color-on-color-printer jobs as price_pending when no color
-///      rule matched and config.color_price_pending is true.
+///   5. For color jobs on color-capable printers:
+///      a. If color_pages == 0 → total_price = 0, price_pending with
+///         reason "awaiting_color_pages" (operator must fill color page count).
+///      b. If color_pages > 0 → split pricing:
+///         - Color pages priced by the best color_mode="color" rule
+///         - Remaining mono pages priced by the best color_mode="monochrome" rule
 ///   6. Flag unmatched jobs as price_pending.
 ///
-/// When `config.rules` is empty, the engine substitutes
-/// `AppConfig::defaults().pricing.rules` so the factory default 6-rule
-/// matrix always applies.
-///
-/// @param metadata  The print job's metadata snapshot
-/// @param config    Full pricing configuration (rules + color_pending flag)
-/// @param printers  Printer capability profiles for color downgrade
-/// @return          JobPricingEntry with complete breakdown and pending flags
+/// @param metadata    The print job's metadata snapshot
+/// @param config      Full pricing configuration (rules + color_pending flag)
+/// @param printers    Printer capability profiles for color downgrade
+/// @param color_pages Operator-filled color page count (0 = not yet filled)
+/// @return            JobPricingEntry with complete breakdown and pending flags
 core::JobPricingEntry compute_job_pricing(
     const core::MetadataSnapshot& metadata,
     const PricingConfig& config,
-    const PrinterProfileConfig& printers);
+    const PrinterProfileConfig& printers,
+    int color_pages = 0);
 
 }  // namespace wpce::common
-

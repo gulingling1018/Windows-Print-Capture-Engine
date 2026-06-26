@@ -4,6 +4,7 @@ add_library(wpce_core
   common/build_info.cpp
   common/counter_store.cpp
   common/logger.cpp
+  common/paper_size_map.cpp
   common/pricing_engine.cpp
   common/printer_profile.cpp
   core/data_contracts.cpp
