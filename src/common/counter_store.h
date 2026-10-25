@@ -33,20 +33,25 @@ class CounterStore
   void setStatePath(const std::filesystem::path& path);
 
   /// Force-load values from the state file.  Returns true on success
-  /// (or when the file does not exist yet — counters stay at 0).
+  /// (or when the file does not exist yet - counters stay at 0).
   bool load();
 
   /// Force-save current values to the state file (atomic).
   /// Returns true on success.
   bool save() const;
+  [[nodiscard]] bool healthy() const;
+  bool ensureMinimum(const std::string& date, long batch_counter, long order_counter);
 
   /// Atomically increment and return the next batch id.
-  std::string nextBatchId();
+  std::string nextBatchId(const std::string& business_date = {});
 
   /// Atomically increment and return the next settlement order id.
-  std::string nextOrderId();
+  std::string nextOrderId(const std::string& business_date = {});
 
-  /// Current date in YYYYMMDD form (UTC), used for id prefixes.
+  /// Current system-local date in YYYYMMDD form, used for business id prefixes.
+  static std::string currentDateYyyymmdd();
+
+  /// Backward-compatible alias for currentDateYyyymmdd().
   static std::string currentDateUtcYyyymmdd();
 
  private:
@@ -60,6 +65,7 @@ class CounterStore
   mutable std::mutex mutex_;
   std::filesystem::path path_;
   Counters counters_{};
+  bool loaded_ok_{true};
 
   /// Roll per-day counters to zero when the date changes.
   void rollDateIfNeeded(const std::string& today);

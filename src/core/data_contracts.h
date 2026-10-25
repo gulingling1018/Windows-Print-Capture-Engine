@@ -28,7 +28,9 @@ struct FieldValue
 struct JobSnapshot
 {
   std::int32_t schema_version{1};
-  std::uint32_t job_id{0};
+  std::uint32_t job_id{0};          // Application-internal stable ID
+  std::uint32_t external_job_id{0}; // Raw Windows Spooler JobId
+  std::string idempotency_key;      // Stable physical-job identity
   std::string user;
   std::string document_name;
   std::string printer_name;
@@ -64,6 +66,12 @@ struct MetadataSnapshot
   /// Lowercased, without the leading dot.  Used for per-filetype pricing rules.
   FieldValue file_extension;
 
+  /// Evidence used to resolve file_extension (document_name, shd_path,
+  /// title_marker, application_hint). Kept separate from FieldState so a
+  /// reported but low-confidence inference can still be diagnosed.
+  std::string file_extension_source;
+  int file_extension_confidence{0}; // 0 unknown, 1 low, 2 medium, 3 exact
+
   /// Hex dump of dmFields bitmask for diagnostics.
   /// e.g. "0x0007635f" allows checking which fields the driver reports.
   /// Set to the literal "PrintTicket" when this snapshot's authoritative
@@ -83,10 +91,11 @@ struct PageArtifactIndex
   std::string page_print_ticket;
   std::string fixed_page;
   std::string source{"xps-filter"};
+  std::string capture_id;
+  std::string fixed_page_state{"unsupported"};
 };
 
-// ── Job lifecycle events ───────────────────────────────────────────────
-
+// Job lifecycle events
 /// High-level job lifecycle phase derived from raw JOB_STATUS flags.
 enum class JobLifecyclePhase
 {
@@ -95,7 +104,7 @@ enum class JobLifecyclePhase
   Spooling,    // Data being sent to spooler
   Printing,    // Data being sent to printer
   Completed,   // printed | complete | retained
-  Failed,      // error | paperout | offline | user_intervention
+  Failed,      // error (genuine job processing failure)
   Cancelled,   // deleting | deleted (user or system cancelled)
   Stalled,     // No progress within timeout window
 };
@@ -154,11 +163,11 @@ struct JobLifecycleSummary
   std::int64_t total_duration_ms{0};
 };
 
-// ── Pricing & settlement data structures ─────────────────────────────────
-
+// Pricing & settlement data structures
 /// A single pricing rule in the matrix-based pricing system.
-/// Empty string fields mean "match all" — the rule applies regardless of
-/// that dimension.  Priority (specificity score) is computed automatically.
+/// Empty paper/printer/file fields mean "match all" for that dimension.
+/// Color is mandatory: empty legacy color values are treated as monochrome.
+/// Priority (specificity score) is computed automatically.
 ///
 /// Multi-value dimensions: `paper_size` and `file_extension` may contain
 /// a pipe-separated string like "A4|B5" or "pdf|dwg" in the config file.
@@ -172,10 +181,10 @@ struct PricingRule
   std::string paper_size;        // Empty = match all; may be "A4|B5"
   std::string duplex_mode;       // "simplex" | "duplex" | "" = all
   std::string printer_name;      // Printer name, or "" = match all printers; may be pipe-separated
-  std::string color_mode;        // "color" | "monochrome" | "" = all
+  std::string color_mode;        // "color" | "monochrome"; empty legacy value = monochrome
   std::string file_extension;    // Empty = match all; may be "pdf|dwg"
   double price_per_sheet{0.0};         // Price per physical sheet
-  int priority{0};                     // Specificity: count of non-empty dimensions
+  int priority{0};                     // Specificity: active dimensions; color always counts
 
   /// Multi-value expansions of paper_size (lowercased, no surrounding pipes).
   /// Empty means "match all paper sizes".
@@ -222,7 +231,9 @@ struct JobPricingEntry
   double mono_subtotal{0.0};    // B&W portion subtotal
   bool price_pending{false};     // Requires operator to manually enter a price
   std::string pending_reason;    // "awaiting_color_pages" | "unmatched_rule" | "no_simplex_rule_for_tail" | ...
-  bool color_downgraded{false};  // True if color job on B&W printer → charged as monochrome
+  bool color_downgraded{false};  // True if color job on B&W printer -> charged as monochrome
+  bool manual_price_override{false}; // Operator-approved total replaces computed total
+  double manual_total_price{0.0};
   std::string note;              // Human-readable note (e.g. "color_on_bw_printer")
 };
 
@@ -239,6 +250,8 @@ struct SettlementOrder
   std::string settled_at_utc;       // ISO8601 timestamp of settlement
   std::string period_start_utc;     // Time window start
   std::string period_end_utc;       // Time window end
+  std::string first_document_name;  // First document name in the settled batch
+  std::string last_document_name;   // Last document name in the settled batch
   std::vector<std::uint32_t> job_ids;      // Print jobs in this order
   std::vector<JobPricingEntry> pricing_entries;  // Per-job cost breakdown
   std::string pricing_snapshot_json; // Frozen PricingConfig at settlement time

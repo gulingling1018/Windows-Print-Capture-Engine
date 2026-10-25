@@ -1,7 +1,9 @@
 #include "bridge/metadata_merger.h"
 #include "collector/metadata_collector.h"
 #include "common/app_config.h"
+#include "common/document_name.h"
 #include "core/data_contracts.h"
+#include "domain/billing_batch_repository.h"
 #include "storage/job_snapshot_writer.h"
 #include "storage/json_serializer.h"
 #include "storage/xml_serializer.h"
@@ -14,6 +16,7 @@
 #include <fstream>
 #include <sstream>
 #include <string>
+#include <unordered_map>
 
 namespace
 {
@@ -40,7 +43,61 @@ std::string read_file(const std::filesystem::path& path)
   return content.str();
 }
 
+void write_file(const std::filesystem::path& path, const std::string& content)
+{
+  std::filesystem::create_directories(path.parent_path());
+  std::ofstream output(path, std::ios::binary | std::ios::trunc);
+  output << content;
+}
+
 }  // namespace
+
+TEST(Config, LegacyPricingFieldsAreSkippedAndEmptyColorBecomesMonochrome)
+{
+  const std::filesystem::path directory = make_test_directory("legacy-config");
+  const std::filesystem::path path = directory / "wpce_config.json";
+  write_file(path, R"json({
+    "storage": { "output_root": "./data", "retention_days": 90 },
+    "pricing": {
+      "currency": "CNY",
+      "color_price_pending": true,
+      "volume_discounts": [
+        { "min_pages": 100, "discount": 0.95, "note": { "ignored": true } }
+      ],
+      "rules": [
+        {
+          "rule_id": "legacy-empty-color",
+          "paper_size": "A4",
+          "duplex_mode": "simplex",
+          "printer_name": "",
+          "color_mode": "",
+          "file_extension": "",
+          "price_per_sheet": 0.15,
+          "unknown_object": { "ignored": true }
+        }
+      ]
+    }
+  })json");
+
+  wpce::common::AppConfig config = wpce::common::AppConfig::defaults();
+  ASSERT_TRUE(config.load_from_json(path));
+  ASSERT_EQ(config.pricing.rules.size(), 1u);
+  EXPECT_EQ(config.pricing.rules[0].color_mode, "monochrome");
+
+  std::filesystem::remove_all(directory);
+}
+
+TEST(DocumentName, SpoolerPlaceholderDetection)
+{
+  EXPECT_TRUE(wpce::common::is_spooler_placeholder_document(
+      "\xE6\x9C\xAC\xE5\x9C\xB0\xE4\xB8\x8B\xE5\xB1\x82\xE6\x96\x87\xE6\xA1\xA3"));
+  EXPECT_TRUE(wpce::common::is_spooler_placeholder_document(" Local Downlevel Document "));
+  EXPECT_TRUE(wpce::common::is_spooler_placeholder_document("local downlevel document"));
+
+  EXPECT_FALSE(wpce::common::is_spooler_placeholder_document("report.pdf"));
+  EXPECT_FALSE(wpce::common::is_spooler_placeholder_document("Local Downlevel Document.pdf"));
+  EXPECT_FALSE(wpce::common::is_spooler_placeholder_document(""));
+}
 
 // ── Serialization tests ──────────────────────────────────────────────────
 
@@ -179,7 +236,7 @@ TEST(Serialization, LifecycleEvent)
 
   const std::string json = wpce::storage::to_json(event);
   expect_contains(json, "\"event_id\": \"42-1\"");
-  expect_contains(json, "\"phase\": \"spooling\"");
+  expect_contains(json, "\"phase\": \"Spooling\"");
   expect_contains(json, "\"total_pages\": 5");
 }
 
@@ -235,7 +292,7 @@ TEST(Serialization, LifecycleSummary)
 
   const std::string json = wpce::storage::to_json(summary);
   expect_contains(json, "\"job_id\": 99");
-  expect_contains(json, "\"final_phase\": \"completed\"");
+  expect_contains(json, "\"final_phase\": \"Completed\"");
   expect_contains(json, "\"progress_percent\": 100");
   expect_contains(json, "\"event_id\": \"99-0\"");
   expect_contains(json, "\"event_id\": \"99-2\"");
@@ -255,9 +312,8 @@ TEST(Watcher, PhaseClassification)
 {
   using Phase = wpce::core::JobLifecyclePhase;
 
-  // Terminal states.
+  // Terminal states — only genuine job errors are terminal.
   EXPECT_EQ(Phase::Failed, wpce::watcher::classify_phase(0x00000002, ""));     // JOB_STATUS_ERROR
-  EXPECT_EQ(Phase::Failed, wpce::watcher::classify_phase(0x00000040, ""));     // JOB_STATUS_PAPEROUT
   EXPECT_EQ(Phase::Cancelled, wpce::watcher::classify_phase(0x00000100, ""));  // JOB_STATUS_DELETED
   EXPECT_EQ(Phase::Completed, wpce::watcher::classify_phase(0x00001000, ""));  // JOB_STATUS_COMPLETE
   EXPECT_EQ(Phase::Completed, wpce::watcher::classify_phase(0x00002000, ""));  // JOB_STATUS_RETAINED
@@ -265,6 +321,16 @@ TEST(Watcher, PhaseClassification)
   // Active states.
   EXPECT_EQ(Phase::Printing, wpce::watcher::classify_phase(0x00000010, ""));   // JOB_STATUS_PRINTING
   EXPECT_EQ(Phase::Spooling, wpce::watcher::classify_phase(0x00000008, ""));   // JOB_STATUS_SPOOLING
+
+  // Device-level status flags — waiting, not terminal.
+  EXPECT_EQ(Phase::Spooling, wpce::watcher::classify_phase(0x00000020, ""));   // JOB_STATUS_OFFLINE
+  EXPECT_EQ(Phase::Spooling, wpce::watcher::classify_phase(0x00000040, ""));   // JOB_STATUS_PAPEROUT
+  EXPECT_EQ(Phase::Spooling, wpce::watcher::classify_phase(0x00000400, ""));   // JOB_STATUS_USER_INTERVENTION
+
+  // Compound flags: active processing takes priority over device state.
+  EXPECT_EQ(Phase::Spooling, wpce::watcher::classify_phase(0x00000008 | 0x00000020, ""));  // SPOOLING|OFFLINE
+  EXPECT_EQ(Phase::Printing, wpce::watcher::classify_phase(0x00000010 | 0x00000020, ""));  // PRINTING|OFFLINE
+  EXPECT_EQ(Phase::Failed,  wpce::watcher::classify_phase(0x00000002 | 0x00000020, ""));   // ERROR|OFFLINE → Failed
 
   // Unknown (empty flags).
   EXPECT_EQ(Phase::Unknown, wpce::watcher::classify_phase(0, ""));
@@ -278,12 +344,12 @@ TEST(Watcher, PhaseClassification)
   EXPECT_FALSE(wpce::core::is_terminal_phase(Phase::Spooling));
   EXPECT_FALSE(wpce::core::is_terminal_phase(Phase::Unknown));
 
-  // Phase name.
-  EXPECT_EQ("accepted", wpce::core::to_string(Phase::Accepted));
-  EXPECT_EQ("completed", wpce::core::to_string(Phase::Completed));
-  EXPECT_EQ("failed", wpce::core::to_string(Phase::Failed));
-  EXPECT_EQ("cancelled", wpce::core::to_string(Phase::Cancelled));
-  EXPECT_EQ("stalled", wpce::core::to_string(Phase::Stalled));
+  // Phase name (capitalized for round-trip serialisation compatibility).
+  EXPECT_EQ("Accepted", wpce::core::to_string(Phase::Accepted));
+  EXPECT_EQ("Completed", wpce::core::to_string(Phase::Completed));
+  EXPECT_EQ("Failed", wpce::core::to_string(Phase::Failed));
+  EXPECT_EQ("Cancelled", wpce::core::to_string(Phase::Cancelled));
+  EXPECT_EQ("Stalled", wpce::core::to_string(Phase::Stalled));
 }
 
 TEST(Watcher, PreservesTransientUnknownForNonTerminalPhases)
@@ -368,10 +434,131 @@ TEST(Storage, AsyncJobSnapshotWriter)
   writer.stop();
 
   EXPECT_TRUE(writer.last_error().empty());
-  expect_contains(read_file(wpce::storage::job_snapshot_path(config)), "\"job_id\": 84");
+  expect_contains(read_file(wpce::storage::job_snapshot_path(config, job)), "\"job_id\": 84");
   expect_contains(read_file(wpce::storage::job_snapshot_archive_path(config, job)), "\"status\": \"printing\"");
-  expect_contains(read_file(wpce::storage::metadata_snapshot_path(config)), "\"total_pages\": { \"value\": \"10\"");
+  expect_contains(read_file(wpce::storage::metadata_snapshot_path(config, metadata)), "\"total_pages\": { \"value\": \"10\"");
   expect_contains(read_file(wpce::storage::metadata_archive_path(config, metadata)), "\"paper_size\": { \"value\": \"A4\"");
+  expect_contains(read_file(wpce::storage::latest_manifest_path(config)), "\"printer_name\": \"Microsoft Print to PDF\"");
+  std::filesystem::remove_all(directory);
+}
+
+TEST(Storage, BillingBatchRepositoryRoundTripsJobRecords)
+{
+  const std::filesystem::path directory = make_test_directory("billing-batch-repo");
+
+  wpce::domain::BillingBatch batch;
+  batch.batch_id = "B-20260626-000001";
+  batch.display_name = "用户#1";
+  batch.source_user = "DOMAIN\\alice";
+  batch.state = wpce::domain::BatchState::Active;
+  batch.period_start_utc = "2026-06-26T09:00:00Z";
+  batch.total_pages = 5;
+  batch.simplex_pages = 5;
+  batch.document_count = 1;
+  batch.total_price = 3.50;
+  batch.pending_count = 1;
+  batch.job_ids.push_back(100);
+
+  wpce::domain::PrintJobRecord rec;
+  rec.job_id = 100;
+  rec.batch_job_seq = 1;
+  rec.phase = wpce::core::JobLifecyclePhase::Completed;
+  rec.last_updated_utc = "2026-06-26T09:01:00Z";
+  rec.snapshot.job_id = 100;
+  rec.snapshot.external_job_id = 42;
+  rec.snapshot.idempotency_key = "Color Printer\\x1f42\\x1f2026-06-26T09:00:00Z";
+  rec.snapshot.user = "DOMAIN\\alice";
+  rec.snapshot.document_name = "color-plan.pdf";
+  rec.snapshot.printer_name = "Color Printer";
+  rec.snapshot.submit_time_utc = "2026-06-26T09:00:00Z";
+  rec.metadata.job_id = 100;
+  rec.metadata.total_pages = {"5", wpce::core::FieldState::Reported};
+  rec.metadata.duplex = {"", wpce::core::FieldState::NotReported};
+  rec.metadata.color = {"color", wpce::core::FieldState::Reported};
+  rec.metadata.paper_size = {"A4", wpce::core::FieldState::Reported};
+  rec.metadata.file_extension = {"dwt", wpce::core::FieldState::Reported};
+  rec.metadata.file_extension_source = "shd_path";
+  rec.metadata.file_extension_confidence = 3;
+  rec.pricing.job_id = 100;
+  rec.pricing.total_pages = 5;
+  rec.pricing.copies = 1;
+  rec.pricing.effective_sheets = 5;
+  rec.pricing.matched_rule_id = "color-a4";
+  rec.pricing.matched_printer_name = "Color Printer";
+  rec.pricing.total_price = 3.50;
+  rec.pricing.color_pages = 2;
+  rec.pricing.mono_pages = 3;
+  rec.pricing.color_subtotal = 2.00;
+  rec.pricing.mono_subtotal = 1.50;
+  rec.pricing.price_pending = true;
+  rec.pricing.pending_reason = "awaiting_color_pages";
+  rec.pricing.manual_price_override = true;
+  rec.pricing.manual_total_price = 3.50;
+
+  std::unordered_map<std::uint32_t, wpce::domain::PrintJobRecord> jobs;
+  jobs.emplace(rec.job_id, rec);
+
+  wpce::domain::BillingBatchRepository repo;
+  repo.setFilePath(directory / "2026-06-26" / "orders.json");
+  wpce::core::SettlementOrder order;
+  order.order_id = "SETTLE-20260626-000001";
+  order.task_id = batch.batch_id;
+  order.batch_id = batch.batch_id;
+  order.job_ids = {100};
+  order.pricing_entries = {rec.pricing};
+  order.total_price = 3.50;
+  wpce::core::SettlementOrder duplicateTask = order;
+  duplicateTask.order_id = "SETTLE-20260626-000002";
+  ASSERT_TRUE(repo.save({batch}, jobs, {order, duplicateTask}, "2026-06-26"));
+  EXPECT_TRUE(std::filesystem::exists(directory / "2026-06-26" / "orders.json"));
+  expect_contains(read_file(directory / "2026-06-26" / "orders.json"), "\"tasks\"");
+  expect_contains(read_file(directory / "2026-06-26" / "orders.json"), "\"jobs\"");
+
+  std::vector<wpce::domain::BillingBatch> loadedBatches;
+  std::unordered_map<std::uint32_t, wpce::domain::PrintJobRecord> loadedJobs;
+  std::string savedDate;
+  ASSERT_TRUE(repo.load(loadedBatches, loadedJobs, savedDate));
+
+  ASSERT_EQ(savedDate, "2026-06-26");
+  ASSERT_EQ(loadedBatches.size(), 1u);
+  ASSERT_EQ(loadedJobs.size(), 1u);
+  const auto& loaded = loadedJobs.at(100);
+  EXPECT_EQ(loaded.metadata.duplex.state, wpce::core::FieldState::NotReported);
+  EXPECT_EQ(loaded.pricing.color_pages, 2);
+  EXPECT_EQ(loaded.pricing.mono_pages, 3);
+  EXPECT_DOUBLE_EQ(loaded.pricing.color_subtotal, 2.00);
+  EXPECT_EQ(loaded.pricing.matched_printer_name, "Color Printer");
+  EXPECT_TRUE(loaded.pricing.price_pending);
+  EXPECT_EQ(loaded.snapshot.external_job_id, 42u);
+  EXPECT_FALSE(loaded.snapshot.idempotency_key.empty());
+  EXPECT_EQ(loaded.metadata.file_extension.value, "dwt");
+  EXPECT_EQ(loaded.metadata.file_extension_source, "shd_path");
+  EXPECT_EQ(loaded.metadata.file_extension_confidence, 3);
+  EXPECT_TRUE(loaded.pricing.manual_price_override);
+  EXPECT_DOUBLE_EQ(loaded.pricing.manual_total_price, 3.50);
+
+  std::vector<wpce::core::SettlementOrder> loadedOrders;
+  ASSERT_TRUE(repo.loadOrders(loadedOrders));
+  ASSERT_EQ(loadedOrders.size(), 1u);
+  EXPECT_EQ(loadedOrders.front().order_id, order.order_id);
+  EXPECT_EQ(loadedOrders.front().task_id, batch.batch_id);
+
+  std::vector<wpce::domain::BillingBatch> summaryBatches;
+  std::string summaryDate;
+  ASSERT_TRUE(repo.loadSummaries(summaryBatches, summaryDate));
+  ASSERT_EQ(summaryDate, "2026-06-26");
+  ASSERT_EQ(summaryBatches.size(), 1u);
+  EXPECT_EQ(summaryBatches[0].batch_id, batch.batch_id);
+
+  std::unordered_map<std::uint32_t, wpce::domain::PrintJobRecord> selectedJobs;
+  ASSERT_TRUE(repo.loadJobsForBatches({batch.batch_id}, selectedJobs));
+  ASSERT_EQ(selectedJobs.size(), 1u);
+  EXPECT_EQ(selectedJobs.at(100).snapshot.document_name, "color-plan.pdf");
+
+  std::unordered_map<std::uint32_t, wpce::domain::PrintJobRecord> missingJobs;
+  ASSERT_TRUE(repo.loadJobsForBatches({"missing-batch"}, missingJobs));
+  EXPECT_TRUE(missingJobs.empty());
+
   std::filesystem::remove_all(directory);
 }
 
@@ -399,7 +586,7 @@ TEST(Storage, LifecycleSummaryPersistence)
   // Verify per-job archive.
   const std::string archive = read_file(wpce::storage::lifecycle_summary_archive_path(config, summary));
   expect_contains(archive, "\"job_id\": 77");
-  expect_contains(archive, "\"final_phase\": \"completed\"");
+  expect_contains(archive, "\"final_phase\": \"Completed\"");
 
   // Verify manifest.
   const std::string manifest = read_file(wpce::storage::lifecycle_summary_path(config));
@@ -444,14 +631,14 @@ TEST(Serialization, LifecycleSummaryTiming)
     .source = "winspool",
     .total_duration_ms = 5230,
   };
-  summary.phase_dwells.push_back({"spooling", 120});
-  summary.phase_dwells.push_back({"printing", 4800});
-  summary.phase_dwells.push_back({"completed", -1});
+  summary.phase_dwells.push_back({"Spooling", 120});
+  summary.phase_dwells.push_back({"Printing", 4800});
+  summary.phase_dwells.push_back({"Completed", -1});
 
   const std::string json = wpce::storage::to_json(summary);
   expect_contains(json, "\"total_duration_ms\": 5230");
   expect_contains(json, "\"phase_dwells\"");
-  expect_contains(json, "\"phase\": \"spooling\"");
+  expect_contains(json, "\"phase\": \"Spooling\"");
   expect_contains(json, "\"duration_ms\": 120");
   expect_contains(json, "\"duration_ms\": -1");
 }

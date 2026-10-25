@@ -78,7 +78,7 @@ PerfSample PerfMonitor::sample() const
   s.timestamp_utc = format_utc(std::chrono::system_clock::now());
 
 #ifdef _WIN32
-  // ── CPU % ──────────────────────────────────────────────────────────
+  // CPU %
   FILETIME ft_create{}, ft_exit{}, ft_kernel{}, ft_user{};
   if (GetProcessTimes(process_handle_, &ft_create, &ft_exit, &ft_kernel, &ft_user))
   {
@@ -112,7 +112,7 @@ PerfSample PerfMonitor::sample() const
     }
   }
 
-  // ── Working set ────────────────────────────────────────────────────
+  // Working set
   PROCESS_MEMORY_COUNTERS_EX pmc{};
   pmc.cb = sizeof(pmc);
   if (GetProcessMemoryInfo(process_handle_,
@@ -122,14 +122,14 @@ PerfSample PerfMonitor::sample() const
     s.working_set_bytes = pmc.WorkingSetSize;
   }
 
-  // ── Handle count ───────────────────────────────────────────────────
+  // Handle count
   DWORD handle_count = 0;
   if (GetProcessHandleCount(process_handle_, &handle_count))
   {
     s.handle_count = static_cast<std::uint32_t>(handle_count);
   }
 
-  // ── Thread count (via toolhelp snapshot) ───────────────────────────
+  // Thread count (via toolhelp snapshot)
   // We count threads in the current process only.
   HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
   if (snapshot != INVALID_HANDLE_VALUE)
@@ -153,7 +153,7 @@ PerfSample PerfMonitor::sample() const
   }
 #endif
 
-  // ── WPCE-specific metrics ──────────────────────────────────────────
+  // WPCE-specific metrics
   s.snapshot_writer_queue_depth = snapshot_writer_queue_depth_.load();
   s.page_writer_queue_depth = page_writer_queue_depth_.load();
   s.last_event_processing_ms = last_event_processing_ms_.load();

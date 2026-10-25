@@ -87,6 +87,8 @@ class QuickSettleDialog : public QDialog
   void updateActionButtons();
   void updateNavButtonStates();
   void updatePositionIndicator();
+  void updateHeightResponsiveState();
+  [[nodiscard]] int minimumCollapsedHeight() const;
 
   /// Return the model row index that should be shown by priority:
   ///   1. Current active-batch (most recently created active)
@@ -119,6 +121,7 @@ class QuickSettleDialog : public QDialog
   BillingService* service_ = nullptr;
   const PricingConfig* pricingConfig_ = nullptr;
   int currentIndex_ = -1;
+  QString currentBatchId_;
   bool pinned_ = true;
 
   // Navigation button click debounce (distinguish single vs double click).
@@ -137,6 +140,8 @@ class QuickSettleDialog : public QDialog
   QFrame* lastAnchorFrame_ = nullptr;    // Hidden when collapsed
   QSize expandedSize_;                   // Remembered expanded geometry
   int collapsedHeight_ = 0;              // Remembered collapsed height
+  int collapsedTableHeight_ = 0;          // Actual table height needed in collapsed mode
+  bool compactHeightMode_ = false;
 
   // UI widgets — title bar
   QWidget* titleBar_ = nullptr;
@@ -170,6 +175,7 @@ class QuickSettleDialog : public QDialog
   bool inToggle_ = false;  // suppress resizeEvent during toggleCollapsed
 
   // Action bar
+  QWidget* actionBar_ = nullptr;
   QPushButton* prevBtn_ = nullptr;
   QPushButton* actionBtn_ = nullptr;
   QPushButton* nextBtn_ = nullptr;

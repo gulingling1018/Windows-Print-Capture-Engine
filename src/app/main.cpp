@@ -32,26 +32,25 @@ namespace
 
 std::atomic_bool g_stop_requested{false};
 
-// ── Phase display helpers ───────────────────────────────────────────────
-
+// Phase display helpers
 const char* phase_icon(wpce::core::JobLifecyclePhase phase) noexcept
 {
   switch (phase)
   {
     case wpce::core::JobLifecyclePhase::Accepted:
-      return "\xe2\x9e\xa4";       // ➤
+      return ">";
     case wpce::core::JobLifecyclePhase::Spooling:
-      return "\xe2\x8f\xb3";       // ⏳
+      return "~";
     case wpce::core::JobLifecyclePhase::Printing:
-      return "\xf0\x9f\x96\xa8";   // 🖨
+      return "P";
     case wpce::core::JobLifecyclePhase::Completed:
-      return "\xe2\x9c\x93";       // ✓
+      return "C";
     case wpce::core::JobLifecyclePhase::Failed:
-      return "\xe2\x9c\x97";       // ✗
+      return "F";
     case wpce::core::JobLifecyclePhase::Cancelled:
-      return "\xe2\x9c\x82";       // ✂
+      return "X";
     case wpce::core::JobLifecyclePhase::Stalled:
-      return "\xe2\x9a\xa0";       // ⚠
+      return "S";
     default:
       return "?";
   }
@@ -80,8 +79,7 @@ const char* phase_display_name(wpce::core::JobLifecyclePhase phase) noexcept
   }
 }
 
-// ── Helpers ─────────────────────────────────────────────────────────────
-
+// Helpers
 wpce::core::JobSnapshot make_sample_job()
 {
   return wpce::core::JobSnapshot{
@@ -101,6 +99,7 @@ wpce::core::MetadataSnapshot make_sample_metadata()
   return wpce::core::MetadataSnapshot{
     .schema_version = 1,
     .job_id = 1,
+    .printer_name = "Microsoft Print to PDF",
     .total_pages = {"3", wpce::core::FieldState::Reported},
     .pages_printed = {"0", wpce::core::FieldState::Reported},
     .copies = {"1", wpce::core::FieldState::Reported},
@@ -182,8 +181,7 @@ std::wstring widen_utf8(const std::string_view value)
 }
 #endif
 
-// ── Commands ─────────────────────────────────────────────────────────────
-
+// Commands
 int list_jobs(const std::string_view printer_name)
 {
   try
@@ -213,10 +211,12 @@ int write_sample_job(const std::filesystem::path& output_directory)
 {
   try
   {
-    wpce::storage::AsyncJobSnapshotWriter writer(
-      wpce::storage::JobSnapshotWriterConfig{.output_directory = output_directory});
+    wpce::storage::JobSnapshotWriterConfig config{.output_directory = output_directory};
+    const auto sample_job = make_sample_job();
+    const auto sample_metadata = make_sample_metadata();
+    wpce::storage::AsyncJobSnapshotWriter writer(config);
     writer.start();
-    if (!writer.enqueue(make_sample_job(), make_sample_metadata()))
+    if (!writer.enqueue(sample_job, sample_metadata))
     {
       std::cerr << "Failed to queue sample job snapshot\n";
       return 2;
@@ -230,9 +230,11 @@ int write_sample_job(const std::filesystem::path& output_directory)
       return 2;
     }
 
-    std::cout << "Wrote sample job snapshot to " << wpce::storage::job_snapshot_path({.output_directory = output_directory})
+    std::cout << "Wrote sample job snapshot to " << wpce::storage::job_snapshot_path(config, sample_job)
               << '\n';
-    std::cout << "Wrote sample metadata snapshot to " << wpce::storage::metadata_snapshot_path({.output_directory = output_directory})
+    std::cout << "Wrote sample metadata snapshot to " << wpce::storage::metadata_snapshot_path(config, sample_metadata)
+              << '\n';
+    std::cout << "Wrote latest manifest to " << wpce::storage::latest_manifest_path(config)
               << '\n';
     return 0;
   }
@@ -313,8 +315,7 @@ int watch_printer(const std::string_view printer_name,
       wpce::storage::JobSnapshotWriterConfig{.output_directory = output_directory});
     writer.start();
 
-    // ── Job callback: persist JSON to stdout ─────────────────────────────
-
+    // Job callback: persist JSON to stdout
     auto job_callback = [&](const wpce::core::JobSnapshot& snapshot) {
       std::scoped_lock lock(output_mutex);
       if (highest_observed_job_id != 0 && snapshot.job_id > highest_observed_job_id + 1)
@@ -336,8 +337,7 @@ int watch_printer(const std::string_view printer_name,
       }
     };
 
-    // ── Metadata callback: persist to disk ──────────────────────────────
-
+    // Metadata callback: persist to disk
     auto metadata_callback = [&](const wpce::core::MetadataSnapshot& metadata) {
       std::scoped_lock lock(output_mutex);
       std::cout << wpce::storage::to_json(metadata) << std::flush;
@@ -355,19 +355,17 @@ int watch_printer(const std::string_view printer_name,
       else
       {
         ++dropped_snapshots;
-        std::cerr << "! [Drop] Writer queue full/unavailable\n";
+        std::cerr << "! [Reject] Writer unavailable\n";
       }
     };
 
-    // ── Lifecycle callback: structured progress display ─────────────────
-
+    // Lifecycle callback: structured progress display
     auto lifecycle_callback = [&](const wpce::core::JobLifecycleEvent& event) {
       std::scoped_lock lock(output_mutex);
       print_lifecycle_event(event);
     };
 
-    // ── Build watcher config ────────────────────────────────────────────
-
+    // Build watcher config
     wpce::watcher::LogCallback log_callback;
     if (verbose)
     {
@@ -421,7 +419,7 @@ int watch_printer(const std::string_view printer_name,
     }
     std::cout << "Press Ctrl+C to stop.\n\n";
 
-    // ── Perf log setup ──────────────────────────────────────────────────
+    // Perf log setup
     std::ofstream perf_log;
     if (!perf_log_path.empty())
     {
@@ -467,8 +465,7 @@ int watch_printer(const std::string_view printer_name,
     watcher.stop();
     writer.stop();
 
-    // ── Collect errors (but continue to write summaries) ────────────────
-
+    // Collect errors (but continue to write summaries)
     const std::string watcher_error = watcher.last_error();
     if (!watcher_error.empty())
     {
@@ -483,8 +480,7 @@ int watch_printer(const std::string_view printer_name,
 
     const bool had_error = !watcher_error.empty() || !writer_error.empty();
 
-    // ── Per-session summary ─────────────────────────────────────────────
-
+    // Per-session summary
     const std::vector<wpce::core::JobLifecycleSummary> summaries = watcher.lifecycle_summaries();
 
     std::cout << "\n=== Session Summary ===\n";
@@ -493,7 +489,7 @@ int watch_printer(const std::string_view printer_name,
 
     if (dropped_snapshots > 0)
     {
-      std::cout << " Dropped " << dropped_snapshots << ".";
+      std::cout << " Rejected " << dropped_snapshots << ".";
     }
     std::cout << "\n\n";
 
@@ -506,8 +502,7 @@ int watch_printer(const std::string_view printer_name,
       std::cout << '\n';
     }
 
-    // ── Persist lifecycle summaries (even on watcher error) ─────────────
-
+    // Persist lifecycle summaries (even on watcher error)
     if (!summaries.empty())
     {
       try
@@ -525,7 +520,7 @@ int watch_printer(const std::string_view printer_name,
       }
     }
 
-    std::cout << "\nQueued " << queued_snapshots << " snapshot(s). Dropped " << dropped_snapshots << ".\n";
+    std::cout << "\nQueued " << queued_snapshots << " snapshot(s). Rejected " << dropped_snapshots << ".\n";
     return had_error ? 2 : 0;
   }
   catch (const std::exception& error)
@@ -537,8 +532,7 @@ int watch_printer(const std::string_view printer_name,
 
 }  // namespace
 
-// ── main ──────────────────────────────────────────────────────────────────
-
+// main
 #ifdef _WIN32
 /// Convert wide arguments from GetCommandLineW to UTF-8, bypassing the
 /// ANSI code-page conversion that the MSVC runtime applies to main()'s

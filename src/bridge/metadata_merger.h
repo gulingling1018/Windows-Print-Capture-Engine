@@ -1,10 +1,10 @@
 /// @file metadata_merger.h
 /// Merge PrintTicket-derived metadata with spooler lifecycle data.
 ///
-/// The wpce_xps_filter.dll writes per-job PrintTicket metadata as
-/// `job-<printer>-N-pt-metadata.json` in the output directory.  This module
-/// scans for those files and merges their contents into the table
-/// model's existing job rows.
+/// The filter writes uniquely identified `<capture-id>.pt-message.json`
+/// envelopes. Production delivery uses PrintTicketInbox with physical job
+/// matching and durable business acknowledgement. This module retains
+/// legacy read-only loading and inbox directory discovery.
 ///
 /// This is the bridge between Layer 1 (spooler watcher) and
 /// Layer 2 (XPS pipeline filter) of the two-layer architecture.
@@ -32,9 +32,10 @@ using MergedMetadataCallback = std::function<void(core::MetadataSnapshot)>;
 ///
 /// @param output_dir          The session output directory (e.g. ./data/capture-xxx/).
 /// @param callback            Called once per metadata file found.
-/// @param cleanup_after_load  If true, delete the file after successful load.
-///                            Recommended: true — prevents file accumulation
-///                            and avoids re-processing after watcher restart.
+/// @param cleanup_after_load  If true, use the durable inbox protocol. A callback
+///                            must persist delivery before returning; throwing
+///                            retains the claim. Identity-less legacy input is
+///                            quarantined. Prefer PrintTicketInbox in new code.
 /// @return                    Number of files found and merged.
 int scan_and_merge_pt_metadata(const std::filesystem::path& output_dir,
                                MergedMetadataCallback callback,

@@ -1,5 +1,5 @@
 /// @file print_ticket_parser.cpp
-/// PrintTicket XML parser — extracts standard Print Schema keywords.
+/// PrintTicket XML parser - extracts standard Print Schema keywords.
 ///
 /// Strategy: string-based XML extraction (no external XML library).
 /// This is deliberately minimal and fast; it processes PrintTicket XML
@@ -7,12 +7,12 @@
 /// prefix, or driver flavour.
 ///
 /// Supported extraction paths:
-///   1. <*:Feature name="psk:FeatureName"> … <*:Option name="psk:Value" />
-///      — the standard Feature/Option pattern.
+///   1. <*:Feature name="psk:FeatureName"> ... <*:Option name="psk:Value" />
+///      - the standard Feature/Option pattern.
 ///   2. <*:ParameterRef name="psk:FeatureName" />
 ///      <*:ParameterInit name="psk:FeatureName">
-///        <*:Value …>N</*:Value>
-///      — the ParameterRef/ParameterInit pattern used for copies.
+///        <*:Value ...>N</*:Value>
+///      - the ParameterRef/ParameterInit pattern used for copies.
 
 #include "parser/print_ticket_parser.h"
 
@@ -27,8 +27,7 @@ namespace wpce::parser
 namespace
 {
 
-// ── Generic XML helpers — prefix-agnostic ───────────────────────────────
-
+// Generic XML helpers - prefix-agnostic
 /// Find the first occurrence of `needle` in `haystack`, starting at `pos`.
 constexpr std::size_t find_at(std::string_view haystack,
                                 std::string_view needle,
@@ -77,7 +76,7 @@ constexpr std::size_t find_tag_end(std::string_view xml,
 /// Extract the value of a named attribute from an XML opening tag.
 /// e.g. attr_value(tag, "name") from `<psf:Feature name="psk:ISOA4">`
 /// returns "psk:ISOA4".
-/// Prefix-agnostic — works with psf:, xps:, wprt:, or custom prefixes.
+/// Prefix-agnostic - works with psf:, xps:, wprt:, or custom prefixes.
 std::string attr_value(std::string_view tag, std::string_view attr_name)
 {
   std::string pattern;
@@ -100,12 +99,12 @@ std::string attr_value(std::string_view tag, std::string_view attr_name)
 /// prefix like ns0000.
 ///
 /// Handles two patterns:
-///   A) <*:Option … selected="true" … /> — the selected option
-///   B) First <*:Option … /> when no selected="true" is present
+///   A) <*:Option ... selected="true" ... /> - the selected option
+///   B) First <*:Option ... /> when no selected="true" is present
 ///
 /// Robustness fixes:
 ///   - Correctly locates the Feature element's end tag by tracking
-///     nesting depth (Feature → Option → ScoredProperty), so nested
+///     nesting depth (Feature -> Option -> ScoredProperty), so nested
 ///     self-closing tags no longer confuse the boundary detection.
 ///   - When the same feature name appears multiple times in the XML
 ///     (e.g. both Job- and Page-level PrintTicket concatenated), the
@@ -140,7 +139,7 @@ std::string find_feature_option(std::string_view xml,
   std::size_t open_tag_end = find_tag_end(xml, tag_start);
   if (open_tag_end == std::string_view::npos) return {};
 
-  // Self-closing Feature: <*:Feature name="..." /> — no Options inside.
+  // Self-closing Feature: <*:Feature name="..." /> - no Options inside.
   if (open_tag_end >= 1 && xml[open_tag_end - 1] == '/')
     return {};
 
@@ -194,9 +193,9 @@ std::string find_feature_option(std::string_view xml,
   std::string_view body = xml.substr(open_tag_end + 1,
                                       feat_end - open_tag_end - 1);
 
-  // ── Pattern A: find selected="true" ─────────────────────────────────
+  // Pattern A: find selected="true"
   // Walk every occurrence of selected="true" and find the enclosing
-  // <*:Option …> tag (prefix-agnostic).
+  // <*:Option ...> tag (prefix-agnostic).
   std::size_t opt_pos = 0;
   while (opt_pos < body.size())
   {
@@ -221,7 +220,7 @@ std::string find_feature_option(std::string_view xml,
     }
     if (open_brace > 0 && body[open_brace - 1] == '/')
     {
-      // </*:Option — closing tag, not an opening tag.
+      // </*:Option - closing tag, not an opening tag.
       opt_pos = sel + 14;
       continue;
     }
@@ -242,7 +241,7 @@ std::string find_feature_option(std::string_view xml,
     opt_pos = sel + 14;
   }
 
-  // ── Pattern B: first Option (fallback) ──────────────────────────────
+  // Pattern B: first Option (fallback)
   // Prefix-agnostic: search for ":Option name=\""
   opt_pos = find_at(body, ":Option name=\"");
   if (opt_pos == std::string_view::npos) return {};
@@ -291,13 +290,13 @@ int find_parameter_init_int(std::string_view xml,
     if (name_pos == std::string_view::npos ||
         name_pos > find_at(xml, ">", init_pos))
     {
-      // Name not in this ParameterInit — skip past it.
+      // Name not in this ParameterInit - skip past it.
       auto close = find_at(xml, ":ParameterInit>", init_pos);
       pos = (close != std::string_view::npos) ? close + 16 : init_pos + 16;
       continue;
     }
 
-    // Found the right ParameterInit — extract the integer Value.
+    // Found the right ParameterInit - extract the integer Value.
     auto value_start = find_at(xml, ":Value", name_pos);
     if (value_start == std::string_view::npos) return -1;
 
@@ -328,7 +327,7 @@ int find_parameter_init_int(std::string_view xml,
 }
 
 /// Find a ParameterInit by its Print Schema keyword name and extract the
-/// string value inside <*:Value xsi:type="xsd:string">…</*:Value>.
+/// string value inside <*:Value xsi:type="xsd:string">...</*:Value>.
 ///
 /// Used for psk:PageRange, which carries a human-readable page range
 /// string such as "1-3,5,7-9".  Returns empty string if not found or
@@ -354,12 +353,12 @@ std::string find_parameter_init_string(std::string_view xml,
         tag_end_pos == std::string_view::npos ||
         name_pos > tag_end_pos)
     {
-      // Name not in this opening tag — skip to the next ParameterInit.
+      // Name not in this opening tag - skip to the next ParameterInit.
       pos = init_pos + 16;
       continue;
     }
 
-    // Found the right ParameterInit — extract the string Value.
+    // Found the right ParameterInit - extract the string Value.
     auto value_start = find_at(xml, ":Value", tag_end_pos);
     if (value_start == std::string_view::npos) return {};
 
@@ -384,8 +383,7 @@ std::string find_parameter_init_string(std::string_view xml,
   return {};
 }
 
-// ── Print Schema keyword mappers ──────────────────────────────────────
-
+// Print Schema keyword mappers
 std::string map_duplex_option(std::string_view option)
 {
   if (option == "psk:OneSided")               return "simplex";
@@ -498,7 +496,7 @@ int extract_option_count(std::string_view option_name)
     : option_name;
   if (last.empty()) return -1;
 
-  // Numeric suffix (e.g. "psk:2", "psk:4Up" → "2", "4").
+  // Numeric suffix (e.g. "psk:2", "psk:4Up" -> "2", "4").
   bool all_digits = true;
   for (char c : last) { if (c < '0' || c > '9') { all_digits = false; break; } }
   if (all_digits)
@@ -540,6 +538,19 @@ int extract_option_count(std::string_view option_name)
   return -1;
 }
 
+int find_feature_or_parameter_count(std::string_view xml,
+                                    std::string_view keyword)
+{
+  std::string opt = find_feature_option(xml, keyword);
+  if (!opt.empty())
+  {
+    int n = extract_option_count(opt);
+    if (n > 0) return n;
+  }
+
+  return find_parameter_init_int(xml, keyword);
+}
+
 std::string map_page_order(std::string_view option)
 {
   if (option == "psk:Standard")       return "standard";
@@ -559,7 +570,7 @@ std::string map_resolution_option(std::string_view option)
 
   if (option.empty()) return {};
 
-  // Pattern: "600x600dpi" → "600x600 dpi"
+  // Pattern: "600x600dpi" -> "600x600 dpi"
   auto dpi_pos = option.find("dpi");
   if (dpi_pos != std::string_view::npos)
   {
@@ -568,7 +579,7 @@ std::string map_resolution_option(std::string_view option)
     return result;
   }
 
-  // Pattern: pure digits → "600 dpi"
+  // Pattern: pure digits -> "600 dpi"
   bool all_digits = true;
   for (char c : option) { if (c < '0' || c > '9') { all_digits = false; break; } }
   if (all_digits)
@@ -585,33 +596,35 @@ void set_if_present(core::FieldValue& field, std::string value)
 
 }  // namespace
 
-// ── Public entry point ────────────────────────────────────────────────
-
+// Public entry point
 void parse_print_ticket_xml(std::string_view pt_xml,
                             core::MetadataSnapshot& snapshot)
 {
   if (pt_xml.empty()) return;
 
-  // ── Job-level features ────────────────────────────────────────────
-
+  // Job-level features
   // Copies: try Feature/Option first, then ParameterInit (the common case).
   {
-    std::string opt = find_feature_option(
-      pt_xml, "psk:JobCopiesAllDocuments");
-    if (!opt.empty())
+    int effectiveCopies = 1;
+    bool hasCopies = false;
+    constexpr std::string_view kCopyKeywords[] = {
+      "psk:JobCopiesAllDocuments",
+      "psk:DocumentCopiesAllPages",
+      "psk:PageCopies",
+    };
+
+    for (std::string_view keyword : kCopyKeywords)
     {
-      int n = extract_option_count(opt);
+      int n = find_feature_or_parameter_count(pt_xml, keyword);
       if (n > 0)
-        set_if_present(snapshot.copies, std::to_string(n));
+      {
+        hasCopies = true;
+        effectiveCopies *= n;
+      }
     }
-    else
-    {
-      // ParameterRef / ParameterInit — the pattern used by the
-      // Windows print dialog for copies in nearly all cases.
-      int n = find_parameter_init_int(pt_xml, "psk:JobCopiesAllDocuments");
-      if (n > 0)
-        set_if_present(snapshot.copies, std::to_string(n));
-    }
+
+    if (hasCopies)
+      set_if_present(snapshot.copies, std::to_string(effectiveCopies));
   }
 
   // Duplex
@@ -634,14 +647,14 @@ void parse_print_ticket_xml(std::string_view pt_xml,
 
   // Collate (DocumentCollate takes priority).
   // JobPageOrder is a SEPARATE concept (reverse page order); it is
-  // not stored in the collate field — we note it but don't overwrite.
+  // not stored in the collate field - we note it but don't overwrite.
   {
     std::string opt = find_feature_option(
       pt_xml, "psk:DocumentCollate");
     set_if_present(snapshot.collate, map_collate_option(opt));
   }
 
-  // JobPageOrder — informational, not stored in the collate column.
+  // JobPageOrder - informational, not stored in the collate column.
   // (Previously it incorrectly overwrote the collate value.)
   {
     std::string opt = find_feature_option(
@@ -650,15 +663,14 @@ void parse_print_ticket_xml(std::string_view pt_xml,
     (void)opt;
   }
 
-  // JobInputBin — informational, no dedicated column.
+  // JobInputBin - informational, no dedicated column.
   {
     std::string opt = find_feature_option(
       pt_xml, "psk:JobInputBin");
     (void)opt;  // reserved for future schema expansion
   }
 
-  // ── Page-level features ────────────────────────────────────────────
-
+  // Page-level features
   // Paper size
   {
     std::string opt = find_feature_option(
@@ -687,7 +699,7 @@ void parse_print_ticket_xml(std::string_view pt_xml,
     set_if_present(snapshot.media_type, map_media_option(opt));
   }
 
-  // Print resolution — now handles "600x600dpi" format.
+  // Print resolution - now handles "600x600dpi" format.
   {
     std::string opt = find_feature_option(
       pt_xml, "psk:PageResolution");
@@ -699,17 +711,17 @@ void parse_print_ticket_xml(std::string_view pt_xml,
     }
   }
 
-  // ── Page range (user's page selection in the print dialog) ────────
-  // Captured for traceability — lets the operator verify which pages
+  // Page range (user's page selection in the print dialog)
+  // Captured for traceability - lets the operator verify which pages
   // were actually printed when reconciling cost against the document.
   // Two shapes:
   //   1. <*:Feature name="psk:PageRange">
-  //        <*:Option name="psk:AllPages" />           → "all"
+  //        <*:Option name="psk:AllPages" />           -> "all"
   //        <*:Option name="psk:CustomRange" />
   //      </*:Feature>
   //      <*:ParameterInit name="psk:PageRange">
   //        <*:Value xsi:type="xsd:string">1-3,5,7-9</*:Value>
-  //      </*:ParameterInit>                            → "1-3,5,7-9"
+  //      </*:ParameterInit>                            -> "1-3,5,7-9"
   //   2. Some drivers omit the Feature and only emit ParameterInit.
   {
     std::string opt = find_feature_option(pt_xml, "psk:PageRange");
@@ -730,7 +742,7 @@ void parse_print_ticket_xml(std::string_view pt_xml,
     }
     else
     {
-      // No Feature — try ParameterInit directly.
+      // No Feature - try ParameterInit directly.
       std::string ranges = find_parameter_init_string(pt_xml, "psk:PageRange");
       if (!ranges.empty())
         set_if_present(snapshot.page_range, std::move(ranges));

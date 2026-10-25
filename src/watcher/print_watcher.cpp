@@ -1,5 +1,6 @@
 #include "watcher/print_watcher.h"
 #include "collector/metadata_collector.h"
+#include "parser/spool_file_parser.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -24,8 +25,7 @@ namespace wpce::watcher
 namespace
 {
 
-// ── UTC timestamp generator ────────────────────────────────────────────
-
+// UTC timestamp generator
 std::string utc_timestamp_now()
 {
   SYSTEMTIME st{};
@@ -42,18 +42,16 @@ std::string utc_timestamp_now()
   return output.str();
 }
 
-// ── Phase classification ───────────────────────────────────────────────
-
+// Phase classification
 // Status flags that map to each lifecycle phase.
-// Priority: terminal phases checked first → Failed > Cancelled > Completed > Printing > Spooling > Accepted > Unknown.
+// Priority: terminal phases checked first -> Failed > Cancelled > Completed > Printing > Spooling > Accepted > Unknown.
 
 bool has_all_status_bits(std::uint32_t value, std::uint32_t mask) noexcept
 {
   return (value & mask) == mask;
 }
 
-// ── Status-name lookup (unchanged from Phase 1) ────────────────────────
-
+// Status-name lookup (unchanged from Phase 1)
 struct StatusName
 {
   std::uint32_t flag;
@@ -76,12 +74,18 @@ constexpr StatusName kStatusNames[] = {
   {JOB_STATUS_RESTART, "restart"},
 #ifdef JOB_STATUS_COMPLETE
   {JOB_STATUS_COMPLETE, "complete"},
+#else
+  {0x00001000, "complete"},
 #endif
 #ifdef JOB_STATUS_RETAINED
   {JOB_STATUS_RETAINED, "retained"},
+#else
+  {0x00002000, "retained"},
 #endif
 #ifdef JOB_STATUS_RENDERING_LOCALLY
   {JOB_STATUS_RENDERING_LOCALLY, "rendering_locally"},
+#else
+  {0x00004000, "rendering_locally"},
 #endif
 };
 #else
@@ -374,7 +378,7 @@ std::optional<JobSnapshotWithMetadata> get_job_snapshot_by_id(HANDLE printer, co
   // DocumentPropertiesW returns the printer's CURRENT DEFAULT DEVMODE,
   // NOT the per-job settings that the application sent.  For v4 drivers
   // (Windows 10/11 default), pDevMode is always NULL and all settings
-  // are carried via PrintTicket XML — which is captured by the XPS
+  // are carried via PrintTicket XML - which is captured by the XPS
   // filter DLL (wpce_xps_filter) in the pipeline, not here.
   //
   // For GDI (Type 3) drivers, JOB_INFO_2W::pDevMode IS the correct
@@ -466,7 +470,7 @@ void apply_job_notification_field(JobNotificationSnapshot& snapshot, const PRINT
       snapshot.total_bytes = data.NotifyData.adwData[0];
       break;
     case JOB_NOTIFY_FIELD_TIME:
-      // JOB_NOTIFY_FIELD_TIME — stored in adwData as a SYSTEMTIME or FILETIME.
+      // JOB_NOTIFY_FIELD_TIME - stored in adwData as a SYSTEMTIME or FILETIME.
       // We capture this information via the submitted field above; time is kept
       // for diagnostic purposes only.
       break;
@@ -562,8 +566,7 @@ core::JobSnapshot make_notification_only_snapshot(
   return snapshot;
 }
 
-// ── Lifecycle event builder helper ─────────────────────────────────────
-
+// Lifecycle event builder helper
 core::JobLifecycleEvent make_lifecycle_event(std::uint32_t job_id,
                                              int sequence,
                                              core::JobLifecyclePhase phase,
@@ -599,8 +602,7 @@ core::JobLifecycleEvent make_lifecycle_event(std::uint32_t job_id,
 
 }  // namespace
 
-// ── Public phase classifier ─────────────────────────────────────────────
-
+// Public phase classifier
 core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
                                        const std::string& /*status_string*/) noexcept
 {
@@ -609,24 +611,22 @@ core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
     return core::JobLifecyclePhase::Unknown;
   }
 
-  // Terminal / error states first (priority order).
+  // Phase classification priority
+  //
+  // Order matters: a job can carry multiple status bits simultaneously.
+  // Higher-priority checks fire first.  The key principle is that ACTIVE
+  // processing states (spooling, printing) take precedence over PASSIVE
+  // device states (offline, paperout, user_intervention).  A job that is
+  // spooling to a printer that happens to be offline is still spooling -
+  // the job will complete when the printer comes back.
+
+  // 1. Genuine job error - unrecoverable processing failure.
 #ifdef JOB_STATUS_ERROR
   if (has_all_status_bits(status_flags, JOB_STATUS_ERROR))
     return core::JobLifecyclePhase::Failed;
 #endif
-#ifdef JOB_STATUS_PAPEROUT
-  if (has_all_status_bits(status_flags, JOB_STATUS_PAPEROUT))
-    return core::JobLifecyclePhase::Failed;
-#endif
-#ifdef JOB_STATUS_OFFLINE
-  if (has_all_status_bits(status_flags, JOB_STATUS_OFFLINE))
-    return core::JobLifecyclePhase::Failed;
-#endif
-#ifdef JOB_STATUS_USER_INTERVENTION
-  if (has_all_status_bits(status_flags, JOB_STATUS_USER_INTERVENTION))
-    return core::JobLifecyclePhase::Failed;
-#endif
 
+  // 2. Terminal deletion states.
 #ifdef JOB_STATUS_DELETED
   if (has_all_status_bits(status_flags, JOB_STATUS_DELETED))
     return core::JobLifecyclePhase::Cancelled;
@@ -637,24 +637,31 @@ core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
     return core::JobLifecyclePhase::Cancelled;
 #endif
 
+  // 3. Successful completion states.
 #ifdef JOB_STATUS_COMPLETE
   if (has_all_status_bits(status_flags, JOB_STATUS_COMPLETE))
+    return core::JobLifecyclePhase::Completed;
+#else
+  if (has_all_status_bits(status_flags, 0x00001000u))
     return core::JobLifecyclePhase::Completed;
 #endif
 #ifdef JOB_STATUS_RETAINED
   if (has_all_status_bits(status_flags, JOB_STATUS_RETAINED))
     return core::JobLifecyclePhase::Completed;
+#else
+  if (has_all_status_bits(status_flags, 0x00002000u))
+    return core::JobLifecyclePhase::Completed;
 #endif
 #ifdef JOB_STATUS_PRINTED
-  if (has_all_status_bits(status_flags, JOB_STATUS_PRINTED) &&
-      !has_all_status_bits(status_flags, JOB_STATUS_RETAINED))
+  if (has_all_status_bits(status_flags, JOB_STATUS_PRINTED)
+#ifdef JOB_STATUS_RETAINED
+      && !has_all_status_bits(status_flags, JOB_STATUS_RETAINED)
+#endif
+  )
     return core::JobLifecyclePhase::Completed;
 #endif
 
-  // ── Multi-flag completion: some brands report PRINTING|PRINTED ─────────
-  // HP LaserJet & many PCL6 drivers emit PRINTING | PRINTED simultaneously.
-  // Treat this as Completed to avoid missing the terminal transition on
-  // fast printers where the job disappears before the next notification cycle.
+  // 4. Multi-flag completion: HP & PCL6 drivers emit PRINTING|PRINTED.
 #ifdef JOB_STATUS_PRINTING
 #ifdef JOB_STATUS_PRINTED
   if (has_all_status_bits(status_flags, JOB_STATUS_PRINTING) &&
@@ -663,7 +670,8 @@ core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
 #endif
 #endif
 
-  // Active / in-progress states.
+  // 5. Active / in-progress states - checked BEFORE passive device states
+  //    so that SPOOLING|OFFLINE -> Spooling (not Failed), etc.
 #ifdef JOB_STATUS_PRINTING
   if (has_all_status_bits(status_flags, JOB_STATUS_PRINTING))
     return core::JobLifecyclePhase::Printing;
@@ -679,9 +687,30 @@ core::JobLifecyclePhase classify_phase(const std::uint32_t status_flags,
   // instead of SPOOLING.  Treat as spooling-equivalent.
   if (has_all_status_bits(status_flags, JOB_STATUS_RENDERING_LOCALLY))
     return core::JobLifecyclePhase::Spooling;
+#else
+  if (has_all_status_bits(status_flags, 0x00004000u))
+    return core::JobLifecyclePhase::Spooling;
 #endif
 
-  // Paused / blocked — still active but not progressing.
+  // 6. Passive device / queue states - the job is waiting, not dead.
+  //    These indicate why the printer isn't consuming jobs right now,
+  //    but the job itself is healthy and will proceed when the condition
+  //    clears.  Classified as Spooling so the lifecycle stays open and
+  //    page counts / metadata continue to be tracked.
+#ifdef JOB_STATUS_OFFLINE
+  if (has_all_status_bits(status_flags, JOB_STATUS_OFFLINE))
+    return core::JobLifecyclePhase::Spooling;
+#endif
+#ifdef JOB_STATUS_PAPEROUT
+  if (has_all_status_bits(status_flags, JOB_STATUS_PAPEROUT))
+    return core::JobLifecyclePhase::Spooling;
+#endif
+#ifdef JOB_STATUS_USER_INTERVENTION
+  if (has_all_status_bits(status_flags, JOB_STATUS_USER_INTERVENTION))
+    return core::JobLifecyclePhase::Spooling;
+#endif
+
+  // 7. Paused / blocked / restarting - still active but not progressing.
 #ifdef JOB_STATUS_PAUSED
   if (has_all_status_bits(status_flags, JOB_STATUS_PAUSED))
     return core::JobLifecyclePhase::Spooling;
@@ -746,82 +775,99 @@ std::vector<JobSnapshotWithMetadata> enumerate_printer_jobs(const std::wstring& 
 #ifdef _WIN32
   PrinterHandle printer(printer_name);
 
-  DWORD bytes_needed = 0;
-  DWORD jobs_returned = 0;
-  constexpr DWORD kMaxJobsPerSnapshot = 1024;
+  std::vector<JobSnapshotWithMetadata> snapshots;
+  DWORD first_job = 0;
+  constexpr DWORD kJobsPerPage = 256;
 
-  const BOOL probe_result =
-    EnumJobsW(printer.get(), 0, kMaxJobsPerSnapshot, 2, nullptr, 0, &bytes_needed, &jobs_returned);
-  if (probe_result != FALSE)
+  for (;;)
   {
-    return {};
-  }
+    DWORD bytes_needed = 0;
+    DWORD jobs_returned = 0;
 
-  const DWORD probe_error = GetLastError();
-  if (probe_error != ERROR_INSUFFICIENT_BUFFER)
-  {
-    if (probe_error == ERROR_SUCCESS || bytes_needed == 0)
-    {
-      return {};
-    }
-    throw std::runtime_error(format_win32_error("EnumJobsW", probe_error));
-  }
-
-  // Guard against corrupt/extreme spooler responses before allocating.
-  // Soft failure: return empty instead of throw — the periodic rescan will
-  // retry on the next cycle without killing the watcher thread.
-  constexpr DWORD kMaxEnumJobsBuffer = 128 * 1024 * 1024;  // 128 MB
-  if (bytes_needed > kMaxEnumJobsBuffer)
-  {
-    return {};
-  }
-
-  // Add headroom — the spooler may add jobs between probe and fetch during
-  // high-concurrency scenarios (e.g. simulator stress tests).
-  const DWORD alloc_size = bytes_needed + static_cast<DWORD>(sizeof(JOB_INFO_2W) * 64);
-  std::vector<BYTE> buffer(alloc_size);
-  DWORD buffer_size = static_cast<DWORD>(buffer.size());
-
-  for (int attempt = 0; attempt < 4; ++attempt)
-  {
-    if (EnumJobsW(
-          printer.get(),
-          0,
-          kMaxJobsPerSnapshot,
-          2,
-          buffer.data(),
-          buffer_size,
-          &bytes_needed,
-          &jobs_returned))
+    const BOOL probe_result =
+      EnumJobsW(printer.get(), first_job, kJobsPerPage, 2, nullptr, 0, &bytes_needed, &jobs_returned);
+    if (probe_result != FALSE)
     {
       break;
     }
 
-    const DWORD err = GetLastError();
-    if (err == ERROR_INSUFFICIENT_BUFFER && attempt < 3)
+    const DWORD probe_error = GetLastError();
+    if (probe_error != ERROR_INSUFFICIENT_BUFFER)
     {
-      if (bytes_needed > kMaxEnumJobsBuffer)
+      if (probe_error == ERROR_SUCCESS || bytes_needed == 0)
       {
-        return {};
+        break;
       }
-      buffer.resize(bytes_needed + (sizeof(JOB_INFO_2W) * 64));
-      buffer_size = static_cast<DWORD>(buffer.size());
-      continue;
+      throw std::runtime_error(format_win32_error("EnumJobsW", probe_error));
     }
 
-    // Soft failure: return empty rather than kill the watcher thread.
-    return {};
-  }
+    // Guard against corrupt/extreme spooler responses before allocating.
+    // Soft failure: keep any pages already read and retry on the next rescan.
+    constexpr DWORD kMaxEnumJobsBuffer = 128 * 1024 * 1024;  // 128 MB
+    if (bytes_needed > kMaxEnumJobsBuffer)
+    {
+      break;
+    }
 
-  const auto* jobs = reinterpret_cast<const JOB_INFO_2W*>(buffer.data());
-  std::vector<JobSnapshotWithMetadata> snapshots;
-  snapshots.reserve(jobs_returned);
-  for (DWORD index = 0; index < jobs_returned; ++index)
-  {
-    snapshots.push_back(JobSnapshotWithMetadata{
-      .job = to_snapshot(jobs[index]),
-      .metadata = collector::extract_metadata(jobs[index]),
-    });
+    // Add headroom: the spooler may add jobs between probe and fetch during
+    // high-concurrency scenarios (e.g. simulator stress tests).
+    const DWORD alloc_size = bytes_needed + static_cast<DWORD>(sizeof(JOB_INFO_2W) * 64);
+    std::vector<BYTE> buffer(alloc_size);
+    DWORD buffer_size = static_cast<DWORD>(buffer.size());
+
+    bool page_read = false;
+    for (int attempt = 0; attempt < 4; ++attempt)
+    {
+      if (EnumJobsW(
+            printer.get(),
+            first_job,
+            kJobsPerPage,
+            2,
+            buffer.data(),
+            buffer_size,
+            &bytes_needed,
+            &jobs_returned))
+      {
+        page_read = true;
+        break;
+      }
+
+      const DWORD err = GetLastError();
+      if (err == ERROR_INSUFFICIENT_BUFFER && attempt < 3)
+      {
+        if (bytes_needed > kMaxEnumJobsBuffer)
+        {
+          break;
+        }
+        buffer.resize(bytes_needed + (sizeof(JOB_INFO_2W) * 64));
+        buffer_size = static_cast<DWORD>(buffer.size());
+        continue;
+      }
+
+      // Soft failure: keep any pages already read rather than kill the watcher thread.
+      break;
+    }
+
+    if (!page_read || jobs_returned == 0)
+    {
+      break;
+    }
+
+    const auto* jobs = reinterpret_cast<const JOB_INFO_2W*>(buffer.data());
+    snapshots.reserve(snapshots.size() + jobs_returned);
+    for (DWORD index = 0; index < jobs_returned; ++index)
+    {
+      snapshots.push_back(JobSnapshotWithMetadata{
+        .job = to_snapshot(jobs[index]),
+        .metadata = collector::extract_metadata(jobs[index]),
+      });
+    }
+
+    first_job += jobs_returned;
+    if (jobs_returned < kJobsPerPage)
+    {
+      break;
+    }
   }
 
   std::sort(snapshots.begin(), snapshots.end(), [](const JobSnapshotWithMetadata& left, const JobSnapshotWithMetadata& right) {
@@ -835,8 +881,7 @@ std::vector<JobSnapshotWithMetadata> enumerate_printer_jobs(const std::wstring& 
 #endif
 }
 
-// ── PrintWatcher implementation ─────────────────────────────────────────
-
+// PrintWatcher implementation
 PrintWatcher::PrintWatcher(WatcherConfig config,
                            JobSnapshotCallback job_callback,
                            MetadataSnapshotCallback metadata_callback,
@@ -904,6 +949,51 @@ std::string PrintWatcher::last_error() const
   return last_error_;
 }
 
+core::JobLifecycleSummary PrintWatcher::build_summary_from_state(
+    const InternalJobState& state) const
+{
+  auto summary = state.summary;
+
+  // Compute total duration from first to last event.
+  if (state.first_event_time.time_since_epoch().count() > 0)
+  {
+    const auto end = state.last_event_time.time_since_epoch().count() > 0
+                       ? state.last_event_time
+                       : state.first_event_time;
+    summary.total_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
+      end - state.first_event_time).count();
+  }
+
+  // Ensure phase_dwells is up-to-date: add current phase dwell if still active.
+  if (state.phase_entry_time.time_since_epoch().count() > 0 &&
+      !is_terminal_phase(state.current_phase))
+  {
+    const auto now = std::chrono::steady_clock::now();
+    const auto current_dwell = std::chrono::duration_cast<std::chrono::milliseconds>(
+      now - state.phase_entry_time).count() + state.cumulative_phase_ms;
+    const std::string phase_name{core::to_string(state.current_phase)};
+    bool found = false;
+    for (auto& dwell : summary.phase_dwells)
+    {
+      if (dwell.phase_name == phase_name)
+      {
+        dwell.duration_ms = current_dwell;
+        found = true;
+        break;
+      }
+    }
+    if (!found)
+    {
+      summary.phase_dwells.push_back(core::PhaseDwellEntry{
+        .phase_name = phase_name,
+        .duration_ms = current_dwell,
+      });
+    }
+  }
+
+  return summary;
+}
+
 std::vector<core::JobLifecycleSummary> PrintWatcher::lifecycle_summaries() const
 {
   std::scoped_lock lock(summaries_mutex_);
@@ -911,52 +1001,43 @@ std::vector<core::JobLifecycleSummary> PrintWatcher::lifecycle_summaries() const
   result.reserve(job_states_.size());
   for (const auto& [id, state] : job_states_)
   {
-    auto summary = state.summary;
-
-    // Compute total duration from first to last event.
-    if (state.first_event_time.time_since_epoch().count() > 0)
-    {
-      const auto end = state.last_event_time.time_since_epoch().count() > 0
-                         ? state.last_event_time
-                         : state.first_event_time;
-      summary.total_duration_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
-        end - state.first_event_time).count();
-    }
-
-    // Ensure phase_dwells is up-to-date: add current phase dwell if still active.
-    if (state.phase_entry_time.time_since_epoch().count() > 0 &&
-        !is_terminal_phase(state.current_phase))
-    {
-      const auto now = std::chrono::steady_clock::now();
-      const auto current_dwell = std::chrono::duration_cast<std::chrono::milliseconds>(
-        now - state.phase_entry_time).count() + state.cumulative_phase_ms;
-      // Only add if not already present.
-      const std::string phase_name{core::to_string(state.current_phase)};
-      bool found = false;
-      for (auto& dwell : summary.phase_dwells)
-      {
-        if (dwell.phase_name == phase_name)
-        {
-          dwell.duration_ms = current_dwell;
-          found = true;
-          break;
-        }
-      }
-      if (!found)
-      {
-        summary.phase_dwells.push_back(core::PhaseDwellEntry{
-          .phase_name = phase_name,
-          .duration_ms = current_dwell,
-        });
-      }
-    }
-
-    result.push_back(std::move(summary));
+    result.push_back(build_summary_from_state(state));
   }
 
   std::sort(result.begin(), result.end(), [](const core::JobLifecycleSummary& left, const core::JobLifecycleSummary& right) {
     return left.job_id < right.job_id;
   });
+  return result;
+}
+
+std::vector<core::JobLifecycleSummary> PrintWatcher::lifecycle_summaries(
+    std::size_t offset, std::size_t limit, std::size_t& total) const
+{
+  std::scoped_lock lock(summaries_mutex_);
+  total = job_states_.size();
+
+  // Collect sorted IDs for deterministic pagination.
+  std::vector<std::uint32_t> ids;
+  ids.reserve(job_states_.size());
+  for (const auto& [id, state] : job_states_)
+  {
+    ids.push_back(id);
+  }
+  std::sort(ids.begin(), ids.end());
+
+  const std::size_t start = std::min(offset, ids.size());
+  const std::size_t end = (limit > 0) ? std::min(start + limit, ids.size()) : ids.size();
+
+  std::vector<core::JobLifecycleSummary> result;
+  result.reserve(end - start);
+  for (std::size_t i = start; i < end; ++i)
+  {
+    auto it = job_states_.find(ids[i]);
+    if (it != job_states_.end())
+    {
+      result.push_back(build_summary_from_state(it->second));
+    }
+  }
   return result;
 }
 
@@ -966,7 +1047,19 @@ void PrintWatcher::run()
   std::unordered_map<std::uint32_t, core::JobSnapshot> known_snapshots;
   std::unordered_map<std::uint32_t, core::MetadataSnapshot> known_metadata;
 
-  // ── Logging helper ────────────────────────────────────────────────────
+  // TotalPages retry tracking: some cover-sheet drivers report TotalPages=0
+  // initially and populate it only after spooling progresses.  We re-query
+  // these jobs during periodic rescans until the value appears or retries
+  // are exhausted.
+  std::unordered_map<std::uint32_t, int> zero_page_retry_count;
+  constexpr int kMaxZeroPageRetries = 10;  // 10 * rescan_interval ~ 50s
+
+  // Spool file enrichment tracking: SPL files can still be growing when the
+  // first notification arrives, so retry a few times while metadata is weak.
+  std::unordered_map<std::uint32_t, int> spool_enrichment_attempts;
+  constexpr int kMaxSpoolEnrichmentAttempts = 8;
+
+  // Logging helper
   const auto log = [&](LogLevel level, std::string_view category, std::string message) {
     if (config_.log_callback)
     {
@@ -974,8 +1067,7 @@ void PrintWatcher::run()
     }
   };
 
-  // ── Lifecycle tracking helpers ───────────────────────────────────────
-
+  // Lifecycle tracking helpers
   const auto ensure_internal_state = [&](std::uint32_t job_id,
                                          const std::string& user,
                                          const std::string& document_name,
@@ -1016,7 +1108,7 @@ void PrintWatcher::run()
       pages_printed,
       total_pages);
 
-    // ── Phase timing ──────────────────────────────────────────────────
+    // Phase timing
     const auto now = std::chrono::steady_clock::now();
 
     // First event tracking.
@@ -1049,7 +1141,7 @@ void PrintWatcher::run()
     }
     else if (state.phase_entry_time.time_since_epoch().count() == 0)
     {
-      // First event for this job — start timing.
+      // First event for this job - start timing.
       state.phase_entry_time = now;
     }
 
@@ -1079,14 +1171,19 @@ void PrintWatcher::run()
     {
       state.last_progress_time = std::chrono::steady_clock::now();  // stop stall clock
 
-      // Remove from dedup maps so that recycled JobIds don't collide with stale entries.
+      // Keep the signature in emitted_signatures so subsequent rescans
+      // dedup this job instead of re-emitting it every 5 seconds.
+      // Recycled JobIds are handled safely: a recycled ID produces a
+      // different signature (different user/document/submit_time), so
+      // the dedup check detects the change and emits the new snapshot.
       log(LogLevel::Debug, "cache",
           "Job " + std::to_string(state.summary.job_id) +
           ": terminal phase \"" + std::string(core::to_string(phase)) +
-          "\", removed from dedup maps");
-      emitted_signatures.erase(state.summary.job_id);
+          "\", retaining signature for dedup");
       known_snapshots.erase(state.summary.job_id);
       known_metadata.erase(state.summary.job_id);
+      spool_enrichment_attempts.erase(state.summary.job_id);
+      zero_page_retry_count.erase(state.summary.job_id);
     }
     else
     {
@@ -1119,9 +1216,7 @@ void PrintWatcher::run()
     {
       // Parse the status string for known substrings.
       const std::string& s = snapshot.status;
-      if (s.find("error") != std::string::npos ||
-          s.find("offline") != std::string::npos ||
-          s.find("paperout") != std::string::npos)
+      if (s.find("error") != std::string::npos)
       {
         new_phase = core::JobLifecyclePhase::Failed;
       }
@@ -1147,6 +1242,14 @@ void PrintWatcher::run()
       {
         new_phase = core::JobLifecyclePhase::Spooling;
       }
+      else if (s.find("offline") != std::string::npos ||
+               s.find("paperout") != std::string::npos ||
+               s.find("user_intervention") != std::string::npos ||
+               s.find("restart") != std::string::npos)
+      {
+        // Device-level status flags - the job is waiting, not dead.
+        new_phase = core::JobLifecyclePhase::Spooling;
+      }
       else if (s.find("notification_added") != std::string::npos)
       {
         new_phase = core::JobLifecyclePhase::Accepted;
@@ -1156,17 +1259,17 @@ void PrintWatcher::run()
     core::JobLifecyclePhase new_phase = core::JobLifecyclePhase::Unknown;
 #endif
 
-    // ── Brand-specific: Kyocera / Ricoh / Sharp drivers ───────────────────
+    // Brand-specific: Kyocera / Ricoh / Sharp drivers
     // These drivers often report zero status flags on the very first
     // notification (or on the first EnumJobs scan).  Without this, the
     // job's first event is suppressed at line 996-998 and no Accepted
-    // event fires — the job remains invisible until a later poll.
+    // event fires - the job remains invisible until a later poll.
     if (new_phase == core::JobLifecyclePhase::Unknown &&
         state.summary.events.empty())
     {
       log(LogLevel::Info, "phase",
           "Job " + std::to_string(job_id) +
-          ": new job with status_flags=0 → emitting Accepted (brand compat)");
+          ": new job with status_flags=0 -> emitting Accepted (brand compat)");
       new_phase = core::JobLifecyclePhase::Accepted;
     }
 
@@ -1199,7 +1302,7 @@ void PrintWatcher::run()
       const int prev_printed = state.summary.events.back().pages_printed;
       if (pages_printed_val != prev_printed || total_pages_val != prev_total)
       {
-        // Progress changed — emit an update as the current phase.
+        // Progress changed - emit an update as the current phase.
         log(LogLevel::Debug, "phase",
             "Job " + std::to_string(job_id) +
             ": progress changed " + std::to_string(prev_printed) + "/" +
@@ -1212,7 +1315,7 @@ void PrintWatcher::run()
     }
 
     // If this job is in a true terminal phase, don't emit more events.
-    // Stalled is NOT terminal — it can recover when real progress arrives.
+    // Stalled is NOT terminal - it can recover when real progress arrives.
     if (is_terminal_phase(state.current_phase) && !state.summary.events.empty())
     {
       log(LogLevel::Debug, "phase",
@@ -1245,15 +1348,108 @@ void PrintWatcher::run()
     emit_lifecycle_event(state, new_phase, snapshot.status, pages_printed_val, total_pages_val);
   };
 
-  // ── Snapshot emission ─────────────────────────────────────────────────
-
-  const auto emit_snapshot = [&](const core::JobSnapshot& snapshot, const core::MetadataSnapshot& metadata) {
+  // Snapshot emission
+  const auto emit_snapshot = [&](const core::JobSnapshot& snapshot, core::MetadataSnapshot metadata) {
     if (snapshot.job_id == 0)
     {
       return;
     }
 
-    // Lifecycle tracking — fires before dedup so every phase transition is recorded.
+    // Spool file enrichment
+    // When the DEVMODE-based metadata is insufficient (copies=1, or key
+    // fields are NotReported), try parsing the SPL spool file to extract
+    // the per-job DEVMODE embedded in the EMF spool data.  This resolves
+    // the Word copies=1 issue and provides data for v4 drivers.
+    // Retried a bounded number of times because the SPL can still be growing.
+    if (spool_enrichment_attempts[snapshot.job_id] < kMaxSpoolEnrichmentAttempts)
+    {
+      bool needs_enrichment = false;
+
+      // Trigger 1: copies is "1" or NotReported (Word multi-copy issue).
+      int copies_val = 0;
+      try { copies_val = std::stoi(metadata.copies.value); } catch (...) {}
+      if (copies_val <= 1) needs_enrichment = true;
+
+      // Trigger 2: color not reported (driver did not set DM_COLOR).
+      if (metadata.color.state != core::FieldState::Reported) needs_enrichment = true;
+
+      // Trigger 3: total_pages is 0.
+      int tp = 0;
+      try { tp = std::stoi(metadata.total_pages.value); } catch (...) {}
+      if (tp == 0) needs_enrichment = true;
+
+      // Trigger 4: file type is missing. CAD and some shell/WeChat print
+      // paths can rename pDocument to a layout/paper title, while SHD still
+      // carries the original path used by file-type pricing.
+      if (metadata.file_extension.state != core::FieldState::Reported ||
+          metadata.file_extension.value.empty() ||
+          metadata.file_extension_confidence < 3)
+      {
+        needs_enrichment = true;
+      }
+
+      if (needs_enrichment)
+      {
+        ++spool_enrichment_attempts[snapshot.job_id];
+        auto spool_info = parser::find_and_parse_spool_file(
+            snapshot.job_id, snapshot.printer_name);
+        if (spool_info.has_value())
+        {
+          const auto spool_md = parser::metadata_from_spool(*spool_info);
+
+          // Merge: spool data fills gaps but does not overwrite existing Reported values.
+          auto merge_field = [](core::FieldValue& dst, const core::FieldValue& src) {
+            if (src.state == core::FieldState::Reported && !src.value.empty())
+            {
+              if (dst.state != core::FieldState::Reported || dst.value.empty())
+                dst = src;
+            }
+          };
+
+          // For copies, spool data takes priority over DEVMODE if it shows > 1.
+          if (spool_info->has_devmode && spool_info->dm_copies > 1)
+          {
+            metadata.copies = core::FieldValue{
+                std::to_string(spool_info->dm_copies), core::FieldState::Reported};
+            log(LogLevel::Info, "spool",
+                "Job " + std::to_string(snapshot.job_id) +
+                ": copies enriched from spool DEVMODE -> " +
+                std::to_string(spool_info->dm_copies));
+          }
+
+          merge_field(metadata.color, spool_md.color);
+          merge_field(metadata.duplex, spool_md.duplex);
+          merge_field(metadata.paper_size, spool_md.paper_size);
+          merge_field(metadata.orientation, spool_md.orientation);
+          merge_field(metadata.n_up, spool_md.n_up);
+          merge_field(metadata.collate, spool_md.collate);
+          merge_field(metadata.print_quality, spool_md.print_quality);
+          if (spool_md.file_extension.state == core::FieldState::Reported &&
+              !spool_md.file_extension.value.empty() &&
+              (metadata.file_extension.state != core::FieldState::Reported ||
+               metadata.file_extension.value.empty() ||
+               spool_md.file_extension_confidence > metadata.file_extension_confidence))
+          {
+            metadata.file_extension = spool_md.file_extension;
+            metadata.file_extension_source = spool_md.file_extension_source;
+            metadata.file_extension_confidence = spool_md.file_extension_confidence;
+          }
+
+          // Page count from EMF parsing - use only if spooler reported 0.
+          if (tp == 0 && spool_info->emf_page_count > 0)
+          {
+            metadata.total_pages = core::FieldValue{
+                std::to_string(spool_info->emf_page_count), core::FieldState::Reported};
+            log(LogLevel::Info, "spool",
+                "Job " + std::to_string(snapshot.job_id) +
+                ": total_pages enriched from EMF parsing -> " +
+                std::to_string(spool_info->emf_page_count));
+          }
+        }
+      }
+    }
+
+    // Lifecycle tracking - fires before dedup so every phase transition is recorded.
     process_phase_transition(snapshot, metadata);
 
     const std::string signature = make_signature(snapshot);
@@ -1283,6 +1479,14 @@ void PrintWatcher::run()
       known_metadata[snapshot.job_id] = metadata;   // refresh cache
       metadata_callback_(metadata);
     }
+
+    // Track jobs whose TotalPages is 0 for retry during periodic rescans.
+    int tp = 0;
+    try { tp = std::stoi(metadata.total_pages.value); } catch (...) {}
+    if (tp == 0)
+      zero_page_retry_count.try_emplace(snapshot.job_id, 0);
+    else
+      zero_page_retry_count.erase(snapshot.job_id);
   };
 
   // Build a minimal metadata snapshot for notification-only fallback paths.
@@ -1335,8 +1539,7 @@ void PrintWatcher::run()
     }
   };
 
-  // ── Main loop ─────────────────────────────────────────────────────────
-
+  // Main loop
   try
   {
 #ifdef _WIN32
@@ -1354,7 +1557,7 @@ void PrintWatcher::run()
 
     while (!stop_requested_)
     {
-      // ── Periodic full rescan — safety net for spoolers that drop notifications ──
+      // Periodic full rescan - safety net for spoolers that drop notifications
       if (config_.rescan_interval.count() > 0)
       {
         const auto now = std::chrono::steady_clock::now();
@@ -1370,6 +1573,38 @@ void PrintWatcher::run()
               " jobs_tracked=" + std::to_string(job_states_.size()));
           emit_changed_jobs();
           last_rescan = now;
+
+          // Retry pass for jobs that had TotalPages=0 - re-query and emit if updated.
+          for (auto it = zero_page_retry_count.begin(); it != zero_page_retry_count.end(); )
+          {
+            if (it->second >= kMaxZeroPageRetries)
+            {
+              log(LogLevel::Warn, "retry",
+                  "Job " + std::to_string(it->first) +
+                  ": TotalPages still 0 after " + std::to_string(kMaxZeroPageRetries) + " retries, giving up");
+              it = zero_page_retry_count.erase(it);
+              continue;
+            }
+
+            auto refreshed = get_job_snapshot_by_id(printer.get(), it->first);
+            if (refreshed.has_value())
+            {
+              int tp = 0;
+              try { tp = std::stoi(refreshed->metadata.total_pages.value); } catch (...) {}
+              if (tp > 0)
+              {
+                log(LogLevel::Info, "retry",
+                    "Job " + std::to_string(it->first) +
+                    ": TotalPages recovered to " + std::to_string(tp) +
+                    " on retry #" + std::to_string(it->second + 1));
+                emit_snapshot(refreshed->job, refreshed->metadata);
+                it = zero_page_retry_count.erase(it);
+                continue;
+              }
+            }
+            it->second++;
+            ++it;
+          }
         }
       }
 
@@ -1377,17 +1612,32 @@ void PrintWatcher::run()
         WaitForSingleObject(notification.get(), static_cast<DWORD>(config_.wait_timeout.count()));
       if (wait_result == WAIT_TIMEOUT)
       {
+        consecutive_wait_failures_ = 0;
         // Periodic stall check on timeout.
         tick_stall_detection();
         continue;
       }
       if (wait_result != WAIT_OBJECT_0)
       {
+        ++consecutive_wait_failures_;
         log(LogLevel::Error, "notify",
             "WaitForSingleObject failed: " + format_win32_error("WaitForSingleObject", GetLastError()));
+        // After 10 consecutive failures (~2.5 s at 250 ms timeout),
+        // the spooler has likely restarted.  Let the loop exit so the
+        // bridge can reconnect.
+        if (consecutive_wait_failures_ >= 10)
+        {
+          log(LogLevel::Error, "notify",
+              "WaitForSingleObject failed " + std::to_string(consecutive_wait_failures_) +
+              " times consecutively - spooler may have restarted; exiting watcher loop for restart");
+          stop_requested_ = true;
+          set_last_error("spooler_restart_detected");
+          break;
+        }
         std::this_thread::sleep_for(std::chrono::seconds{1});
         continue;
       }
+      consecutive_wait_failures_ = 0;
 
       perf_monitor_.set_last_notification_time(std::chrono::steady_clock::now());
       const auto processing_start = std::chrono::steady_clock::now();
@@ -1443,7 +1693,7 @@ void PrintWatcher::run()
               ": GetJobW failed, using notification-only stub (known_snapshot=" +
               (had_known ? "yes" : "no") + ")");
 
-          // ── Recover from metadata cache ─────────────────────────────
+          // Recover from metadata cache
           // When GetJobW fails (job already deleted from spooler), we
           // lose pDevMode.  Recover previously-cached DEVMODE fields so
           // the UI does not flash all-N/A then recover on the next
@@ -1453,7 +1703,7 @@ void PrintWatcher::run()
             auto cached = known_metadata.find(job_notification.job_id);
             if (cached != known_metadata.end())
             {
-              // Overlay cached field values — notification carries
+              // Overlay cached field values - notification carries
               // pages_printed / total_pages which are fresher.
               auto copy_if_reported = [&](core::FieldValue& dst,
                                           const core::FieldValue& src) {
@@ -1493,7 +1743,7 @@ void PrintWatcher::run()
       if (info.get() != nullptr && (info.get()->Flags & PRINTER_NOTIFY_INFO_DISCARDED) != 0)
       {
         log(LogLevel::Warn, "notify",
-            "PRINTER_NOTIFY_INFO_DISCARDED flag set — requesting full refresh");
+            "PRINTER_NOTIFY_INFO_DISCARDED flag set - requesting full refresh");
         PRINTER_NOTIFY_OPTIONS refresh_options{};
         refresh_options.Version = 2;
         refresh_options.Flags = PRINTER_NOTIFY_OPTIONS_REFRESH;
@@ -1548,9 +1798,31 @@ void PrintWatcher::run()
         }  // else (refresh succeeded)
       }
 
-      if (has_job_change_flags(change_flags))
+      // Full rescan after job-change notifications (rate-limited)
+      // Individual job changes are processed incrementally in the
+      // notification loop above.  However, spooler notifications may
+      // omit job details for some drivers, so we also trigger a full
+      // EnumJobs sweep as a fast safety net.
+      //
+      // Rate-limited to config_.rescan_interval to prevent the death
+      // spiral that occurs when thousands of active jobs each trigger
+      // a notification -> full-rescan cycle faster than the scan can
+      // complete.
+      const bool discarded_detected =
+        info.get() != nullptr && (info.get()->Flags & PRINTER_NOTIFY_INFO_DISCARDED) != 0;
+      if (has_job_change_flags(change_flags) || discarded_detected)
       {
-        emit_changed_jobs();
+        const auto now_after_notify = std::chrono::steady_clock::now();
+        if (now_after_notify - last_rescan >= config_.rescan_interval)
+        {
+          if (discarded_detected)
+          {
+            log(LogLevel::Warn, "notify",
+                "DISCARDED detected, triggering full rescan");
+          }
+          emit_changed_jobs();
+          last_rescan = now_after_notify;
+        }
       }
 
       // Periodic stall check after processing notifications.
@@ -1567,23 +1839,40 @@ void PrintWatcher::run()
         std::chrono::duration<double, std::milli>(processing_end - processing_start).count();
       perf_monitor_.set_last_event_processing_ms(processing_ms);
 
-      // Periodic cleanup of terminal job states to bound memory growth.
+      // Periodic cleanup of terminal AND long-stalled job states to bound
+      // memory growth over long-running sessions.  Rate-limited to once
+      // per 60 s - no size guard so it scales with any job count.
       {
-        std::scoped_lock lk(summaries_mutex_);
-        if (job_states_.size() > 256)
+        if (now - last_cleanup_ >= std::chrono::seconds{60})
         {
-          const auto cutoff = now - std::chrono::minutes{10};
-          for (auto it = job_states_.begin(); it != job_states_.end(); )
+          last_cleanup_ = now;
+          std::vector<std::uint32_t> cleaned_ids;
           {
-            if (is_terminal_phase(it->second.current_phase) &&
-                it->second.last_event_time < cutoff)
+            std::scoped_lock lk(summaries_mutex_);
+            const auto terminal_cutoff = now - std::chrono::minutes{10};
+            const auto zombie_cutoff = now - std::chrono::minutes{30};
+            for (auto it = job_states_.begin(); it != job_states_.end(); )
             {
-              it = job_states_.erase(it);
+              const bool is_terminal = is_terminal_phase(it->second.current_phase);
+              const bool is_stalled = (it->second.current_phase == core::JobLifecyclePhase::Stalled);
+              const bool is_empty = it->second.summary.events.empty();
+              const bool is_old_terminal = is_terminal && it->second.last_event_time < terminal_cutoff;
+              const bool is_zombie = (is_stalled || is_empty) && it->second.last_event_time < zombie_cutoff;
+
+              if (is_old_terminal || is_zombie)
+              {
+                cleaned_ids.push_back(it->first);
+                it = job_states_.erase(it);
+              }
+              else
+              {
+                ++it;
+              }
             }
-            else
-            {
-              ++it;
-            }
+          }
+          for (const auto job_id : cleaned_ids)
+          {
+            emitted_signatures.erase(job_id);
           }
         }
       }
@@ -1654,8 +1943,14 @@ void PrintWatcher::tick_stall_detection()
 
   const auto now = std::chrono::steady_clock::now();
 
-  std::scoped_lock lock(summaries_mutex_);
-  for (auto& [job_id, state] : job_states_)
+  // Collect lifecycle events under the lock, then emit callbacks outside
+  // the lock to prevent deadlock if a callback chain re-enters PrintWatcher
+  // (e.g., lifecycle_summaries() which also acquires summaries_mutex_).
+  std::vector<core::JobLifecycleEvent> stalled_events;
+
+  {
+    std::scoped_lock lock(summaries_mutex_);
+    for (auto& [job_id, state] : job_states_)
   {
     // Only check active (non-terminal) jobs.
     if (is_terminal_phase(state.current_phase))
@@ -1738,9 +2033,17 @@ void PrintWatcher::tick_stall_detection()
 
       if (lifecycle_callback_)
       {
-        lifecycle_callback_(event);
+        stalled_events.push_back(event);
       }
     }
+  }
+  }  // summaries_mutex_ released here
+
+  // Emit events outside the lock to avoid deadlock if callbacks
+  // re-enter PrintWatcher (e.g., lifecycle_summaries()).
+  for (const auto& event : stalled_events)
+  {
+    lifecycle_callback_(event);
   }
 }
 

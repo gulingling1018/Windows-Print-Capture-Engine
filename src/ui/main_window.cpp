@@ -1,9 +1,14 @@
 #include "ui/main_window.h"
+#include "ui/filter_install_dialog.h"
+#include "management/filter_install_service.h"
 
 #include "bridge/settlement_bridge.h"
 #include "common/app_config.h"
+#include "common/business_clock.h"
 #include "common/pricing_engine.h"
-#include "ui/grip_splitter.h"
+#include "domain/billing_batch_repository.h"
+#include "domain/billing_migration.h"
+#include "storage/capture_retention.h"
 #include "ui/completion_dialog.h"
 #include "ui/history_explorer_dialog.h"
 #include "ui/job_detail_panel.h"
@@ -13,9 +18,7 @@
 #include "ui/receipt_preview_panel.h"
 #include "ui/settings_dialog.h"
 #include "ui/user_color_palette.h"
-#include "ui/user_group_delegate.h"
-#include "ui/user_group_model.h"
-#include "ui/user_task_model.h"
+#include "ui/billing_view_data.h"
 #include "ui/watcher_bridge.h"
 
 #include <QAbstractItemView>
@@ -24,6 +27,7 @@
 #include <QDateTime>
 #include <QDesktopServices>
 #include <QDir>
+#include <QEventLoop>
 #include <QFile>
 #include <QFrame>
 #include <QHBoxLayout>
@@ -44,7 +48,11 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstdio>
+#include <cstdint>
+#include <filesystem>
 #include <iomanip>
+#include <limits>
 #include <sstream>
 #include <unordered_map>
 
@@ -117,310 +125,43 @@ QString compactPathText(const QString& path)
   return path.left(left) + QStringLiteral("...") + path.right(right);
 }
 
-}  // namespace
-
-// ── XPS Filter Auto-Install ───────────────────────────────────────────
-//
-// The wpce_xps_filter.dll COM filter must be registered under
-// HKLM\CLSID\{GUID} and injected into each v4 printer's XPS pipeline
-// config in the DriverStore.  Both operations require Administrator
-// privilege.
-//
-// Once installed, the spooler loads the filter automatically for every
-// XPS print job — no further admin rights needed.  Normal-user runs
-// benefit from the one-time setup.
-//
-// Strategy:
-//   Admin run     → auto-install silently, then continue as normal.
-//   Non-admin run → if already installed, proceed normally.
-//                    if not installed, alert the user once.
-//
-// The sentinel file %ProgramFiles%\WPCE\wpce_filter_installed avoids
-// re-running the spooler restart on every admin launch.
-
-namespace
+std::filesystem::path backupUnreadableConfig(const std::filesystem::path& cfgPath)
 {
-
-const wchar_t* filterClsid() noexcept
-{
-  return L"{B1C8E3F0-2D4A-5B6C-7D8E-9F0A1B2C3D4E}";
-}
-
-std::wstring filterInstallPath()
-{
-  wchar_t progFiles[MAX_PATH];
-  if (SUCCEEDED(SHGetFolderPathW(nullptr, CSIDL_PROGRAM_FILES, nullptr,
-                                 0, progFiles)))
-    return std::wstring(progFiles) + L"\\WPCE\\wpce_xps_filter.dll";
-  return L"C:\\Program Files\\WPCE\\wpce_xps_filter.dll";
-}
-
-bool isFilterRegistered()
-{
-  std::wstring keyPath = L"CLSID\\";
-  keyPath += filterClsid();
-  HKEY hKey = nullptr;
-  LONG rc = ::RegOpenKeyExW(HKEY_LOCAL_MACHINE, keyPath.c_str(),
-                             0, KEY_READ, &hKey);
-  if (rc == ERROR_SUCCESS) { ::RegCloseKey(hKey); return true; }
-  return false;
-}
-
-bool isFilterSentinelPresent()
-{
-  std::wstring sentinel = filterInstallPath();
-  auto pos = sentinel.rfind(L'\\');
-  if (pos != std::wstring::npos)
-    sentinel = sentinel.substr(0, pos) + L"\\wpce_filter_installed";
-  return ::GetFileAttributesW(sentinel.c_str()) != INVALID_FILE_ATTRIBUTES;
-}
-
-bool isRunningAsAdmin()
-{
-  BOOL isAdmin = FALSE;
-  PSID adminGroup = nullptr;
-  SID_IDENTIFIER_AUTHORITY ntAuth = SECURITY_NT_AUTHORITY;
-  if (::AllocateAndInitializeSid(&ntAuth, 2,
-        SECURITY_BUILTIN_DOMAIN_RID, DOMAIN_ALIAS_RID_ADMINS,
-        0, 0, 0, 0, 0, 0, &adminGroup))
-  {
-    ::CheckTokenMembership(nullptr, adminGroup, &isAdmin);
-    ::FreeSid(adminGroup);
-  }
-  return isAdmin != FALSE;
-}
-
-bool tryInstallFilter(const std::wstring& exeDir)
-{
-  if (isFilterSentinelPresent())
-    return true;
-
-  std::wstring installDir = filterInstallPath();
-  auto pos = installDir.rfind(L'\\');
-  if (pos != std::wstring::npos)
-  {
-    std::wstring dir = installDir.substr(0, pos);
-    ::CreateDirectoryW(dir.c_str(), nullptr);
-  }
-
-  // Copy filter DLL to permanent location.
-  std::wstring srcDll = exeDir + L"\\wpce_xps_filter.dll";
-  if (::GetFileAttributesW(srcDll.c_str()) == INVALID_FILE_ATTRIBUTES)
-    return false;
-
-  ::CopyFileW(srcDll.c_str(), installDir.c_str(), FALSE);
-
-  // Register COM server.
-  HMODULE hMod = ::LoadLibraryW(installDir.c_str());
-  if (hMod)
-  {
-    using RegFn = HRESULT (WINAPI*)();
-    auto regServer = reinterpret_cast<RegFn>(
-      ::GetProcAddress(hMod, "DllRegisterServer"));
-    if (regServer) regServer();
-    ::FreeLibrary(hMod);
-  }
-
-  // Inject filter into v4 printer pipeline configs.
-  const wchar_t* driverStore =
-    L"C:\\Windows\\System32\\DriverStore\\FileRepository";
-
-  WIN32_FIND_DATAW fd{};
-  std::wstring searchPath = std::wstring(driverStore) + L"\\*.inf";
-  HANDLE hFind = ::FindFirstFileW(searchPath.c_str(), &fd);
-  if (hFind != INVALID_HANDLE_VALUE)
-  {
-    do
-    {
-      std::wstring infPath =
-        std::wstring(driverStore) + L"\\" + fd.cFileName;
-      std::wstring dirPath = infPath;
-      auto dot = dirPath.rfind(L'.');
-      if (dot != std::wstring::npos)
-        dirPath = dirPath.substr(0, dot);
-
-      // Read INF — check for v4 XPSDrv markers.
-      HANDLE hInf = ::CreateFileW(infPath.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-      if (hInf == INVALID_HANDLE_VALUE) continue;
-
-      std::string infContent;
-      DWORD sz = ::GetFileSize(hInf, nullptr);
-      if (sz > 0 && sz < 1048576)
-      {
-        infContent.resize(sz);
-        DWORD read = 0;
-        ::ReadFile(hInf, infContent.data(), sz, &read, nullptr);
-      }
-      ::CloseHandle(hInf);
-
-      bool isV4 = (infContent.find("XPSDrvFilter") != std::string::npos ||
-                   infContent.find("FilterPipelineConfig") != std::string::npos ||
-                   infContent.find("[DriverConfig]") != std::string::npos);
-      if (!isV4) continue;
-
-      std::wstring configPath =
-        dirPath + L"\\FilterPipelineConfig.xml";
-      if (::GetFileAttributesW(configPath.c_str()) == INVALID_FILE_ATTRIBUTES)
-        continue;
-
-      // Read config XML.
-      HANDLE hCfg = ::CreateFileW(configPath.c_str(), GENERIC_READ,
-        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
-      if (hCfg == INVALID_HANDLE_VALUE) continue;
-      std::string cfgXml;
-      DWORD cSz = ::GetFileSize(hCfg, nullptr);
-      if (cSz > 0 && cSz < 1048576)
-      {
-        cfgXml.resize(cSz);
-        DWORD read = 0;
-        ::ReadFile(hCfg, cfgXml.data(), cSz, &read, nullptr);
-      }
-      ::CloseHandle(hCfg);
-      if (cfgXml.empty()) continue;
-
-      // Already injected?
-      std::string clsidA(filterClsid(), filterClsid() + wcslen(filterClsid()));
-      if (cfgXml.find(clsidA) != std::string::npos) continue;
-
-      // Find <Filters> tag.
-      auto fpos = cfgXml.find("<Filters>");
-      if (fpos == std::string::npos)
-      { fpos = cfgXml.find("<Filters "); if (fpos == std::string::npos) continue; }
-      auto fclose = cfgXml.find('>', fpos);
-      if (fclose == std::string::npos) continue;
-
-      // Build filter fragment.
-      char dllPathA[MAX_PATH];
-      ::WideCharToMultiByte(CP_UTF8, 0, installDir.c_str(), -1,
-                            dllPathA, MAX_PATH, nullptr, nullptr);
-      std::string filterXml = "\r\n  <Filter xmlns=\"http://schemas.microsoft.com/windows/2005/06/printing/FilterPipeline\" dll=\"";
-      filterXml += dllPathA;
-      filterXml += "\" clsid=\"";
-      filterXml += clsidA;
-      filterXml += "\" name=\"WPCE Capture\">\r\n    <Input><InputPart type=\"IFixedDocumentSequence\"/></Input>\r\n    <Output><OutputPart type=\"IFixedDocumentSequence\"/></Output>\r\n  </Filter>";
-
-      cfgXml.insert(fclose + 1, filterXml);
-
-      // Backup + write.
-      std::wstring backupPath = configPath + L".wpce-backup";
-      if (::GetFileAttributesW(backupPath.c_str()) == INVALID_FILE_ATTRIBUTES)
-        ::CopyFileW(configPath.c_str(), backupPath.c_str(), TRUE);
-
-      HANDLE hW = ::CreateFileW(configPath.c_str(), GENERIC_WRITE,
-        0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-      if (hW != INVALID_HANDLE_VALUE)
-      {
-        DWORD written = 0;
-        ::WriteFile(hW, cfgXml.data(),
-                    static_cast<DWORD>(cfgXml.size()), &written, nullptr);
-        ::CloseHandle(hW);
-      }
-
-    } while (::FindNextFileW(hFind, &fd));
-    ::FindClose(hFind);
-  }
-
-  // Restart spooler.
-  SC_HANDLE scm = ::OpenSCManagerW(nullptr, nullptr, SC_MANAGER_CONNECT);
-  if (scm)
-  {
-    SC_HANDLE svc = ::OpenServiceW(scm, L"Spooler",
-      SERVICE_STOP | SERVICE_START);
-    if (svc)
-    {
-      SERVICE_STATUS st{};
-      ::ControlService(svc, SERVICE_CONTROL_STOP, &st);
-      for (int i = 0; i < 30; ++i)
-      {
-        ::QueryServiceStatus(svc, &st);
-        if (st.dwCurrentState == SERVICE_STOPPED) break;
-        ::Sleep(500);
-      }
-      ::StartServiceW(svc, 0, nullptr);
-      ::CloseServiceHandle(svc);
-    }
-    ::CloseServiceHandle(scm);
-  }
-
-  // Write sentinel.
-  std::wstring sentinel = installDir;
-  auto sp = sentinel.rfind(L'\\');
-  if (sp != std::wstring::npos)
-    sentinel = sentinel.substr(0, sp) + L"\\wpce_filter_installed";
-  HANDLE hS = ::CreateFileW(sentinel.c_str(), GENERIC_WRITE,
-    0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-  if (hS != INVALID_HANDLE_VALUE)
-  {
-    const char* msg = "installed";
-    DWORD w = 0;
-    ::WriteFile(hS, msg, 9, &w, nullptr);
-    ::CloseHandle(hS);
-  }
-
-  return true;
-}
-
-/// Check filter status and install if running as admin.
-/// Returns a user-visible message if action is needed.
-QString ensureFilterInstalled()
-{
-  if (isFilterSentinelPresent())
-    return {};  // everything set up
-
-  QString exeDir = QCoreApplication::applicationDirPath();
-
-  if (isRunningAsAdmin())
-  {
-    // Auto-install — we have the required privileges.
-    bool ok = tryInstallFilter(exeDir.toStdWString());
-    if (ok)
-      return QStringLiteral("XPS 过滤器已自动安装并注册，打印参数捕获已就绪");
-    else
-      return QStringLiteral("XPS 过滤器安装失败 — wpce_xps_filter.dll 未找到");
-  }
-  else
-  {
-    // Not admin — user needs to run once as admin.
-    // Check if DLL exists next to the exe.
-    QString dllPath = exeDir + QStringLiteral("/wpce_xps_filter.dll");
-    if (!QFile::exists(dllPath))
-      return QStringLiteral("wpce_xps_filter.dll 未找到 — 打印参数捕获不可用");
-
-    // Filter not installed yet, but DLL exists.  Prompt once.
-    static bool warned = false;
-    if (!warned)
-    {
-      warned = true;
-      return QStringLiteral("⚡ 首次使用请以管理员身份运行一次以安装 XPS 过滤器（之后无需管理员权限）");
-    }
+  if (!std::filesystem::exists(cfgPath))
     return {};
-  }
+
+  const std::string stamp =
+    QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd-HHmmss")).toStdString();
+  const std::filesystem::path backup =
+    cfgPath.string() + ".invalid-" + stamp + ".bak";
+
+  std::error_code ec;
+  std::filesystem::copy_file(cfgPath, backup,
+                             std::filesystem::copy_options::overwrite_existing,
+                             ec);
+  return ec ? std::filesystem::path{} : backup;
 }
 
-}  // namespace (anonymous)
+}  // namespace
 
 }  // namespace wpce::ui
 
 // ── Includes for MainWindow implementation ───────────────────────────
 
 #include "billing/billing_service.h"
+#include <QFileDialog>
+#include <QScopedValueRollback>
+#include <QEvent>
 #include "bridge/settlement_bridge.h"
 #include "common/app_config.h"
-#include "common/pricing_engine.h"
 #include "common/printer_profile.h"
 #include "ui/billing_batch_model.h"
-#include "ui/grip_splitter.h"
 #include "ui/completion_dialog.h"
 #include "ui/job_detail_panel.h"
-#include "ui/pricing_config.h"
 #include "ui/quick_settle_dialog.h"
 #include "ui/receipt_preview_panel.h"
 #include "ui/settings_dialog.h"
 #include "ui/user_color_palette.h"
-#include "ui/user_group_delegate.h"
 #include "ui/watcher_bridge.h"
 
 #include <QAbstractItemView>
@@ -481,14 +222,15 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
     // Create daily root directory first.
     const QString dailyRoot = resolveOutputRoot();
     QDir().mkpath(dailyRoot);
+    cleanupExpiredCapturedData();
 
     const QString stateDir = resolveStateDir();
     QDir().mkpath(stateDir);
+    migrateLegacyDailyStateIfNeeded();
     billingService_->setStateDirectory(stateDir);
-    const QString historyRoot = resolveHistoryRoot();
-    QDir().mkpath(historyRoot);
-    billingService_->setHistoryRoot(historyRoot);
-    billingService_->load();
+    billingService_->setOrderBucketPath(resolveOrderBucketPath());
+    QDir().mkpath(resolveHistoryRoot());
+    // setOrderBucketPath has already loaded and validated this bucket.
 
     // Ensure per-user directories exist for any loaded batches.
     for (const auto& batch : billingService_->batches())
@@ -500,8 +242,8 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   central->setMinimumWidth(0);
   central->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
   auto* root = new QVBoxLayout(central);
-  root->setContentsMargins(20, 18, 20, 16);
-  root->setSpacing(14);
+  root->setContentsMargins(24, 20, 24, 18);
+  root->setSpacing(16);
   setCentralWidget(central);
 
   // ── Hero bar ─────────────────────────────────────────────────────
@@ -570,6 +312,12 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   heroLayout->addWidget(openOutputBtn_);
   heroLayout->addWidget(historyBtn);
   heroLayout->addWidget(settingsBtn_);
+  auto* xpsSettings=new QPushButton(QStringLiteral("XPS 设置"));
+  heroLayout->addWidget(xpsSettings);
+  connect(xpsSettings,&QPushButton::clicked,this,[this]{
+    FilterInstallDialog dialog(resolveStorageRoot(),this);
+    dialog.exec();
+  });
   root->addWidget(hero);
 
   // ── Metrics ───────────────────────────────────────────────────────
@@ -620,10 +368,10 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
   searchEdit_ = new QLineEdit();
   searchEdit_->setObjectName(QStringLiteral("SearchBox"));
-  searchEdit_->setPlaceholderText(QStringLiteral("搜索批次"));
+  searchEdit_->setPlaceholderText(QStringLiteral("搜索文档"));
   searchEdit_->setClearButtonEnabled(true);
-  searchEdit_->setMinimumWidth(96);
-  searchEdit_->setMaximumWidth(140);
+  searchEdit_->setMinimumWidth(180);
+  searchEdit_->setMaximumWidth(280);
 
   clearFilterBtn_ = new QPushButton(QStringLiteral("重置"));
   clearFilterBtn_->setIcon(style()->standardIcon(QStyle::SP_DialogResetButton));
@@ -675,6 +423,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   treeView_->setMinimumWidth(0);
   treeView_->setSizePolicy(QSizePolicy::Ignored, QSizePolicy::Expanding);
   treeView_->setModel(batchModel_);
+  treeView_->setUniformRowHeights(true);
   treeView_->setSelectionBehavior(QAbstractItemView::SelectRows);
   treeView_->setSelectionMode(QAbstractItemView::SingleSelection);
   treeView_->setEditTriggers(QAbstractItemView::NoEditTriggers);
@@ -768,7 +517,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   treeView_->header()->setSectionResizeMode(BillingBatchModel::ColSubmitTime, QHeaderView::Interactive);
   treeView_->header()->setSectionResizeMode(BillingBatchModel::ColPrice,      QHeaderView::Interactive);
 
-  treeView_->setColumnWidth(BillingBatchModel::ColName,       200);
+  treeView_->setColumnWidth(BillingBatchModel::ColName,       250);
   treeView_->setColumnWidth(BillingBatchModel::ColState,      62);
   treeView_->setColumnWidth(BillingBatchModel::ColProgress,   110);
   treeView_->setColumnWidth(BillingBatchModel::ColPages,      48);
@@ -829,54 +578,7 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   connect(openOutputBtn_, &QPushButton::clicked, this, &MainWindow::onOpenOutputClicked);
   connect(settingsBtn_, &QPushButton::clicked, this, &MainWindow::onSettingsClicked);
   connect(completeUserBtn_, &QPushButton::clicked, this, &MainWindow::onCompleteClicked);
-  connect(quickSettleBtn_, &QPushButton::clicked, this, [this]() {
-    if (quickSettleDialog_ == nullptr)
-    {
-      quickSettleDialog_ = new QuickSettleDialog(batchModel_, billingService_, &config_.pricing,
-                                                  config_.window.quick_settle_width,
-                                                  config_.window.quick_settle_height,
-                                                  config_.window.quick_settle_collapsed_height,
-                                                  config_.window.quick_settle_collapsed,
-                                                  nullptr);
-      connect(quickSettleDialog_, &QuickSettleDialog::geometryChanged,
-              this, [this](int w, int h, int ch, bool collapsed) {
-        config_.window.quick_settle_width = w;
-        config_.window.quick_settle_height = h;
-        config_.window.quick_settle_collapsed_height = ch;
-        config_.window.quick_settle_collapsed = collapsed;
-      });
-      connect(quickSettleDialog_, &QuickSettleDialog::settleRequested,
-              this, [this](const QString& batchId) { billingService_->settle(batchId); });
-      connect(quickSettleDialog_, &QuickSettleDialog::hangUpRequested,
-              this, [this](const QString& batchId) { billingService_->suspend(batchId); });
-      connect(quickSettleDialog_, &QuickSettleDialog::resumeRequested,
-              this, [this](const QString& batchId) { billingService_->resume(batchId); });
-      connect(quickSettleDialog_, &QuickSettleDialog::batchFocusChanged,
-              this, [this](const QString& batchId) {
-        QModelIndex idx = batchModel_->batchIndex(batchId);
-        if (idx.isValid())
-        {
-          treeView_->selectionModel()->setCurrentIndex(idx,
-            QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
-          treeView_->expand(idx);
-          treeView_->scrollTo(idx, QAbstractItemView::PositionAtCenter);
-        }
-      });
-    }
-    int targetIndex = -1;
-    QModelIndex current = treeView_->currentIndex();
-    while (current.isValid() && !batchModel_->isBatchRow(current))
-      current = current.parent();
-    if (current.isValid())
-      targetIndex = current.row();
-    if (targetIndex < 0)
-      targetIndex = batchModel_->nextRelevantRow(-1);
-    if (targetIndex >= 0)
-      quickSettleDialog_->setCurrentBatchIndex(targetIndex);
-    quickSettleDialog_->show();
-    quickSettleDialog_->raise();
-    quickSettleDialog_->activateWindow();
-  });
+  connect(quickSettleBtn_, &QPushButton::clicked, this, &MainWindow::showQuickSettleDialog);
   connect(expandAllBtn_, &QPushButton::clicked, this, [this]() {
     for (int i = 0; i < batchModel_->rowCount(); ++i)
     {
@@ -903,6 +605,11 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
           billingService_, &BillingService::onMetadata);
   connect(bridge_, &WatcherBridge::lifecycleEventReceived,
           billingService_, &BillingService::onLifecycleEvent);
+  bridge_->setPrintTicketAcknowledgement([this](std::uint32_t id) {
+    billingService_->flushSave();
+    return billingService_->storageReady() && !billingService_->hasPendingSave() &&
+        billingService_->deferredEventCount() == 0 && billingService_->jobRecord(id) != nullptr;
+  });
   connect(bridge_, &WatcherBridge::watcherError, this,
           [this](const QString& error) {
             statusBar()->showMessage(QStringLiteral("警告: %1").arg(error), 5000);
@@ -947,6 +654,18 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
   connect(billingService_, &BillingService::orderSettled, this, &MainWindow::onBatchSettled);
 
   // Create per-user data subdirectories when a new batch is created.
+  connect(billingService_, &BillingService::storageError, this, [this](const QString& message) {
+    statusBar()->showMessage(message, 0);
+  });
+  connect(billingService_, &BillingService::businessDayChanged, this, [this](const QString&) {
+    lastOutputDir_ = resolveOutputRoot();
+    outputDirLabel_->setText(compactPathText(lastOutputDir_));
+    outputDirLabel_->setToolTip(lastOutputDir_);
+    detailPanel_->clear();
+    refreshSummaryCards(); refreshReceiptPanel(); updateButtonStates();
+    statusBar()->showMessage(QStringLiteral("已切换到新的业务日期，昨日订单已保留。"), 10000);
+  }, Qt::QueuedConnection);
+
   connect(billingService_, &BillingService::batchCreated, this, [this](const QString& batchId) {
     const auto* batch = billingService_->batchById(batchId.toStdString());
     if (batch != nullptr)
@@ -977,11 +696,22 @@ MainWindow::MainWindow(QWidget* parent) : QMainWindow(parent)
 
   updateButtonStates(); updatePrinterLabel();
   refreshSummaryCards(); refreshEmptyState(); refreshGroupRowSpans();
+  selectLastBatch();
 
-  QString filterMsg = ensureFilterInstalled();
-  if (!filterMsg.isEmpty()) statusBar()->showMessage(filterMsg, 10000);
+  auto* filterProbe=new management::FilterInstallService(this);
+  connect(filterProbe,&management::FilterInstallService::completed,this,[this](const auto& result){
+    statusBar()->showMessage(management::FilterInstallService::summary(result),10000);
+  });
+  const auto appDirectory=QDir(QCoreApplication::applicationDirPath());
+  filterProbe->start(management::FilterInstallService::Action::Probe,
+      appDirectory.filePath("scripts/install-xps-filter.ps1"),appDirectory.filePath("wpce_xps_filter.dll"),
+      resolveStorageRoot());
 
   QTimer::singleShot(100, this, &MainWindow::autoStart);
+  if (config_.startup.open_quick_settle_at_start || config_.startup.silent_startup)
+  {
+    QTimer::singleShot(250, this, &MainWindow::showQuickSettleDialog);
+  }
   QTimer::singleShot(800, this, &MainWindow::detectPrintersAsync);
 }
 
@@ -991,8 +721,8 @@ MainWindow::~MainWindow()
   config_.window.height = height();
   common::AppConfig::ensure_config_file(common::AppConfig::default_config_path());
   config_.save_to_json(common::AppConfig::default_config_path());
+  (void)bridge_->stopWatching();
   billingService_->flushSave();
-  bridge_->stopWatching();
 
   if (quickSettleDialog_ != nullptr)
   {
@@ -1043,7 +773,7 @@ void MainWindow::rebalanceWorkspaceSplitters()
       }
       else
       {
-        treeView_->setColumnWidth(BillingBatchModel::ColName,       200);
+        treeView_->setColumnWidth(BillingBatchModel::ColName,       250);
         treeView_->setColumnWidth(BillingBatchModel::ColState,      62);
         treeView_->setColumnWidth(BillingBatchModel::ColProgress,   110);
         treeView_->setColumnWidth(BillingBatchModel::ColPages,      48);
@@ -1091,13 +821,26 @@ void MainWindow::rebalanceWorkspaceSplitters()
 
 void MainWindow::onStartClicked()
 {
+  if (closing_) return;
   if (bridge_->isRunning()) return;
-  billingService_->flushSave();
+  if (!bridge_->stopWatching(0))
+  {
+    statusBar()->showMessage(QStringLiteral("上次监听线程尚未停止，请稍后重试。"), 15000);
+    return;
+  }
+  QCoreApplication::sendPostedEvents(billingService_, QEvent::MetaCall);
+  const auto saved = billingService_->prepareShutdown();
+  if (!saved.ready)
+  {
+    statusBar()->showMessage(saved.message, 15000);
+    return;
+  }
   detailPanel_->clear();
   refreshReceiptPanel();
 
   lastOutputDir_ = resolveOutputRoot();
   QDir().mkpath(lastOutputDir_);
+  cleanupExpiredCapturedData();
 
   // Also ensure per-user dirs for any loaded batches are re-created.
   for (const auto& batch : billingService_->batches())
@@ -1107,13 +850,19 @@ void MainWindow::onStartClicked()
   {
     const QString stateDir = resolveStateDir();
     QDir().mkpath(stateDir);
+    migrateLegacyDailyStateIfNeeded();
     billingService_->setStateDirectory(stateDir);
+    billingService_->setOrderBucketPath(resolveOrderBucketPath());
 
-    const QString historyRoot = resolveHistoryRoot();
-    QDir().mkpath(historyRoot);
-    billingService_->setHistoryRoot(historyRoot);
+    QDir().mkpath(resolveHistoryRoot());
 
-    billingService_->load();
+    // setOrderBucketPath has already loaded and validated this bucket.
+  }
+
+  if (!billingService_->storageReady())
+  {
+    statusBar()->showMessage(billingService_->storageErrorMessage(), 15000);
+    return;
   }
 
   const QString nativeOutputDir = QDir::toNativeSeparators(lastOutputDir_);
@@ -1123,15 +872,30 @@ void MainWindow::onStartClicked()
   bridge_->setStallTimeout(std::chrono::seconds{config_.monitoring.stall_timeout_seconds});
   bridge_->setRescanInterval(std::chrono::seconds{config_.monitoring.rescan_interval_seconds});
   bridge_->setPollTimeout(std::chrono::milliseconds{config_.monitoring.poll_timeout_ms});
+  const std::uint32_t maxStoredJobId = billingService_->maxStoredJobId();
+  std::vector<core::JobSnapshot> storedJobs;
+  for (const auto& batch : billingService_->batches())
+    for (const auto id : batch.job_ids)
+      if (const auto* record = billingService_->jobRecord(id)) storedJobs.push_back(record->snapshot);
+  bridge_->seedStoredJobs(std::move(storedJobs));
+  bridge_->seedMinSyntheticJobId(
+      maxStoredJobId == std::numeric_limits<std::uint32_t>::max()
+          ? maxStoredJobId
+          : maxStoredJobId + 1);
   bridge_->startWatching(lastOutputDir_);
   updateButtonStates(); updatePrinterLabel(); refreshSummaryCards();
-  refreshEmptyState(); refreshGroupRowSpans();
+  refreshEmptyState(); refreshGroupRowSpans(); selectLastBatch();
   statusBar()->showMessage(QStringLiteral("监听中 -> %1").arg(QDir::toNativeSeparators(lastOutputDir_)));
 }
 
 void MainWindow::onStopClicked()
 {
-  bridge_->stopWatching();
+  if (!bridge_->stopWatching())
+  {
+    statusBar()->showMessage(QStringLiteral("监听线程尚未停止，已保留线程和数据，请稍后重试。"), 0);
+    return;
+  }
+  QCoreApplication::sendPostedEvents(billingService_, QEvent::MetaCall);
   billingService_->flushSave();
   updateButtonStates(); updatePrinterLabel();
   statusBar()->showMessage(QStringLiteral("已停止"));
@@ -1166,6 +930,7 @@ void MainWindow::onCompleteClicked()
   if (!current.isValid()) { statusBar()->showMessage(QStringLiteral("请选择一个未结算的批次"), 3000); return; }
 
   const QString batchId = batchModel_->batchIdAt(current);
+  (void)billingService_->ensureBatchJobsLoaded(batchId);
   const auto* batch = batchModel_->batchAt(current);
   if (batch == nullptr || batch->is_settled()) { statusBar()->showMessage(QStringLiteral("请选择一个未结算的批次"), 3000); return; }
 
@@ -1176,6 +941,7 @@ void MainWindow::onCompleteClicked()
     const auto* job = batchModel_->jobAt(childIdx);
     if (job == nullptr) continue;
     JobCostLine line;
+    line.jobId = job->snapshot.job_id;
     line.documentName = QString::fromStdString(job->snapshot.document_name);
     line.pages = job->pricing.total_pages;
     if (job->metadata.color.state == core::FieldState::Reported)
@@ -1198,6 +964,17 @@ void MainWindow::onCompleteClicked()
                        costLines, config_.pricing, this);
   if (dlg.exec() != QDialog::Accepted) return;
 
+  const auto finalPrices = dlg.finalPrices();
+  for (std::size_t i = 0; i < costLines.size() && i < finalPrices.size(); ++i)
+  {
+    if (!costLines[i].pricePending) continue;
+    if (!billingService_->setManualPrice(costLines[i].jobId, finalPrices[i]))
+    {
+      statusBar()->showMessage(QStringLiteral("计费调整写入失败，未执行结算"), 5000);
+      return;
+    }
+  }
+
   QString orderId = billingService_->settle(batchId);
   if (orderId.isEmpty()) { statusBar()->showMessage(QStringLiteral("结算失败"), 3000); return; }
   statusBar()->showMessage(
@@ -1207,10 +984,13 @@ void MainWindow::onCompleteClicked()
 
 void MainWindow::onTreeSelectionChanged()
 {
-  refreshSelectedDetail();
   QModelIndex current = treeView_->currentIndex();
   while (current.isValid() && !batchModel_->isBatchRow(current))
     current = current.parent();
+  if (current.isValid())
+    (void)billingService_->ensureBatchJobsLoaded(batchModel_->batchIdAt(current));
+
+  refreshSelectedDetail();
   bool canSettle = current.isValid() && batchModel_->batchAt(current) != nullptr &&
                    !batchModel_->batchAt(current)->is_settled();
   completeUserBtn_->setEnabled(canSettle);
@@ -1247,6 +1027,11 @@ void MainWindow::checkStalePrinters()
   }
   if (!stale.isEmpty())
     statusBar()->showMessage(QStringLiteral("打印机无响应: %1").arg(stale.join(QStringLiteral(", "))), 5000);
+}
+
+bool MainWindow::isSilentStartup() const
+{
+  return config_.startup.silent_startup;
 }
 
 void MainWindow::autoStart() { onStartClicked(); }
@@ -1297,8 +1082,8 @@ void MainWindow::applySearchFilter()
   for (int i = 0; i < batchModel_->rowCount(); ++i)
   {
     QModelIndex idx = batchModel_->index(i, 0);
-    const QString displayName = idx.data(BillingBatchModel::DisplayNameRole).toString();
-    const bool match = norm.isEmpty() || displayName.contains(norm, Qt::CaseInsensitive);
+    const QString batchId = idx.data(BillingBatchModel::BatchIdRole).toString();
+    const bool match = norm.isEmpty() || billingService_->batchMatchesSearch(batchId, norm);
     treeView_->setRowHidden(i, QModelIndex(), !match);
     if (match && !norm.isEmpty()) treeView_->expand(idx);
     else if (norm.isEmpty()) treeView_->collapse(idx);
@@ -1378,6 +1163,74 @@ void MainWindow::selectNextRelevantBatch()
   }
 }
 
+void MainWindow::selectLastBatch()
+{
+  if (treeView_ == nullptr || batchModel_ == nullptr) return;
+  for (int row = batchModel_->batchCount() - 1; row >= 0; --row)
+  {
+    if (treeView_->isRowHidden(row, QModelIndex())) continue;
+    QModelIndex idx = batchModel_->index(row, 0);
+    if (!idx.isValid()) continue;
+    treeView_->selectionModel()->setCurrentIndex(
+      idx, QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+    treeView_->expand(idx);
+    treeView_->scrollTo(idx, QAbstractItemView::PositionAtBottom);
+    return;
+  }
+}
+
+void MainWindow::showQuickSettleDialog()
+{
+  if (quickSettleDialog_ == nullptr)
+  {
+    quickSettleDialog_ = new QuickSettleDialog(batchModel_, billingService_, &config_.pricing,
+                                                config_.window.quick_settle_width,
+                                                config_.window.quick_settle_height,
+                                                config_.window.quick_settle_collapsed_height,
+                                                config_.window.quick_settle_collapsed,
+                                                nullptr);
+    connect(quickSettleDialog_, &QuickSettleDialog::geometryChanged,
+            this, [this](int w, int h, int ch, bool collapsed) {
+      config_.window.quick_settle_width = w;
+      config_.window.quick_settle_height = h;
+      config_.window.quick_settle_collapsed_height = ch;
+      config_.window.quick_settle_collapsed = collapsed;
+    });
+    connect(quickSettleDialog_, &QuickSettleDialog::settleRequested,
+            this, [this](const QString& batchId) { billingService_->settle(batchId); });
+    connect(quickSettleDialog_, &QuickSettleDialog::hangUpRequested,
+            this, [this](const QString& batchId) { billingService_->suspend(batchId); });
+    connect(quickSettleDialog_, &QuickSettleDialog::resumeRequested,
+            this, [this](const QString& batchId) { billingService_->resume(batchId); });
+    connect(quickSettleDialog_, &QuickSettleDialog::batchFocusChanged,
+            this, [this](const QString& batchId) {
+      QModelIndex idx = batchModel_->batchIndex(batchId);
+      if (idx.isValid())
+      {
+        treeView_->selectionModel()->setCurrentIndex(idx,
+          QItemSelectionModel::ClearAndSelect | QItemSelectionModel::Rows);
+        treeView_->expand(idx);
+        treeView_->scrollTo(idx, QAbstractItemView::PositionAtCenter);
+      }
+    });
+  }
+
+  int targetIndex = -1;
+  QModelIndex current = treeView_->currentIndex();
+  while (current.isValid() && !batchModel_->isBatchRow(current))
+    current = current.parent();
+  if (current.isValid())
+    targetIndex = current.row();
+  if (targetIndex < 0)
+    targetIndex = batchModel_->nextRelevantRow(-1);
+  if (targetIndex >= 0)
+    quickSettleDialog_->setCurrentBatchIndex(targetIndex);
+
+  quickSettleDialog_->show();
+  quickSettleDialog_->raise();
+  quickSettleDialog_->activateWindow();
+}
+
 void MainWindow::refreshReceiptPanel()
 {
   if (receiptPanel_ == nullptr || batchModel_ == nullptr || billingService_ == nullptr) return;
@@ -1418,7 +1271,22 @@ void MainWindow::loadOrCreateConfig()
   if (std::filesystem::exists(cfgPath))
   {
     config_ = common::AppConfig::defaults();
-    if (!config_.load_from_json(cfgPath)) { config_ = common::AppConfig::defaults(); config_.save_to_json(cfgPath); }
+    if (!config_.load_from_json(cfgPath))
+    {
+      const auto backup = backupUnreadableConfig(cfgPath);
+      config_ = common::AppConfig::defaults();
+      if (!backup.empty())
+      {
+        fprintf(stderr,
+                "[WPCE] Config load failed; preserved original as %s and using in-memory defaults\n",
+                backup.string().c_str());
+      }
+      else
+      {
+        fprintf(stderr,
+                "[WPCE] Config load failed; using in-memory defaults without overwriting the file\n");
+      }
+    }
   }
   else { config_ = common::AppConfig::defaults(); common::AppConfig::ensure_config_file(cfgPath); }
 }
@@ -1427,7 +1295,7 @@ void MainWindow::applyConfig()
 {
   billingService_->setPricingConfig(&config_.pricing);
   billingService_->setPrinterProfiles(&config_.printers);
-  const QString outputRoot = QString::fromStdString(config_.storage.output_root);
+  const QString outputRoot = resolveStorageRoot();
   outputDirLabel_->setText(compactPathText(outputRoot));
   outputDirLabel_->setToolTip(outputRoot);
 }
@@ -1468,24 +1336,38 @@ void MainWindow::detectPrintersAsync()
   thread->start();
 }
 
-QString MainWindow::resolveOutputRoot() const
+QString MainWindow::resolveStorageRoot() const
 {
   QString root = QString::fromStdString(config_.storage.output_root);
   if (QDir::isRelativePath(root))
-  { const QString exeDir = QCoreApplication::applicationDirPath(); root = QDir(exeDir).filePath(root); }
-  // Daily subdirectory: ./data/2026-06-24/
-  const QString today = QDate::currentDate().toString(QStringLiteral("yyyy-MM-dd"));
-  return QDir::toNativeSeparators(QDir(root).filePath(today));
+  {
+    const QString exeDir = QCoreApplication::applicationDirPath();
+    root = QDir(exeDir).filePath(root);
+  }
+  return QDir::toNativeSeparators(root);
+}
+
+QString MainWindow::resolveOutputRoot() const
+{
+  // Captured spooler artifacts are partitioned by day.
+  const QString today = QString::fromStdString(common::current_business_date().yyyy_mm_dd);
+  return QDir::toNativeSeparators(QDir(resolveStorageRoot()).filePath(today));
 }
 
 QString MainWindow::resolveStateDir() const
 {
-  return QDir::toNativeSeparators(QDir(resolveOutputRoot()).filePath(QStringLiteral("_state")));
+  return QDir::toNativeSeparators(QDir(resolveStorageRoot()).filePath(QStringLiteral("_state")));
+}
+
+QString MainWindow::resolveOrderBucketPath() const
+{
+  return QDir::toNativeSeparators(
+      QDir(resolveOutputRoot()).filePath(QStringLiteral("orders.json")));
 }
 
 QString MainWindow::resolveHistoryRoot() const
 {
-  return QDir::toNativeSeparators(QDir(resolveOutputRoot()).filePath(QStringLiteral("history")));
+  return resolveStorageRoot();
 }
 
 QString MainWindow::resolveUserDir(const QString& displayName) const
@@ -1501,15 +1383,79 @@ void MainWindow::ensureUserDirectories(const QString& displayName)
   QDir().mkpath(userDir + QStringLiteral("/pages"));
 }
 
+void MainWindow::cleanupExpiredCapturedData()
+{
+  const auto result = storage::cleanup_expired_capture(
+      std::filesystem::path(resolveStorageRoot().toStdWString()),
+      common::current_business_date().yyyy_mm_dd, config_.storage.retention_days);
+  if (!result.errors.empty())
+    statusBar()->showMessage(QStringLiteral("部分过期捕获文件未能清理，订单和原文件已保留。"), 8000);
+}
+
+void MainWindow::migrateLegacyDailyStateIfNeeded()
+{
+  const auto result = domain::migrate_legacy_billing(
+      std::filesystem::path(resolveStorageRoot().toStdWString()),
+      common::current_business_date().yyyy_mm_dd);
+  if (!result.ok())
+    statusBar()->showMessage(QStringLiteral("旧账务数据有 %1 项迁移异常，原文件已保留，请核对后重试。")
+                               .arg(result.errors.size()), 15000);
+}
+
 void MainWindow::closeEvent(QCloseEvent* event)
 {
+  event->ignore();
+  if (closing_) return;
+  QScopedValueRollback<bool> closingGuard(closing_, true);
   auto reply = QMessageBox::question(this, QStringLiteral("确认退出"),
                                      QStringLiteral("确定要退出 WPCE 吗？"),
                                      QMessageBox::Yes | QMessageBox::No);
-  if (reply == QMessageBox::Yes)
+  if (reply != QMessageBox::Yes) return;
+  if (!bridge_->stopWatching())
+  {
+    QMessageBox::warning(this, QStringLiteral("暂不能退出"),
+        QStringLiteral("监听线程尚未停止。窗口和数据已保留，请稍后再次尝试退出。"));
+    return;
+  }
+  QCoreApplication::sendPostedEvents(billingService_, QEvent::MetaCall);
+  const auto result = billingService_->prepareShutdown();
+  const auto captureErrors = bridge_->storageErrors();
+  if (result.ready && captureErrors.isEmpty())
+  {
     event->accept();
-  else
-    event->ignore();
+    return;
+  }
+
+  QMessageBox failure(QMessageBox::Warning, QStringLiteral("数据尚未安全保存"),
+      result.ready ? QStringLiteral("采集文件曾写入失败，请先导出恢复数据并核对。") : result.message,
+      QMessageBox::NoButton, this);
+  if (!captureErrors.isEmpty()) failure.setDetailedText(captureErrors.join('\n'));
+  auto* retry = failure.addButton(QStringLiteral("重试保存"), QMessageBox::AcceptRole);
+  auto* exportButton = failure.addButton(QStringLiteral("导出恢复数据"), QMessageBox::ActionRole);
+  failure.addButton(QStringLiteral("保留窗口"), QMessageBox::RejectRole);
+  failure.exec();
+  if (failure.clickedButton() == retry)
+  {
+    const auto retried = billingService_->prepareShutdown();
+    if (retried.ready && bridge_->storageErrors().isEmpty()) event->accept();
+    else statusBar()->showMessage(retried.ready ? QStringLiteral("请先导出并核对采集故障恢复数据。") : retried.message, 0);
+  }
+  else if (failure.clickedButton() == exportButton)
+  {
+    const auto suggested = QDir(QStandardPaths::writableLocation(QStandardPaths::DocumentsLocation))
+        .filePath(QStringLiteral("WPCE-恢复数据-%1.json").arg(QDateTime::currentDateTime().toString("yyyyMMdd-HHmmss-zzz")));
+    const auto path = QFileDialog::getSaveFileName(this, QStringLiteral("导出恢复数据（需人工核对恢复）"),
+        suggested, QStringLiteral("JSON 文件 (*.json)"));
+    if (path.isEmpty()) return;
+    QString error;
+    if (billingService_->exportRecovery(path, &error, captureErrors))
+    {
+      bridge_->acknowledgeRecoveryExport();
+      QMessageBox::information(this, QStringLiteral("恢复数据已导出"),
+          QStringLiteral("已保存当前任务、冻结订单、暂存事件及采集故障信息。请人工核对恢复；窗口保持打开，原订单未被覆盖。"));
+    }
+    else QMessageBox::warning(this, QStringLiteral("导出失败"), error);
+  }
 }
 
 }  // namespace wpce::ui

@@ -1,7 +1,7 @@
 /// WPCE Stress Test Tool — exercises the async writer infrastructure under load.
 ///
 /// Simulates N synthetic print jobs enqueued across W concurrent writers.
-/// Validates: no crashes, no leaks, no data corruption, backpressure behavior.
+/// Validates: no crashes, no leaks, no data corruption, and burst durability.
 
 #include "core/data_contracts.h"
 #include "storage/job_snapshot_writer.h"
@@ -32,7 +32,6 @@ struct StressConfig
 {
   std::uint32_t job_count{10000};
   std::uint32_t writer_count{1};
-  std::size_t queue_capacity{256};
   std::filesystem::path output_directory{"stress-test-output"};
   std::uint32_t burst_size{100};
   std::chrono::milliseconds burst_interval{0};
@@ -80,7 +79,7 @@ void print_usage()
     << "Options:\n"
     << "  --job-count <N>          Number of jobs to simulate (default: 10000)\n"
     << "  --writer-count <N>       Number of concurrent writers (default: 1)\n"
-    << "  --queue-capacity <N>     Queue capacity per writer (default: 256)\n"
+    << "  --queue-capacity <N>     Deprecated; accepted but ignored\n"
     << "  --output-dir <path>      Output directory (default: stress-test-output)\n"
     << "  --burst-size <N>         Jobs per burst (default: 100)\n"
     << "  --burst-interval-ms <N>  Delay between bursts in ms (default: 0)\n";
@@ -102,7 +101,7 @@ StressConfig parse_args(int argc, char* argv[])
     }
     else if (arg == "--queue-capacity" && i + 1 < argc)
     {
-      try { config.queue_capacity = static_cast<std::size_t>(std::stoull(argv[++i])); } catch (...) {}
+      ++i;
     }
     else if (arg == "--output-dir" && i + 1 < argc)
     {
@@ -130,13 +129,13 @@ int run_stress_test(const StressConfig& config)
   std::cout << "=== WPCE Stress Test ===\n"
             << "Jobs:       " << config.job_count << '\n'
             << "Writers:    " << config.writer_count << '\n'
-            << "Queue cap:  " << config.queue_capacity << '\n'
+            << "Queue cap:  unbounded\n"
             << "Burst size: " << config.burst_size << '\n'
             << "Output:     " << config.output_directory << "\n\n";
 
-  if (config.writer_count == 0 || config.queue_capacity == 0)
+  if (config.writer_count == 0)
   {
-    std::cerr << "! Invalid config: writer_count and queue_capacity must be > 0\n";
+    std::cerr << "! Invalid config: writer_count must be > 0\n";
     return 2;
   }
 
@@ -154,7 +153,6 @@ int run_stress_test(const StressConfig& config)
     storage::JobSnapshotWriterConfig writer_config;
     writer_config.output_directory =
       config.output_directory / ("writer-" + std::to_string(w));
-    writer_config.queue_capacity = config.queue_capacity;
     writers.emplace_back(std::make_unique<storage::AsyncJobSnapshotWriter>(writer_config));
     writers.back()->start();
   }
@@ -210,7 +208,7 @@ int run_stress_test(const StressConfig& config)
       const double rate = elapsed > 0 ? (enqueued * 1000.0 / elapsed) : 0.0;
       std::cout << "  " << burst_end << '/' << config.job_count
                 << " jobs generated | enqueued: " << enqueued
-                << " | dropped: " << dropped
+                << " | rejected: " << dropped
                 << " | peak depth: " << peak_queue_depth
                 << " | rate: " << static_cast<int>(rate) << " jobs/s\n";
     }
@@ -303,7 +301,7 @@ int run_stress_test(const StressConfig& config)
             << "Total time:      " << total_ms << " ms\n"
             << "Throughput:      " << static_cast<int>(throughput) << " jobs/s\n"
             << "Enqueued:        " << enqueued << '\n'
-            << "Dropped:         " << dropped << '\n'
+            << "Rejected:        " << dropped << '\n'
             << "Peak queue depth:" << peak_queue_depth << '\n'
             << "Output files:    " << file_count << '\n'
             << "Writer errors:   " << writer_errors << '\n';

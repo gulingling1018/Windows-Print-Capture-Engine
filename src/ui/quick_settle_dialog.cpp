@@ -42,8 +42,22 @@ public:
     auto* editor = new QSpinBox(parent);
     int totalPages = index.data(Qt::UserRole + 1).toInt();
     editor->setRange(0, totalPages);
+    editor->setButtonSymbols(QAbstractSpinBox::NoButtons);
+    editor->setAlignment(Qt::AlignCenter);
+    editor->setFrame(false);
+    editor->setContentsMargins(0, 0, 0, 0);
+    editor->setStyleSheet(QStringLiteral(
+      "QSpinBox { padding: 0 2px; margin: 0; border: 1px solid #2563eb;"
+      " border-radius: 3px; background: white; color: #0f172a; }"));
     editor->setToolTip(QStringLiteral("彩印页数 (0-%1)").arg(totalPages));
     return editor;
+  }
+
+  void updateEditorGeometry(QWidget* editor,
+                            const QStyleOptionViewItem& option,
+                            const QModelIndex&) const override
+  {
+    editor->setGeometry(option.rect.adjusted(1, 1, -1, -1));
   }
 
   void setEditorData(QWidget* editor, const QModelIndex& index) const override
@@ -114,10 +128,10 @@ QuickSettleDialog::QuickSettleDialog(BillingBatchModel* model,
 {
   setWindowTitle(QStringLiteral("快速结算"));
   int w = std::max(initialWidth, 520);
-  int h = std::max(initialHeight, 200);
+  int h = std::max(initialHeight, 260);
   expandedSize_ = QSize(w, h);
   resize(w, h);
-  setMinimumSize(420, 200);
+  setMinimumSize(420, 260);
   setWindowFlags(Qt::Tool | Qt::FramelessWindowHint | Qt::WindowStaysOnTopHint);
   setAttribute(Qt::WA_TranslucentBackground, false);
 
@@ -139,6 +153,11 @@ QuickSettleDialog::QuickSettleDialog(BillingBatchModel* model,
   refreshDebounce_.setInterval(kRefreshDebounceMs);
   connect(&refreshDebounce_, &QTimer::timeout, this, [this]() {
     if (!isVisible() || model_ == nullptr) return;
+    if (!currentBatchId_.isEmpty())
+    {
+      const QModelIndex stableIndex = model_->batchIndex(currentBatchId_);
+      if (stableIndex.isValid()) currentIndex_ = stableIndex.row();
+    }
     if (currentIndex_ >= model_->batchCount())
       currentIndex_ = model_->batchCount() - 1;
     if (currentIndex_ < 0 && model_->batchCount() > 0)
@@ -304,10 +323,11 @@ void QuickSettleDialog::buildUi()
   jobTable_->setColumnWidth(1, 80);    // 打印机
   jobTable_->setColumnWidth(2, 36);    // 份数
   jobTable_->setColumnWidth(3, 50);    // 单|双面
-  jobTable_->setColumnWidth(4, 64);    // 页数 (m+n)
+  jobTable_->setColumnWidth(4, 78);    // 页数 (m+n)，为高 DPI 数字编辑器留足空间
   jobTable_->setColumnWidth(5, 56);    // 总页数
   jobTable_->setColumnWidth(6, 60);    // 价格
   jobTable_->verticalHeader()->hide();
+  jobTable_->verticalHeader()->setDefaultSectionSize(28);
   jobTable_->setShowGrid(false);
   jobTable_->setAlternatingRowColors(true);
   jobTable_->setEditTriggers(QAbstractItemView::DoubleClicked);
@@ -377,6 +397,7 @@ void QuickSettleDialog::buildUi()
 
   // ── Bottom action bar ───────────────────────────────────────────
   auto* actionBar = new QWidget();
+  actionBar_ = actionBar;
   actionBar->setObjectName(QStringLiteral("QsdActionBar"));
   actionBar->setStyleSheet(QStringLiteral(
     "QWidget#QsdActionBar { background: #f1f5f9;"
@@ -456,13 +477,22 @@ void QuickSettleDialog::setCurrentBatchIndex(int index)
   QModelIndex idx = model_->index(currentIndex_, 0);
   QString batchId = model_->batchIdAt(idx);
   if (!batchId.isEmpty())
+  {
+    currentBatchId_ = batchId;
     emit batchFocusChanged(batchId);
+  }
 }
 
 void QuickSettleDialog::refresh()
 {
   if (!isVisible()) return;
   if (model_ == nullptr) return;
+
+  if (!currentBatchId_.isEmpty())
+  {
+    const QModelIndex stableIndex = model_->batchIndex(currentBatchId_);
+    if (stableIndex.isValid()) currentIndex_ = stableIndex.row();
+  }
 
   // Clamp current index if batches were removed.
   if (currentIndex_ >= model_->batchCount())
@@ -557,6 +587,7 @@ void QuickSettleDialog::rebuildUi()
   jobTable_->setRowCount(childCount);
   double totalPrice = 0.0;
   int totalColorPages = 0;
+  int collapsedColorRows = 0;
 
   for (int r = 0; r < childCount; ++r)
   {
@@ -570,6 +601,9 @@ void QuickSettleDialog::rebuildUi()
     bool jobIsColor = common::is_color_job(job->metadata);
     bool isColorDowngraded = job->pricing.color_downgraded;
     bool isColorJobOnColorPrinter = jobIsColor && !isColorDowngraded;
+    if (isColorJobOnColorPrinter)
+      ++collapsedColorRows;
+    jobTable_->setRowHidden(r, collapsed_ && !isColorJobOnColorPrinter);
 
     // Column 0: 文档 (read-only)
     auto* docItem = new QTableWidgetItem(
@@ -681,6 +715,30 @@ void QuickSettleDialog::rebuildUi()
   // Collapsed color area is no longer used — job table remains visible.
   collapsedColorArea_->hide();
   colorPendingLabel_->hide();
+  collapsedTableHeight_ = 0;
+  if (collapsed_)
+  {
+    if (collapsedColorRows > 0)
+    {
+      jobTable_->show();
+      const int rowHeight = std::max(24, jobTable_->verticalHeader()->defaultSectionSize());
+      const int headerHeight = std::max(28, jobTable_->horizontalHeader()->height());
+      const int targetHeight = std::clamp(headerHeight + rowHeight * collapsedColorRows + 8,
+                                          86, 240);
+      collapsedTableHeight_ = targetHeight;
+      jobTable_->setMaximumHeight(targetHeight);
+    }
+    else
+    {
+      jobTable_->hide();
+    }
+  }
+  else
+  {
+    collapsedTableHeight_ = 0;
+    jobTable_->show();
+    jobTable_->setMaximumHeight(QWIDGETSIZE_MAX);
+  }
 
   // Summary bar.
   bool hasPending = batch->pending_count > 0;
@@ -711,7 +769,8 @@ void QuickSettleDialog::rebuildUi()
   // (jobTable_ is hidden in collapsed mode so sizeHint is compact).
   if (collapsed_)
   {
-    int target = sizeHint().height();
+    int target = std::max(sizeHint().height(), minimumCollapsedHeight());
+    setMinimumHeight(target);
     if (height() < target)
     {
       inToggle_ = true;
@@ -719,6 +778,11 @@ void QuickSettleDialog::rebuildUi()
       collapsedHeight_ = target;
       inToggle_ = false;
     }
+  }
+  else
+  {
+    setMinimumSize(420, 260);
+    updateHeightResponsiveState();
   }
 }
 
@@ -733,11 +797,13 @@ void QuickSettleDialog::updateActionButtons()
   bool active = batch->is_active();
 
   // Suspended batches cannot be settled directly — must resume first.
-  settleBtn_->setEnabled(active);
+  settleBtn_->setEnabled(active && batch->pending_count == 0);
   if (suspended)
     settleBtn_->setToolTip(QStringLiteral("需先恢复才能结算"));
   else
-    settleBtn_->setToolTip(QStringLiteral("结算当前批次 (Enter)"));
+    settleBtn_->setToolTip(batch->pending_count > 0
+      ? QStringLiteral("仍有待定价项目")
+      : QStringLiteral("结算当前批次 (Enter)"));
 
   if (settled)
   {
@@ -810,6 +876,78 @@ void QuickSettleDialog::updatePositionIndicator()
       "color: #e0f2fe; font-size: 11px; font-weight: 600;"
       "background: #475569; border-radius: 8px; padding: 2px 8px;"));
   }
+}
+
+int QuickSettleDialog::minimumCollapsedHeight() const
+{
+  const int titleH = titleBar_ != nullptr ? titleBar_->height() : 44;
+  int contentH = 0;
+  int visibleCount = 0;
+
+  auto addVisible = [&](const QWidget* widget, int preferredHeight = -1) {
+    if (widget == nullptr || widget->isHidden()) return;
+    if (visibleCount > 0) contentH += 8;
+    const int h = preferredHeight > 0 ? preferredHeight : widget->sizeHint().height();
+    contentH += std::max(0, h);
+    ++visibleCount;
+  };
+
+  QMargins margins;
+  if (contentArea_ != nullptr && contentArea_->layout() != nullptr)
+    margins = contentArea_->layout()->contentsMargins();
+
+  int tableH = collapsedTableHeight_;
+  if (tableH <= 0 && jobTable_ != nullptr && !jobTable_->isHidden())
+  {
+    tableH = jobTable_->maximumHeight() < QWIDGETSIZE_MAX
+               ? jobTable_->maximumHeight()
+               : jobTable_->sizeHint().height();
+  }
+
+  addVisible(jobTable_, tableH);
+  addVisible(summaryLabel_);
+  addVisible(colorPendingLabel_);
+  addVisible(collapsedColorArea_);
+  addVisible(actionBar_, actionBar_ != nullptr ? actionBar_->height() : -1);
+
+  return std::max(150, titleH + margins.top() + contentH + margins.bottom());
+}
+
+void QuickSettleDialog::updateHeightResponsiveState()
+{
+  if (contentArea_ == nullptr || collapsed_) return;
+
+  const bool compact = height() > 0 && height() < 360;
+  compactHeightMode_ = compact;
+
+  if (auto* layout = qobject_cast<QVBoxLayout*>(contentArea_->layout()))
+  {
+    layout->setContentsMargins(compact ? 10 : 14,
+                               compact ? 8 : 12,
+                               compact ? 10 : 14,
+                               compact ? 8 : 12);
+    layout->setSpacing(compact ? 6 : 8);
+  }
+
+  if (firstAnchorFrame_ != nullptr)
+    firstAnchorFrame_->setVisible(!compact);
+  if (lastAnchorFrame_ != nullptr)
+    lastAnchorFrame_->setVisible(!compact);
+
+  if (jobTable_ != nullptr)
+  {
+    jobTable_->verticalHeader()->setDefaultSectionSize(compact ? 24 : 28);
+    jobTable_->horizontalHeader()->setVisible(height() >= 300);
+  }
+
+  if (actionBar_ != nullptr)
+    actionBar_->setFixedHeight(compact ? 48 : 56);
+
+  const QSize navSize(compact ? 34 : 38, compact ? 34 : 38);
+  if (prevBtn_ != nullptr) prevBtn_->setFixedSize(navSize);
+  if (nextBtn_ != nullptr) nextBtn_->setFixedSize(navSize);
+  if (actionBtn_ != nullptr) actionBtn_->setFixedHeight(compact ? 34 : 36);
+  if (settleBtn_ != nullptr) settleBtn_->setFixedHeight(compact ? 36 : 40);
 }
 
 void QuickSettleDialog::switchToPrev()
@@ -1031,7 +1169,10 @@ void QuickSettleDialog::resizeEvent(QResizeEvent* event)
   if (collapsed_)
     collapsedHeight_ = height();
   else
+  {
     expandedSize_ = size();
+    updateHeightResponsiveState();
+  }
   emit geometryChanged(expandedSize_.width(), expandedSize_.height(),
                        collapsedHeight_, collapsed_);
 }
@@ -1302,21 +1443,22 @@ void QuickSettleDialog::toggleCollapsed()
 
     firstAnchorFrame_->hide();
     lastAnchorFrame_->hide();
-    jobTable_->hide();        // hide entirely — header + rows take too much space
     colorPendingLabel_->hide();
     collapsedColorArea_->hide();
     collapseBtn_->setText(QStringLiteral("▴"));
     collapseBtn_->setToolTip(QStringLiteral("展开 (C)"));
     setMinimumSize(320, 120);
     setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
+    rebuildUi();
 
     // sizeHint() recalculates with hidden widgets, giving the compact height.
-    int computedH = std::max(sizeHint().height(), 150);
+    int computedH = std::max(sizeHint().height(), minimumCollapsedHeight());
     // Accept saved height only if it looks like a real collapsed height
     // (not a leftover expanded height from a previous bugged session).
-    bool savedOk = (collapsedHeight_ >= 120 &&
+    bool savedOk = (collapsedHeight_ >= computedH &&
                     collapsedHeight_ < expandedSize_.height() - 30);
     int h = savedOk ? collapsedHeight_ : computedH;
+    setMinimumHeight(computedH);
     resize(width(), h);
     collapsedHeight_ = h;
   }
@@ -1328,7 +1470,8 @@ void QuickSettleDialog::toggleCollapsed()
 
     jobTable_->show();
     jobTable_->setMaximumHeight(QWIDGETSIZE_MAX);
-    setMinimumSize(420, 200);
+    collapsedTableHeight_ = 0;
+    setMinimumSize(420, 260);
     setMaximumSize(QWIDGETSIZE_MAX, QWIDGETSIZE_MAX);
     firstAnchorFrame_->show();
     lastAnchorFrame_->show();
@@ -1336,7 +1479,10 @@ void QuickSettleDialog::toggleCollapsed()
     collapsedColorArea_->hide();
     collapseBtn_->setText(QStringLiteral("▾"));
     collapseBtn_->setToolTip(QStringLiteral("折叠 (C)"));
+    compactHeightMode_ = false;
+    rebuildUi();
     resize(expandedSize_);
+    updateHeightResponsiveState();
   }
 
   inToggle_ = false;

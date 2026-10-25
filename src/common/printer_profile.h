@@ -2,7 +2,7 @@
 /// Printer capability profile for color-aware pricing.
 ///
 /// In real print-shop workflows, color vs monochrome printing is
-/// separated by physical printer — the shop has dedicated B&W
+/// separated by physical printer - the shop has dedicated B&W
 /// printers and dedicated color printers.  A "color" job sent to a
 /// B&W printer is actually printed in monochrome, so the pricing
 /// engine must downgrade it to the monochrome rate instead of
@@ -35,7 +35,7 @@ struct PrinterProfile
   std::string printer_name;
 
   /// True if this printer is a color-capable device.
-  /// False → color jobs sent here are downgraded to monochrome pricing.
+  /// False -> color jobs sent here are downgraded to monochrome pricing.
   bool is_color_capable{false};
 
   /// Paper sizes supported by this printer.

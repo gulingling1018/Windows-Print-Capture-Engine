@@ -4,7 +4,7 @@
 /// The PrintTicket is the ONLY authoritative source for per-job print
 /// settings on Windows 10/11 (v4 drivers).  JOB_INFO_2W::pDevMode is
 /// null for v4 drivers, and DocumentPropertiesW returns printer defaults
-/// — not the actual job settings.
+/// - not the actual job settings.
 ///
 /// This parser extracts the standard Print Schema Keywords (psk:*) from
 /// captured PrintTicket XML and maps them to the MetadataSnapshot fields
@@ -29,7 +29,7 @@ namespace wpce::parser
 ///   - Job-level: copies, duplex, N-up, collate, page order, input bin
 ///   - Page-level: media size, orientation, color, media type, resolution
 ///
-/// The snapshot's job_id is NOT set — the caller must assign it.
+/// The snapshot's job_id is NOT set - the caller must assign it.
 ///
 /// @param pt_xml   The raw PrintTicket XML string.
 /// @param snapshot Existing MetadataSnapshot to merge into.

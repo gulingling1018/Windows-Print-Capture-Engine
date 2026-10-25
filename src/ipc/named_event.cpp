@@ -12,10 +12,10 @@ NamedEvent::NamedEvent(std::wstring_view name, EventRole role)
 {
   if (role == EventRole::Creator)
   {
-    // ── Creator: CreateEventW with NULL DACL ──────────────────────────
+    // Creator: CreateEventW with NULL DACL
     // The spooler service runs in session 0; the UI runs in the user's
     // interactive session.  A default DACL would block cross-session
-    // OpenEventW.  A NULL DACL grants full access to everyone — safe
+    // OpenEventW.  A NULL DACL grants full access to everyone - safe
     // for a local-machine signalling primitive.
     SECURITY_DESCRIPTOR sd{};
     ::InitializeSecurityDescriptor(&sd, SECURITY_DESCRIPTOR_REVISION);
@@ -30,11 +30,11 @@ NamedEvent::NamedEvent(std::wstring_view name, EventRole role)
     handle_ = ::CreateEventW(&sa, TRUE, FALSE, name.data());
 
     // CreateEventW returns the existing handle with ERROR_ALREADY_EXISTS
-    // if a previous filter invocation already created it — that's fine.
+    // if a previous filter invocation already created it - that's fine.
   }
   else
   {
-    // ── Opener: OpenEventW ───────────────────────────────────────────
+    // Opener: OpenEventW
     // SYNCHRONIZE for WaitForSingleObject; EVENT_MODIFY_STATE for ResetEvent.
     handle_ = ::OpenEventW(SYNCHRONIZE | EVENT_MODIFY_STATE, FALSE, name.data());
   }

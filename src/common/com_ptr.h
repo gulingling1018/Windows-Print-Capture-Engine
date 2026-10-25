@@ -28,8 +28,7 @@ class com_ptr
     }
   }
 
-  // ── Copy (AddRef) ─────────────────────────────────────────────────────
-
+  // Copy (AddRef)
   com_ptr(const com_ptr& other) noexcept : ptr_(other.ptr_)
   {
     if (ptr_ != nullptr)
@@ -52,8 +51,7 @@ class com_ptr
     return *this;
   }
 
-  // ── Move ──────────────────────────────────────────────────────────────
-
+  // Move
   com_ptr(com_ptr&& other) noexcept : ptr_(other.ptr_)
   {
     other.ptr_ = nullptr;
@@ -70,8 +68,7 @@ class com_ptr
     return *this;
   }
 
-  // ── Operators ─────────────────────────────────────────────────────────
-
+  // Operators
   T* get() const noexcept
   {
     return ptr_;
@@ -94,8 +91,7 @@ class com_ptr
     return ptr_ != nullptr;
   }
 
-  // ── COM output helpers ────────────────────────────────────────────────
-
+  // COM output helpers
   /// Returns the address of the internal pointer for COM output parameters.
   /// Asserts the pointer is currently null (will leak otherwise).
   T** operator&() noexcept
@@ -112,8 +108,7 @@ class com_ptr
     return &ptr_;
   }
 
-  // ── Lifetime ──────────────────────────────────────────────────────────
-
+  // Lifetime
   void reset() noexcept
   {
     if (ptr_ != nullptr)

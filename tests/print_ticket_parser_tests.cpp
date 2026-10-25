@@ -10,6 +10,7 @@
 ///   - Colour, duplex, paper, orientation from standard psk: features
 
 #include "parser/print_ticket_parser.h"
+#include "parser/spool_file_parser.h"
 
 #include <gtest/gtest.h>
 
@@ -124,6 +125,39 @@ TEST(PrintTicketParser, ExtractsCopiesFromParameterInit)
   EXPECT_EQ(snapshot.copies.value, "3");
 }
 
+TEST(PrintTicketParser, ExtractsDocumentLevelCopies)
+{
+  constexpr std::string_view xml = R"(
+<psf:PrintTicket xmlns:psf="..." xmlns:psk="...">
+  <psf:ParameterInit name="psk:DocumentCopiesAllPages">
+    <psf:Value xsi:type="xsd:integer">4</psf:Value>
+  </psf:ParameterInit>
+</psf:PrintTicket>
+)";
+  wpce::core::MetadataSnapshot snapshot;
+  wpce::parser::parse_print_ticket_xml(xml, snapshot);
+  EXPECT_EQ(snapshot.copies.state, wpce::core::FieldState::Reported);
+  EXPECT_EQ(snapshot.copies.value, "4");
+}
+
+TEST(PrintTicketParser, MultipliesCopyScopes)
+{
+  constexpr std::string_view xml = R"(
+<psf:PrintTicket xmlns:psf="..." xmlns:psk="...">
+  <psf:ParameterInit name="psk:JobCopiesAllDocuments">
+    <psf:Value xsi:type="xsd:integer">2</psf:Value>
+  </psf:ParameterInit>
+  <psf:ParameterInit name="psk:DocumentCopiesAllPages">
+    <psf:Value xsi:type="xsd:integer">3</psf:Value>
+  </psf:ParameterInit>
+</psf:PrintTicket>
+)";
+  wpce::core::MetadataSnapshot snapshot;
+  wpce::parser::parse_print_ticket_xml(xml, snapshot);
+  EXPECT_EQ(snapshot.copies.state, wpce::core::FieldState::Reported);
+  EXPECT_EQ(snapshot.copies.value, "6");
+}
+
 TEST(PrintTicketParser, ExtractsDuplexLongEdge)
 {
   wpce::core::MetadataSnapshot snapshot;
@@ -228,4 +262,16 @@ TEST(PrintTicketParser, EmptyXmlLeavesFieldsNotReported)
   EXPECT_NE(snapshot.copies.state, wpce::core::FieldState::Reported);
   EXPECT_NE(snapshot.duplex.state, wpce::core::FieldState::Reported);
   EXPECT_NE(snapshot.color.state, wpce::core::FieldState::Reported);
+}
+
+TEST(SpoolFileParser, MetadataFromSpoolReportsShdDwgExtension)
+{
+  wpce::parser::SpoolFileInfo info;
+  info.shd_document_name =
+      R"(C:\Users\Administrator\xwechat_files\wxid_4aded946zz8b22_6d2e\msg\file\2026-06\312301030119牛鹏超图纸.dwg)";
+
+  const auto snapshot = wpce::parser::metadata_from_spool(info);
+
+  EXPECT_EQ(snapshot.file_extension.state, wpce::core::FieldState::Reported);
+  EXPECT_EQ(snapshot.file_extension.value, "dwg");
 }

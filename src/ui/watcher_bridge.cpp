@@ -1,17 +1,25 @@
 #include "ui/watcher_bridge.h"
+#include "ui/worker_shutdown.h"
 
 #include "bridge/metadata_merger.h"
+#include "common/document_name.h"
+#include "common/physical_job_identity.h"
+#include "common/business_clock.h"
 #include "common/logger.h"
 #include "ipc/named_event.h"
 #include "storage/job_snapshot_writer.h"
 
 #include <QMetaObject>
+#include <QCoreApplication>
+#include <QEvent>
 
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
 #include <filesystem>
+#include <limits>
 #include <mutex>
+#include <map>
 #include <sstream>
 #include <string>
 #include <string_view>
@@ -28,6 +36,8 @@ namespace wpce::ui
 
 namespace
 {
+
+constexpr std::uint32_t kSyntheticJobIdBase = 0x80000000u;
 
 std::wstring widen_utf8(const std::string_view value)
 {
@@ -105,6 +115,21 @@ std::string make_job_key(const std::string& printerName, std::uint32_t rawJobId)
   return printerName + "\x1f" + std::to_string(rawJobId);
 }
 
+std::uint32_t allocate_synthetic_job_id(
+    std::uint32_t& nextSyntheticJobId,
+    const std::unordered_map<std::uint32_t, std::string>& owners)
+{
+  for (std::uint64_t attempts = 0;
+       attempts <= std::numeric_limits<std::uint32_t>::max();
+       ++attempts)
+  {
+    const std::uint32_t candidate = nextSyntheticJobId++;
+    if (candidate == 0) continue;
+    if (!owners.contains(candidate)) return candidate;
+  }
+  return 0;
+}
+
 /// @returns true when this snapshot's authoritative source is the XPS
 /// PrintTicket XML (v4 drivers) rather than the spooler DEVMODE.
 /// PrintTicket-sourced data MUST win over DEVMODE-sourced data because
@@ -165,6 +190,42 @@ void merge_field(core::FieldValue& current,
   current = incoming;
 }
 
+int positive_int_value(const core::FieldValue& field)
+{
+  if (field.state != core::FieldState::Reported || field.value.empty())
+    return 0;
+  try
+  {
+    int n = std::stoi(field.value);
+    return n > 0 ? n : 0;
+  }
+  catch (...) { return 0; }
+}
+
+void merge_copies_field(core::FieldValue& current,
+                        const core::FieldValue& incoming,
+                        bool current_pt,
+                        bool incoming_pt)
+{
+  const int current_n = positive_int_value(current);
+  const int incoming_n = positive_int_value(incoming);
+
+  // A later spool/driver source with copies > 1 fixes the common Word
+  // path where the first PrintTicket/DEVMODE value is the default "1".
+  if (incoming_n > 1 && incoming_n > current_n)
+  {
+    current = incoming;
+    return;
+  }
+
+  // Do not let a PrintTicket default "1" erase a non-PrintTicket value
+  // that already proved this is a multi-copy job.
+  if (current_n > 1 && incoming_n <= 1 && incoming_pt && !current_pt)
+    return;
+
+  merge_field(current, incoming, current_pt, incoming_pt);
+}
+
 /// Field overlay that preserves the page count progress fields
 /// (total_pages / pages_printed) regardless of source, because the
 /// spooler tracks page progress more frequently than the PrintTicket
@@ -184,6 +245,23 @@ void merge_progress_field(core::FieldValue& current,
     current = incoming;
 }
 
+void merge_total_pages_field(core::FieldValue& current,
+                             const core::FieldValue& incoming)
+{
+  const int current_n = positive_int_value(current);
+  const int incoming_n = positive_int_value(incoming);
+
+  // Refresh and notification-only snapshots can briefly report 0 pages
+  // after a full job snapshot or EMF enrichment already found the count.
+  // Treat that as "not ready yet" instead of a newer authoritative value.
+  if (current_n > 0 && incoming.state == core::FieldState::Reported && incoming_n <= 0)
+  {
+    return;
+  }
+
+  merge_progress_field(current, incoming);
+}
+
 core::MetadataSnapshot merge_metadata_snapshots(core::MetadataSnapshot current,
                                                  const core::MetadataSnapshot& incoming)
 {
@@ -195,13 +273,13 @@ core::MetadataSnapshot merge_metadata_snapshots(core::MetadataSnapshot current,
   const bool current_pt = is_from_print_ticket(current);
   const bool incoming_pt = is_from_print_ticket(incoming);
 
-  // Page progress fields — always take the freshest reported value
-  // regardless of source (spooler updates these during printing).
-  merge_progress_field(current.total_pages,   incoming.total_pages);
+  // Page progress fields: keep a known positive total page count when a
+  // later refresh reports 0 while the spooler is still settling.
+  merge_total_pages_field(current.total_pages, incoming.total_pages);
   merge_progress_field(current.pages_printed, incoming.pages_printed);
 
   // Print-setting fields — apply source authority.
-  merge_field(current.copies,        incoming.copies,        current_pt, incoming_pt);
+  merge_copies_field(current.copies, incoming.copies,        current_pt, incoming_pt);
   merge_field(current.duplex,        incoming.duplex,        current_pt, incoming_pt);
   merge_field(current.color,         incoming.color,         current_pt, incoming_pt);
   merge_field(current.paper_size,    incoming.paper_size,    current_pt, incoming_pt);
@@ -212,14 +290,19 @@ core::MetadataSnapshot merge_metadata_snapshots(core::MetadataSnapshot current,
   merge_field(current.media_type,    incoming.media_type,    current_pt, incoming_pt);
   merge_field(current.page_range,    incoming.page_range,    current_pt, incoming_pt);
 
-  // file_extension is extracted from the document name in the DEVMODE
-  // path only (PrintTicket path doesn't expose it).  Treat it like a
-  // progress field — always take a Reported value when available,
-  // regardless of which source is "authoritative" for other settings.
-  // This prevents a PrintTicket snapshot from blocking a later DEVMODE
-  // snapshot's file_extension, which would otherwise cause per-filetype
-  // pricing rules to silently fail to match.
-  merge_progress_field(current.file_extension, incoming.file_extension);
+  // File type evidence is merged as one atomic value/source/confidence tuple.
+  // A low-confidence application-title hint must never overwrite an exact
+  // DWG/DWT suffix recovered later (or earlier) from the SHD spool data.
+  if (incoming.file_extension.state == core::FieldState::Reported &&
+      !incoming.file_extension.value.empty() &&
+      (current.file_extension.state != core::FieldState::Reported ||
+       current.file_extension.value.empty() ||
+       incoming.file_extension_confidence >= current.file_extension_confidence))
+  {
+    current.file_extension = incoming.file_extension;
+    current.file_extension_source = incoming.file_extension_source;
+    current.file_extension_confidence = incoming.file_extension_confidence;
+  }
 
   // Source marker — PrintTicket authority is sticky.
   if (incoming_pt || current_pt)
@@ -236,7 +319,8 @@ core::MetadataSnapshot merge_metadata_snapshots(core::MetadataSnapshot current,
 
 }  // namespace
 
-WatcherBridge::WatcherBridge(QObject* parent) : QObject(parent)
+WatcherBridge::WatcherBridge(QObject* parent, bool includeExternalInboxRoots)
+    : QObject(parent), includeExternalInboxRoots_(includeExternalInboxRoots)
 {
   qRegisterMetaType<core::JobSnapshot>("core::JobSnapshot");
   qRegisterMetaType<core::MetadataSnapshot>("core::MetadataSnapshot");
@@ -245,7 +329,12 @@ WatcherBridge::WatcherBridge(QObject* parent) : QObject(parent)
 
 WatcherBridge::~WatcherBridge()
 {
-  stopWatching();
+  (void)stopWatching();
+  // Destruction cannot leave callbacks referencing this object. Ordinary close
+  // uses the bounded check and keeps the object alive on timeout.
+  std::vector<QThread*> remaining;
+  { std::scoped_lock lock(threadsMutex_); remaining.swap(watcherThreads_); }
+  for (auto* thread : remaining) { thread->wait(); delete thread; }
 }
 
 void WatcherBridge::setStallTimeout(std::chrono::seconds timeout) noexcept
@@ -263,22 +352,50 @@ void WatcherBridge::setPollTimeout(std::chrono::milliseconds timeout) noexcept
   pollTimeout_ = timeout;
 }
 
+void WatcherBridge::seedMinSyntheticJobId(std::uint32_t minId) noexcept
+{
+  std::scoped_lock lock(jobIdMutex_);
+  syntheticJobIdFloor_ = std::max(kSyntheticJobIdBase, minId);
+  if (nextSyntheticJobId_ < syntheticJobIdFloor_)
+    nextSyntheticJobId_ = syntheticJobIdFloor_;
+  forceSyntheticJobIds_ = minId > 1;
+}
+
+void WatcherBridge::resetCapturedJobMappings()
+{
+  std::scoped_lock lock(jobIdMutex_);
+  normalizedJobIds_.clear();
+  normalizedJobOwners_.clear();
+  normalizedJobIdentities_.clear();
+  capturedSnapshots_.clear();
+  rawJobPrinters_.clear();
+  nextSyntheticJobId_ = syntheticJobIdFloor_;
+  for (const auto& snapshot : storedJobSeeds_)
+  {
+    const auto id = snapshot.job_id;
+    const auto raw = snapshot.external_job_id ? snapshot.external_job_id : id;
+    const auto identity = common::physical_job_identity(snapshot);
+    if (!id || identity.empty()) continue;
+    const auto key = make_job_key(snapshot.printer_name, raw);
+    const auto previous = normalizedJobIds_.find(key);
+    if (previous == normalizedJobIds_.end() || capturedSnapshots_.at(previous->second).submit_time_utc <= snapshot.submit_time_utc)
+      normalizedJobIds_[key] = id;
+    normalizedJobOwners_[id] = key; normalizedJobIdentities_[id] = identity;
+    capturedSnapshots_[id] = snapshot;
+  }
+}
+
 void WatcherBridge::startWatching(const QString& outputDir)
 {
   if (running_) return;
+  { std::scoped_lock lock(threadsMutex_); if (!watcherThreads_.empty()) return; }
 
   running_ = true;
 
   auto printers = listLocalPrinterNames();
   const std::filesystem::path dir(outputDir.toStdWString());
 
-  {
-    std::scoped_lock lock(jobIdMutex_);
-    normalizedJobIds_.clear();
-    normalizedJobOwners_.clear();
-    rawJobPrinters_.clear();
-    nextSyntheticJobId_ = 0x80000000u;
-  }
+  resetCapturedJobMappings();
   {
     std::scoped_lock lock(metadataCacheMutex_);
     metadataCache_.clear();
@@ -296,6 +413,8 @@ void WatcherBridge::startWatching(const QString& outputDir)
     emit sessionFinished();
     return;
   }
+
+  startPrintTicketInbox(dir);
 
   for (const auto& printerName : printers)
   {
@@ -322,29 +441,61 @@ void WatcherBridge::startWatching(const QString& outputDir)
   }
 }
 
-void WatcherBridge::stopWatching()
+bool WatcherBridge::stopWatching(unsigned long timeoutMs)
 {
-  if (!running_) return;
-
   running_ = false;
-
   std::vector<QThread*> threads;
+  { std::scoped_lock lock(threadsMutex_); threads.swap(watcherThreads_); }
+  const bool stopped = join_worker_threads(threads, timeoutMs);
   {
     std::scoped_lock lock(threadsMutex_);
-    threads.swap(watcherThreads_);
+    watcherThreads_.insert(watcherThreads_.end(), threads.begin(), threads.end());
   }
-
-  for (QThread* thread : threads)
+  if (stopped)
   {
-    if (thread != nullptr)
+    // Producers are joined: all of their queued callbacks are now known.
+    QCoreApplication::sendPostedEvents(this, QEvent::MetaCall);
+    if (inboxWriter_ && inboxWriter_->running()) processPrintTicketInbox();
+    if (inboxWriter_) inboxWriter_->request_stop();
+    for (auto& writer : pageRecoveryWriters_) writer->request_stop();
+    const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs);
+    auto pending = [&] {
+      if (inboxWriter_ && inboxWriter_->running()) return true;
+      for (const auto& writer : pageRecoveryWriters_) if (writer->running()) return true;
+      return false;
+    };
+    while (pending() && std::chrono::steady_clock::now() < deadline) QThread::msleep(10);
+    if (pending()) return false;
+    if (inboxWriter_)
     {
-      thread->quit();
-      thread->wait(5000);
-      thread->deleteLater();
+      inboxWriter_->stop();
+      if (!inboxWriter_->drained()) recordStorageFailure(QString::fromStdString(inboxWriter_->last_error()));
     }
+    for (auto& writer : pageRecoveryWriters_)
+    {
+      writer->stop();
+      if (!writer->drained()) recordStorageFailure(QString::fromStdString(writer->last_error()));
+    }
+    pageRecoveryWriters_.clear(); pageRecoveryRoots_.clear();
+    emit sessionFinished();
   }
+  return stopped;
+}
 
-  emit sessionFinished();
+QStringList WatcherBridge::storageErrors() const
+{
+  std::scoped_lock lock(storageErrorsMutex_); return storageErrors_;
+}
+
+void WatcherBridge::recordStorageFailure(const QString& error)
+{
+  std::scoped_lock lock(storageErrorsMutex_);
+  if (!storageErrors_.contains(error)) storageErrors_.append(error);
+}
+
+void WatcherBridge::acknowledgeRecoveryExport()
+{
+  std::scoped_lock lock(storageErrorsMutex_); storageErrors_.clear();
 }
 
 bool WatcherBridge::isRunning() const noexcept
@@ -374,19 +525,90 @@ std::uint32_t WatcherBridge::normalizedJobId(const std::string& printerName,
     return existing->second;
   }
 
-  std::uint32_t normalized = rawJobId;
-  if (auto owner = normalizedJobOwners_.find(normalized);
-      owner != normalizedJobOwners_.end() && owner->second != key)
+  std::uint32_t normalized = forceSyntheticJobIds_ ? 0 : rawJobId;
+  const auto owner = normalizedJobOwners_.find(normalized);
+  if (normalized == 0 ||
+      (owner != normalizedJobOwners_.end() && owner->second != key))
   {
-    do
-    {
-      normalized = nextSyntheticJobId_++;
-    }
-    while (normalized == 0 || normalizedJobOwners_.contains(normalized));
+    normalized = allocate_synthetic_job_id(nextSyntheticJobId_, normalizedJobOwners_);
+    if (normalized == 0) return 0;
   }
 
   normalizedJobIds_[key] = normalized;
   normalizedJobOwners_[normalized] = key;
+
+  const auto rawOwner = rawJobPrinters_.find(rawJobId);
+  if (rawOwner == rawJobPrinters_.end())
+  {
+    rawJobPrinters_[rawJobId] = printerName;
+  }
+  else if (rawOwner->second != printerName)
+  {
+    rawJobPrinters_[rawJobId].clear();
+  }
+
+  return normalized;
+}
+
+std::uint32_t WatcherBridge::normalizedJobIdForSnapshot(
+    const std::string& printerName,
+    std::uint32_t rawJobId,
+    const core::JobSnapshot& snapshot)
+{
+  if (rawJobId == 0)
+  {
+    return 0;
+  }
+
+  const std::string key = make_job_key(printerName, rawJobId);
+  const std::string incomingIdentity = common::physical_job_identity(snapshot);
+
+  std::scoped_lock lock(jobIdMutex_);
+
+  if (auto existing = normalizedJobIds_.find(key); existing != normalizedJobIds_.end())
+  {
+    const std::uint32_t normalized = existing->second;
+    auto oldIdentity = normalizedJobIdentities_.find(normalized);
+    if (!incomingIdentity.empty() &&
+        oldIdentity != normalizedJobIdentities_.end() &&
+        !oldIdentity->second.empty() &&
+        oldIdentity->second != incomingIdentity)
+    {
+      // The spooler reused the same raw JobId for a different physical job.
+      // Keep the old normalized id reserved for historical callbacks and give
+      // the new job a fresh id instead of overwriting the previous billable job.
+      const std::uint32_t recycled =
+          allocate_synthetic_job_id(nextSyntheticJobId_, normalizedJobOwners_);
+      if (recycled == 0) return 0;
+
+      normalizedJobIds_[key] = recycled;
+      normalizedJobOwners_[recycled] = key;
+      normalizedJobIdentities_[recycled] = incomingIdentity;
+      return recycled;
+    }
+
+    if (!incomingIdentity.empty())
+    {
+      normalizedJobIdentities_[normalized] = incomingIdentity;
+    }
+    return normalized;
+  }
+
+  std::uint32_t normalized = forceSyntheticJobIds_ ? 0 : rawJobId;
+  const auto owner = normalizedJobOwners_.find(normalized);
+  if (normalized == 0 ||
+      (owner != normalizedJobOwners_.end() && owner->second != key))
+  {
+    normalized = allocate_synthetic_job_id(nextSyntheticJobId_, normalizedJobOwners_);
+    if (normalized == 0) return 0;
+  }
+
+  normalizedJobIds_[key] = normalized;
+  normalizedJobOwners_[normalized] = key;
+  if (!incomingIdentity.empty())
+  {
+    normalizedJobIdentities_[normalized] = incomingIdentity;
+  }
 
   const auto rawOwner = rawJobPrinters_.find(rawJobId);
   if (rawOwner == rawJobPrinters_.end())
@@ -419,7 +641,13 @@ core::JobSnapshot WatcherBridge::normalizeJobSnapshot(core::JobSnapshot snapshot
   {
     snapshot.printer_name = fallbackPrinter;
   }
-  snapshot.job_id = normalizedJobId(snapshot.printer_name, snapshot.job_id);
+  const std::uint32_t rawJobId = snapshot.job_id;
+  snapshot.external_job_id = rawJobId;
+  const std::string identity = common::physical_job_identity(snapshot);
+  snapshot.idempotency_key = make_job_key(snapshot.printer_name, rawJobId);
+  if (!identity.empty()) snapshot.idempotency_key += "\x1f" + identity;
+  snapshot.job_id = normalizedJobIdForSnapshot(snapshot.printer_name, rawJobId, snapshot);
+  { std::scoped_lock lock(jobIdMutex_); capturedSnapshots_[snapshot.job_id] = snapshot; }
   return snapshot;
 }
 
@@ -453,6 +681,16 @@ core::MetadataSnapshot WatcherBridge::normalizeMetadata(core::MetadataSnapshot m
   return it->second;
 }
 
+core::MetadataSnapshot WatcherBridge::mergeCapturedMetadata(core::MetadataSnapshot metadata)
+{
+  std::scoped_lock lock(metadataCacheMutex_);
+  const auto id = metadata.job_id;
+  auto it = metadataCache_.find(id);
+  if (it == metadataCache_.end()) it = metadataCache_.emplace(id, std::move(metadata)).first;
+  else it->second = merge_metadata_snapshots(std::move(it->second), metadata);
+  return it->second;
+}
+
 core::JobLifecycleEvent WatcherBridge::normalizeLifecycleEvent(core::JobLifecycleEvent event,
                                                                const std::string& fallbackPrinter)
 {
@@ -472,7 +710,7 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
     auto log_callback = [printer_name_str](
                           watcher::LogLevel level,
                           std::string_view category,
-                          std::string message) {
+                          const std::string& message) {
       // ── 1. Ring-buffer logger (structured, queryable from UI) ──────
       {
         common::LogSeverity sev = common::LogSeverity::Debug;
@@ -508,6 +746,7 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
     };
 
     // Short test: can we open this printer?
+    // RAII guard so the handle is closed even if log_callback throws.
     {
       HANDLE hTest = nullptr;
       if (!OpenPrinterW(const_cast<LPWSTR>(printerName.c_str()),
@@ -520,14 +759,15 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
         }, Qt::QueuedConnection);
         return;
       }
-      ClosePrinter(hTest);
+      struct Guard { HANDLE h; ~Guard() { if (h) ClosePrinter(h); } } guard{hTest};
+      (void)guard; // extend lifetime to end of scope
     }
 
     log_callback(watcher::LogLevel::Info, "bridge",
                  "Printer \"" + narrow_utf8(printerName.c_str()) + "\" opened, starting watcher");
 
     storage::AsyncJobSnapshotWriter writer(
-      storage::JobSnapshotWriterConfig{.output_directory = outputDir});
+      storage::JobSnapshotWriterConfig{.output_directory = outputDir, .rotate_daily = true});
     writer.start();
 
     // │─── Signal wiring ──────────────────────────────────────────────│
@@ -535,29 +775,53 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
     // callback always has the right pairing — even when dedup skips
     // the job callback (signature unchanged).
     std::unordered_map<std::uint32_t, core::JobSnapshot> jobCache;
+    std::unordered_map<std::uint32_t, std::string> jobCaptureDates;
+    std::unordered_set<std::uint32_t> ignoredPlaceholderJobs;
     std::mutex pendingMutex;
+
+    // Keep a copy for bridge-level logging - log_callback will be moved
+    // into PrintWatcher below and the moved-from local must not be called.
+    auto bridge_log = log_callback;
 
     auto jobCallback = [&](const core::JobSnapshot& rawSnapshot)
     {
       core::JobSnapshot snapshot = normalizeJobSnapshot(rawSnapshot, printer_name_str);
+      if (common::is_spooler_placeholder_document(snapshot.document_name))
+      {
+        {
+          std::scoped_lock lock(pendingMutex);
+          ignoredPlaceholderJobs.insert(snapshot.job_id);
+          jobCache.erase(snapshot.job_id);
+        }
+        bridge_log(watcher::LogLevel::Info, "filter",
+                   "Job " + std::to_string(snapshot.job_id) +
+                   ": ignored spooler placeholder document");
+        return;
+      }
       QMetaObject::invokeMethod(this, [this, snapshot]() {
         emit jobSnapshotReceived(snapshot);
       }, Qt::QueuedConnection);
       std::scoped_lock lock(pendingMutex);
       jobCache[snapshot.job_id] = snapshot;
+      jobCaptureDates.try_emplace(snapshot.job_id, common::current_business_date().yyyy_mm_dd);
     };
 
     // ── Queue-full sentinel ────────────────────────────────────────
     // Tracks consecutive enqueue failures so we emit exactly one
     // warning at onset and one recovery message when the queue drains,
     // avoiding log spam from every dropped job.
-    bool queue_was_full = false;
-    int consecutive_full = 0;
-    constexpr int kFullWarnThreshold = 3;   // emit after N consecutive drops
+    bool storage_was_unavailable = false;
+    int consecutive_rejections = 0;
+    constexpr int kStorageWarnThreshold = 3;   // emit after N consecutive drops
 
-    auto metadataCallback = [&](const core::MetadataSnapshot& rawMetadata)
+    auto metadataCallback = [&, log_callback](const core::MetadataSnapshot& rawMetadata)
     {
       core::MetadataSnapshot metadata = normalizeMetadata(rawMetadata, printer_name_str);
+      {
+        std::scoped_lock lock(pendingMutex);
+        if (ignoredPlaceholderJobs.find(metadata.job_id) != ignoredPlaceholderJobs.end())
+          return;
+      }
       QMetaObject::invokeMethod(this, [this, metadata]() {
         emit metadataReceived(metadata);
       }, Qt::QueuedConnection);
@@ -610,33 +874,45 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
       const bool ok = writer.enqueue(std::move(job), metadata);
       if (!ok)
       {
-        ++consecutive_full;
-        if (!queue_was_full && consecutive_full >= kFullWarnThreshold)
+        recordStorageFailure(QString::fromStdString(printer_name_str + ": " + writer.last_error()));
+        ++consecutive_rejections;
+        if (!storage_was_unavailable && consecutive_rejections >= kStorageWarnThreshold)
         {
-          queue_was_full = true;
+          storage_was_unavailable = true;
           auto printer_utf8 = narrow_utf8(printerName.c_str());
           QMetaObject::invokeMethod(this, [this, p = std::move(printer_utf8)]() {
-            emit storageWarning(QStringLiteral("存储队列已满 — %1 的数据可能丢失")
+            emit storageWarning(QStringLiteral("采集暂存失败 — 请检查 %1 的数据目录")
                                   .arg(QString::fromStdString(p)));
           }, Qt::QueuedConnection);
         }
       }
       else
       {
-        if (queue_was_full && consecutive_full > 0)
+        if (storage_was_unavailable && consecutive_rejections > 0)
         {
-          queue_was_full = false;
+          storage_was_unavailable = false;
           QMetaObject::invokeMethod(this, [this]() {
-            emit storageWarning(QStringLiteral("存储队列已恢复"));
+            emit storageWarning(QStringLiteral("采集暂存已恢复"));
           }, Qt::QueuedConnection);
         }
-        consecutive_full = 0;
+        consecutive_rejections = 0;
       }
     };
 
     auto lifecycleCallback = [&](const core::JobLifecycleEvent& rawEvent)
     {
       core::JobLifecycleEvent event = normalizeLifecycleEvent(rawEvent, printer_name_str);
+      {
+        std::scoped_lock lock(pendingMutex);
+        if (ignoredPlaceholderJobs.find(event.job_id) != ignoredPlaceholderJobs.end())
+          return;
+      }
+
+      // Do not drop normalized JobId mappings on the first terminal status.
+      // Windows often sends retained/deleting/printed updates after a job first
+      // appears completed; clearing here can split one physical print job into
+      // multiple synthetic IDs and therefore multiple billable rows.
+
       QMetaObject::invokeMethod(this, [this, event]() {
         emit lifecycleEventReceived(event);
       }, Qt::QueuedConnection);
@@ -656,136 +932,61 @@ void WatcherBridge::runWatcher(const std::wstring& printerName,
 
     watcher.start();
 
-    // ── Periodic PrintTicket metadata scan ──────────────────────────────
-    // The XPS filter DLL (wpce_xps_filter) writes job-N-pt-metadata.json
-    // from inside the spooler process.  Scan the output directory every
-    // 3 s and emit any new PrintTicket metadata into the UI pipeline.
-    // Track seen files to avoid re-emitting stale data.
-    std::unordered_set<std::string> seen_pt_files;
-    // Seed with files already present (don't replay old sessions).
-    {
-      std::error_code ec;
-      for (const auto& entry : std::filesystem::directory_iterator(outputDir, ec))
-      {
-        auto n = entry.path().filename().string();
-        if (n.starts_with("job-") && n.ends_with("-pt-metadata.json"))
-          seen_pt_files.insert(std::move(n));
-      }
-    }
-
-    // ── Named event IPC ──────────────────────────────────────────────
-    // Creates (or opens) the global named event used by the XPS filter
-    // DLL to signal that new PrintTicket metadata is ready on disk.
-    // When the event is valid, WaitForSingleObject replaces the 50 ms
-    // sleep — the loop wakes up instantly when the filter signals.
-    ipc::NamedEvent pt_event(ipc::kPTMetadataReadyEventName,
-                             ipc::EventRole::Opener);
-    if (pt_event.valid())
-    {
-      log_callback(watcher::LogLevel::Info, "bridge",
-                   "Named event IPC active — real-time PrintTicket delivery");
-    }
-    else
-    {
-      log_callback(watcher::LogLevel::Warn, "bridge",
-                   "Named event IPC unavailable — falling back to 3 s polling");
-    }
-
     // ── Heartbeat: snapshot printer name once for the loop ────────────
     const QString heartbeatPrinter = QString::fromStdWString(printerName);
 
-    // Lambda for scanning & emitting PT metadata — called both on the
-    // fast IPC path and the periodic fallback path.
-    const auto scan_pt_metadata_now = [&]() {
-      // cleanup_after_load = true: delete PT metadata files after
-      // loading so they don't accumulate across long sessions and
-      // don't get re-processed after a watcher thread restart.
-      bridge::scan_and_merge_pt_metadata(
-        outputDir,
-        [&](core::MetadataSnapshot pt_meta) {
-          std::string key = pt_meta.printer_name + "\x1f" + std::to_string(pt_meta.job_id);
-          if (!seen_pt_files.insert(std::move(key)).second)
-            return;  // Already consumed this file.
-
-          pt_meta.dm_fields_hex = "PrintTicket";
-          pt_meta = normalizeMetadata(std::move(pt_meta), printer_name_str);
-
-          core::JobSnapshot job;
-          {
-            std::scoped_lock lock(pendingMutex);
-            auto it = jobCache.find(pt_meta.job_id);
-            if (it != jobCache.end())
-            {
-              job = it->second;
-            }
-          }
-          if (job.job_id != 0)
-          {
-            (void)writer.enqueue(std::move(job), pt_meta);
-          }
-
-          QMetaObject::invokeMethod(this, [this, meta = std::move(pt_meta)]() mutable {
-            emit metadataReceived(std::move(meta));
-          }, Qt::QueuedConnection);
-        },
-        /* cleanup_after_load = */ true);
-    };
-
+    std::string storage_health;
     int tick_count = 0;
     while (running_ && watcher.running())
     {
-      // ── Wait: event-driven (IPC) or legacy sleep ────────────────────
-      if (pt_event.valid())
-      {
-        const DWORD wait_result = pt_event.wait(50);  // 50 ms tick
-        if (wait_result == WAIT_OBJECT_0)
-        {
-          // Reset the manual-reset event BEFORE scanning so a
-          // concurrent SetEvent from another filter invocation
-          // during the scan is not lost.
-          pt_event.reset();
-          scan_pt_metadata_now();
-          tick_count = 0;  // skip redundant 3 s scan next tick
-        }
-      }
-      else
-      {
-        QThread::msleep(50);
-      }
+      QThread::msleep(50);
 
       ++tick_count;
 
       // Heartbeat — fires every ~1 s (20 ticks).
       if (tick_count % 20 == 0)
       {
+        const auto error = writer.last_error();
+        if (error != storage_health)
+        {
+          storage_health = error;
+          QMetaObject::invokeMethod(this, [this, failed = !error.empty()]() {
+            emit storageWarning(failed ? QStringLiteral("采集文件暂未写入，数据已保留待重试，请检查目录。") : QStringLiteral("采集存储已恢复。"));
+          }, Qt::QueuedConnection);
+        }
         QMetaObject::invokeMethod(this, [this, heartbeatPrinter]() {
           emit watcherHeartbeat(heartbeatPrinter);
         }, Qt::QueuedConnection);
       }
 
-      // ── Periodic fallback scan (~3 s) ─────────────────────────────
-      // Even when IPC is active, scan periodically as a safety net:
-      // - GDI-only drivers skip the XPS pipeline entirely
-      // - Event may be missed across spooler restarts
-      if (tick_count % 60 == 0)
-      {
-        scan_pt_metadata_now();
-      }
+
     }
 
     watcher.stop();
     writer.stop();
+    if (!writer.last_error().empty())
+      recordStorageFailure(QString::fromStdString(printer_name_str + ": " + writer.last_error()));
 
-    const auto summaries = watcher.lifecycle_summaries();
+    auto summaries = watcher.lifecycle_summaries();
     if (!summaries.empty())
     {
-      storage::write_lifecycle_summaries_atomic(
-        summaries,
-        storage::JobSnapshotWriterConfig{.output_directory = outputDir});
+      std::map<std::string, std::vector<core::JobLifecycleSummary>> dailySummaries;
+      for (auto& summary : summaries)
+      {
+        summary.job_id = normalizedJobId(summary.printer_name.empty() ? printer_name_str : summary.printer_name,
+                                        summary.job_id);
+        const auto date = jobCaptureDates.find(summary.job_id);
+        dailySummaries[date == jobCaptureDates.end() ? common::current_business_date().yyyy_mm_dd : date->second]
+            .push_back(std::move(summary));
+      }
+      for (const auto& [date, daily] : dailySummaries)
+        storage::write_lifecycle_summaries_atomic(daily,
+            storage::JobSnapshotWriterConfig{.output_directory = outputDir.parent_path() / date});
     }
   }
   catch (const std::exception& error)
   {
+    recordStorageFailure(QString::fromUtf8(error.what()));
     QMetaObject::invokeMethod(this, [this, msg = QString::fromStdString(error.what())]() {
       emit watcherError(msg);
     }, Qt::QueuedConnection);

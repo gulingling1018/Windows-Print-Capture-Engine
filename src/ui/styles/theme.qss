@@ -11,19 +11,19 @@
 /* ── Global ──────────────────────────────────────────────────────── */
 
 QWidget#AppRoot {
-  background: #f1f5f9;
+  background: #f4f7fb;
 }
 
 QMainWindow {
-  background: #f1f5f9;
+  background: #f4f7fb;
 }
 
 /* ── Hero bar ────────────────────────────────────────────────────── */
 
 QFrame#HeroBar {
   background: white;
-  border: 1px solid #e2e8f0;
-  border-radius: 10px;
+  border: 1px solid #dbe4f0;
+  border-radius: 12px;
 }
 
 QLabel#WindowTitle {
@@ -41,8 +41,8 @@ QLabel#WindowSubtitle {
 
 QFrame#MetricCard {
   background: white;
-  border: 1px solid #e2e8f0;
-  border-radius: 8px;
+  border: 1px solid #dbe4f0;
+  border-radius: 10px;
 }
 
 QLabel#MetricLabel {
@@ -84,8 +84,8 @@ QLabel#PathValue {
 
 QFrame#TablePanel {
   background: white;
-  border: 1px solid #e2e8f0;
-  border-radius: 10px;
+  border: 1px solid #dbe4f0;
+  border-radius: 12px;
 }
 
 QLabel#PanelHeader {
@@ -191,6 +191,14 @@ QTreeView#JobTree::item:selected {
   color: #1e40af;
 }
 
+QTreeView#JobTree::item:hover:!selected {
+  background: #f1f5f9;
+}
+
+QTreeView#JobTree:focus {
+  border-color: #93c5fd;
+}
+
 QHeaderView::section {
   background: #f8fafc;
   color: #475569;
@@ -218,7 +226,7 @@ QLineEdit#SearchBox {
 
 QLineEdit#SearchBox:focus {
   border-color: #2563eb;
-  border-width: 2px;
+  background: #f8fbff;
 }
 
 /* ── Splitters ───────────────────────────────────────────────────── */

@@ -13,8 +13,7 @@
 namespace wpce::common
 {
 
-// ── Sub-config structures ──────────────────────────────────────────────────
-
+// Sub-config structures
 struct StorageConfig
 {
   /// Root directory for captured output. Relative paths resolve
@@ -23,9 +22,6 @@ struct StorageConfig
   /// Default: "./data" (portable, next to exe).
   std::string output_root{"./data"};
 
-  /// Maximum number of pending snapshot items before backpressure.
-  std::size_t queue_capacity{256};
-
   /// Number of days to keep captured data before automatic cleanup.
   /// 0 = never delete.
   int retention_days{90};
@@ -33,12 +29,12 @@ struct StorageConfig
 
 struct PricingConfig
 {
-  // ── Matrix pricing rules ───────────────────────────────────────────
+  // Matrix pricing rules
   //
   // The legacy additive fields (single_sided_per_page, color_surcharge,
   // volume_discounts, etc.) have been removed.  All pricing is now
   // matrix-based.  Old config files containing legacy fields are still
-  // loadable — the legacy fields are silently ignored.
+  // loadable - the legacy fields are silently ignored.
 
   /// Per-dimension pricing rules.  When non-empty, the pricing engine
   /// uses matrix-based matching.  When empty, the engine falls back to
@@ -103,7 +99,19 @@ struct WindowLayoutConfig
   bool quick_settle_collapsed{false};
 };
 
-// ── Master configuration ───────────────────────────────────────────────────
+// Master configuration
+struct StartupConfig
+{
+  /// Register the UI app in the current user's Windows Run key.
+  bool launch_at_login{false};
+
+  /// Open the floating billing/settlement window when the app starts.
+  bool open_quick_settle_at_start{false};
+
+  /// Start without showing the main window. The quick settle window is
+  /// opened automatically when this is enabled.
+  bool silent_startup{false};
+};
 
 struct AppConfig
 {
@@ -112,6 +120,7 @@ struct AppConfig
   MerchantConfig merchant;
   MonitoringConfig monitoring;
   WindowLayoutConfig window;
+  StartupConfig startup;
 
   /// Printer capability profiles for color-aware pricing.
   /// Populated automatically on first launch via
@@ -119,7 +128,7 @@ struct AppConfig
   PrinterProfileConfig printers;
 
   /// Build a config populated with sensible factory defaults,
-  /// including the 6 default pricing rules.
+  /// including the 9 default pricing rules.
   static AppConfig defaults();
 
   /// Resolve the best configuration file path:
@@ -144,4 +153,3 @@ struct AppConfig
 };
 
 }  // namespace wpce::common
-

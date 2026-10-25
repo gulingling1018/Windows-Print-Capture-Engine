@@ -2,6 +2,7 @@
 /// Settlement bridge implementation.
 
 #include "bridge/settlement_bridge.h"
+#include "storage/json_reader.h"
 #include "common/pricing_engine.h"
 
 #include <algorithm>
@@ -14,14 +15,14 @@
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
+#include <thread>
 
 namespace wpce::bridge
 {
 namespace
 {
 
-// ── Minimal JSON writer (same pattern as app_config.cpp) ────────────────
-
+// Minimal JSON writer (same pattern as app_config.cpp)
 class JsonWriter
 {
 public:
@@ -45,7 +46,7 @@ public:
   void write_string(const std::string& s) { before_value(); out_ << '"' << esc(s) << '"'; }
   void write_int(int v)                   { before_value(); out_ << v; }
   void write_uint32(std::uint32_t v)      { before_value(); out_ << v; }
-  void write_double(double v)             { before_value(); char buf[64]; std::snprintf(buf, sizeof(buf), "%.2f", v); out_ << buf; }
+  void write_double(double v)             { before_value(); char buf[64]; std::snprintf(buf, sizeof(buf), "%.4f", v); out_ << buf; }
   void write_bool(bool v)                 { before_value(); out_ << (v ? "true" : "false"); }
 
 private:
@@ -72,69 +73,20 @@ private:
         case '\n': r += "\\n"; break;
         case '\r': r += "\\r"; break;
         case '\t': r += "\\t"; break;
-        default: r += c;
+        default:
+          if (static_cast<unsigned char>(c) < 0x20) {
+            char escaped[7]; std::snprintf(escaped, sizeof(escaped), "\\u%04x", static_cast<unsigned char>(c)); r += escaped;
+          } else r += c;
       }
     }
     return r;
   }
 };
 
-// ── Minimal JSON reader ──────────────────────────────────────────────────
+// Minimal JSON reader
+using JsonReader = storage::JsonReader;
 
-class JsonReader
-{
-public:
-  explicit JsonReader(std::istream& in) : in_(in) { skip_ws(); }
-
-  void begin_object() { expect('{'); skip_ws(); stack_.push_back({true, true}); }
-  bool end_object_or_next()
-  {
-    skip_ws();
-    if (peek() == '}') { get(); if (!stack_.empty()) stack_.pop_back(); return false; }
-    if (!stack_.empty() && stack_.back().first) { stack_.back().first = false; return true; }
-    expect(','); return true;
-  }
-  void begin_array() { expect('['); skip_ws(); stack_.push_back({false, true}); }
-  bool end_array_or_next()
-  {
-    skip_ws();
-    if (peek() == ']') { get(); if (!stack_.empty()) stack_.pop_back(); return false; }
-    if (!stack_.empty() && stack_.back().first) { stack_.back().first = false; return true; }
-    expect(','); return true;
-  }
-
-  std::string read_key() { std::string k = read_string(); skip_ws(); expect(':'); skip_ws(); return k; }
-  std::string read_string()
-  {
-    expect('"'); std::string r;
-    for (;;) {
-      int c = get(); if (c == '"') break;
-      if (c == '\\') { c = get(); switch (c) { case '"': r+='"'; break; case '\\': r+='\\'; break; case 'n': r+='\n'; break; case 'r': r+='\r'; break; case 't': r+='\t'; break; default: r+=static_cast<char>(c); } }
-      else r += static_cast<char>(c);
-    }
-    skip_ws(); return r;
-  }
-  double read_number() { std::string t; while (std::isdigit(peek())||peek()=='-'||peek()=='+'||peek()=='.') t+=static_cast<char>(get()); skip_ws(); return std::stod(t); }
-  int read_int() { return static_cast<int>(read_number()); }
-  std::uint32_t read_uint32() { return static_cast<std::uint32_t>(read_number()); }
-  bool read_bool() {
-    if (peek()=='t') { for(int i=0;i<4;++i)get(); skip_ws(); return true; }
-    for(int i=0;i<5;++i)get(); skip_ws(); return false;
-  }
-  void read_null() { for(int i=0;i<4;++i)get(); skip_ws(); }
-
-private:
-  struct Ctx { bool is_object; bool first; };
-  std::vector<Ctx> stack_;
-  std::istream& in_;
-  int peek() const { return in_.peek(); }
-  int get() { int c=in_.get(); if(c==std::char_traits<char>::eof()) throw std::runtime_error("unexpected end of JSON"); return c; }
-  void expect(char e) { int c=get(); if(c!=e) throw std::runtime_error("expected different char"); }
-  void skip_ws() { while(std::isspace(peek())) get(); }
-};
-
-// ── Timestamp helpers ────────────────────────────────────────────────────
-
+// Timestamp helpers
 std::string utc_now_iso8601()
 {
   const auto now = std::chrono::system_clock::now();
@@ -154,13 +106,13 @@ std::string utc_now_iso8601()
 
 }  // namespace
 
-// ── Public API ───────────────────────────────────────────────────────────
-
+// Public API
 std::string SettlementBridge::generateOrderId(
     const std::string& date_yyyymmdd, int daily_counter)
 {
-  char buf[32];
-  std::snprintf(buf, sizeof(buf), "SETTLE-%s-%03d",
+  char buf[64];
+  // 6-digit zero-padded format (consistent with CounterStore).
+  std::snprintf(buf, sizeof(buf), "SETTLE-%s-%06d",
                 date_yyyymmdd.c_str(), daily_counter);
   return buf;
 }
@@ -172,18 +124,28 @@ std::string SettlementBridge::snapshotPricingConfig(
   common::AppConfig temp;
   temp.pricing = config;
 
-  // Write to a temp file and read back as string.
-  const auto temp_path = std::filesystem::temp_directory_path() / "wpce_pricing_snapshot.tmp";
-  if (!temp.save_to_json(temp_path)) return "{}";
+  // Use a unique temp path to avoid races between concurrent settlements.
+  const auto temp_path = std::filesystem::temp_directory_path() /
+      ("wpce_pricing_snapshot_" + std::to_string(std::hash<std::thread::id>{}(std::this_thread::get_id())) + ".tmp");
 
-  std::ifstream in(temp_path, std::ios::binary);
-  if (!in) return "{}";
+  std::string result = "{}";
+  try
+  {
+    if (!temp.save_to_json(temp_path)) return result;
 
-  std::ostringstream oss;
-  oss << in.rdbuf();
+    std::ifstream in(temp_path, std::ios::binary);
+    if (!in) return result;
+
+    std::ostringstream oss;
+    oss << in.rdbuf();
+    result = oss.str();
+  }
+  catch (...) {}
+
+  // Always clean up the temp file.
   std::error_code ec;
   std::filesystem::remove(temp_path, ec);
-  return oss.str();
+  return result;
 }
 
 core::SettlementOrder SettlementBridge::createSettlementOrder(
@@ -228,14 +190,18 @@ std::string SettlementBridge::toJson(const core::SettlementOrder& order)
 
   w.key("schema_version");    w.write_int(order.schema_version);
   w.key("order_id");          w.write_string(order.order_id);
+  w.key("batch_id");          w.write_string(order.batch_id);
   w.key("task_id");           w.write_string(order.task_id);
   w.key("user_id");           w.write_string(order.user_id);
   w.key("settled_by");        w.write_string(order.settled_by);
   w.key("settled_at_utc");    w.write_string(order.settled_at_utc);
   w.key("period_start_utc");  w.write_string(order.period_start_utc);
   w.key("period_end_utc");    w.write_string(order.period_end_utc);
+  w.key("first_document_name"); w.write_string(order.first_document_name);
+  w.key("last_document_name");  w.write_string(order.last_document_name);
   w.key("currency");          w.write_string(order.currency);
   w.key("total_price");       w.write_double(order.total_price);
+  w.key("color_merged_total"); w.write_double(order.color_merged_total);
 
   // job_ids array
   w.key("job_ids");
@@ -257,10 +223,22 @@ std::string SettlementBridge::toJson(const core::SettlementOrder& order)
     w.key("duplex_full_sheets");  w.write_int(entry.duplex_full_sheets);
     w.key("simplex_tail_pages");  w.write_int(entry.simplex_tail_pages);
     w.key("matched_rule_id");     w.write_string(entry.matched_rule_id);
+    w.key("tail_rule_id");        w.write_string(entry.tail_rule_id);
+    w.key("matched_printer_name"); w.write_string(entry.matched_printer_name);
     w.key("base_price");          w.write_double(entry.base_price);
+    w.key("tail_price");          w.write_double(entry.tail_price);
     w.key("total_price");         w.write_double(entry.total_price);
+    w.key("color_pages");         w.write_int(entry.color_pages);
+    w.key("mono_pages");          w.write_int(entry.mono_pages);
+    w.key("color_subtotal");      w.write_double(entry.color_subtotal);
+    w.key("mono_subtotal");       w.write_double(entry.mono_subtotal);
     w.key("price_pending");       w.write_bool(entry.price_pending);
     w.key("pending_reason");      w.write_string(entry.pending_reason);
+    w.key("color_downgraded");    w.write_bool(entry.color_downgraded);
+    w.key("manual_price_override"); w.write_bool(entry.manual_price_override);
+    w.key("manual_total_price");   w.write_double(entry.manual_total_price);
+    if (!entry.note.empty())
+    { w.key("note");              w.write_string(entry.note); }
     w.end_object();
   }
   w.end_array();
@@ -283,6 +261,7 @@ std::optional<core::SettlementOrder> SettlementBridge::fromJson(
     JsonReader r(in);
 
     core::SettlementOrder order;
+    bool hasPrice = false, hasJobs = false, hasEntries = false;
     r.begin_object();
     while (r.end_object_or_next())
     {
@@ -290,23 +269,29 @@ std::optional<core::SettlementOrder> SettlementBridge::fromJson(
 
       if (key == "schema_version")       order.schema_version = r.read_int();
       else if (key == "order_id")         order.order_id = r.read_string();
+      else if (key == "batch_id")         order.batch_id = r.read_string();
       else if (key == "task_id")          order.task_id = r.read_string();
       else if (key == "user_id")          order.user_id = r.read_string();
       else if (key == "settled_by")       order.settled_by = r.read_string();
       else if (key == "settled_at_utc")   order.settled_at_utc = r.read_string();
       else if (key == "period_start_utc") order.period_start_utc = r.read_string();
       else if (key == "period_end_utc")   order.period_end_utc = r.read_string();
+      else if (key == "first_document_name") order.first_document_name = r.read_string();
+      else if (key == "last_document_name")  order.last_document_name = r.read_string();
       else if (key == "currency")         order.currency = r.read_string();
-      else if (key == "total_price")      order.total_price = r.read_number();
+      else if (key == "total_price")      { order.total_price = r.read_number(); hasPrice = true; }
+      else if (key == "color_merged_total") order.color_merged_total = r.read_number();
       else if (key == "pricing_snapshot_json") order.pricing_snapshot_json = r.read_string();
       else if (key == "job_ids")
       {
+        hasJobs = true;
         r.begin_array();
         while (r.end_array_or_next())
           order.job_ids.push_back(r.read_uint32());
       }
       else if (key == "pricing_entries")
       {
+        hasEntries = true;
         r.begin_array();
         while (r.end_array_or_next())
         {
@@ -322,17 +307,33 @@ std::optional<core::SettlementOrder> SettlementBridge::fromJson(
             else if (ek == "duplex_full_sheets")  entry.duplex_full_sheets = r.read_int();
             else if (ek == "simplex_tail_pages")  entry.simplex_tail_pages = r.read_int();
             else if (ek == "matched_rule_id")     entry.matched_rule_id = r.read_string();
+            else if (ek == "tail_rule_id")        entry.tail_rule_id = r.read_string();
+            else if (ek == "matched_printer_name") entry.matched_printer_name = r.read_string();
             else if (ek == "base_price")          entry.base_price = r.read_number();
+            else if (ek == "tail_price")          entry.tail_price = r.read_number();
             else if (ek == "total_price")         entry.total_price = r.read_number();
+            else if (ek == "color_pages")         entry.color_pages = r.read_int();
+            else if (ek == "mono_pages")          entry.mono_pages = r.read_int();
+            else if (ek == "color_subtotal")      entry.color_subtotal = r.read_number();
+            else if (ek == "mono_subtotal")       entry.mono_subtotal = r.read_number();
             else if (ek == "price_pending")       entry.price_pending = r.read_bool();
             else if (ek == "pending_reason")      entry.pending_reason = r.read_string();
-            else (void)r.read_string();
+            else if (ek == "color_downgraded")    entry.color_downgraded = r.read_bool();
+            else if (ek == "manual_price_override") entry.manual_price_override = r.read_bool();
+            else if (ek == "manual_total_price") entry.manual_total_price = r.read_number();
+            else if (ek == "note")                entry.note = r.read_string();
+            else r.skipValue();
           }
           order.pricing_entries.push_back(std::move(entry));
         }
       }
-      else { (void)r.read_string(); }
+      else { r.skipValue(); }
     }
+    r.finish();
+    if (order.order_id.empty() || !hasPrice || !hasJobs || !hasEntries ||
+        order.schema_version < 1 || order.schema_version > 2 ||
+        !std::isfinite(order.total_price) || order.total_price < 0)
+      return std::nullopt;
     return order;
   }
   catch (...) { return std::nullopt; }
@@ -342,6 +343,8 @@ bool SettlementBridge::saveToFile(
     const core::SettlementOrder& order,
     const std::filesystem::path& output_dir)
 {
+  if (order.order_id.empty()) return false;
+
   try
   {
     const auto orders_dir = output_dir / "settlement_orders";
@@ -386,8 +389,7 @@ std::optional<core::SettlementOrder> SettlementBridge::loadFromFile(
   catch (...) { return std::nullopt; }
 }
 
-// ── Date-based storage helpers ──────────────────────────────────────────
-
+// Date-based storage helpers
 namespace
 {
 
@@ -438,6 +440,8 @@ bool SettlementBridge::saveToDateDir(
     const std::string& first_doc,
     const std::string& last_doc)
 {
+  if (order.order_id.empty() || date_yyyy_mm_dd.empty()) return false;
+
   try
   {
     const auto date_dir = history_root / date_yyyy_mm_dd;

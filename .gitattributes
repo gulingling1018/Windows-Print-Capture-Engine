@@ -1,0 +1,23 @@
+* text=auto
+
+*.c text working-tree-encoding=UTF-8
+*.cc text working-tree-encoding=UTF-8
+*.cpp text working-tree-encoding=UTF-8
+*.cxx text working-tree-encoding=UTF-8
+*.h text working-tree-encoding=UTF-8
+*.hpp text working-tree-encoding=UTF-8
+*.cmake text working-tree-encoding=UTF-8
+CMakeLists.txt text working-tree-encoding=UTF-8
+*.json text working-tree-encoding=UTF-8
+*.md text working-tree-encoding=UTF-8
+*.ps1 text working-tree-encoding=UTF-8
+*.qss text working-tree-encoding=UTF-8
+*.qrc text working-tree-encoding=UTF-8
+*.rc text working-tree-encoding=UTF-8
+*.rc.in text working-tree-encoding=UTF-8
+*.def text working-tree-encoding=UTF-8
+*.in text working-tree-encoding=UTF-8
+readme text working-tree-encoding=UTF-8
+
+*.ico binary
+*.png binary

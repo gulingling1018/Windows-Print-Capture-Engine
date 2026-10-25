@@ -27,24 +27,24 @@ std::string_view to_string(const JobLifecyclePhase phase) noexcept
   switch (phase)
   {
     case JobLifecyclePhase::Unknown:
-      return "unknown";
+      return "Unknown";
     case JobLifecyclePhase::Accepted:
-      return "accepted";
+      return "Accepted";
     case JobLifecyclePhase::Spooling:
-      return "spooling";
+      return "Spooling";
     case JobLifecyclePhase::Printing:
-      return "printing";
+      return "Printing";
     case JobLifecyclePhase::Completed:
-      return "completed";
+      return "Completed";
     case JobLifecyclePhase::Failed:
-      return "failed";
+      return "Failed";
     case JobLifecyclePhase::Cancelled:
-      return "cancelled";
+      return "Cancelled";
     case JobLifecyclePhase::Stalled:
-      return "stalled";
+      return "Stalled";
   }
 
-  return "unknown";
+  return "Unknown";
 }
 
 bool is_terminal_phase(const JobLifecyclePhase phase) noexcept

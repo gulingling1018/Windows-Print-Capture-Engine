@@ -5,6 +5,7 @@
 
 #include <atomic>
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <mutex>
@@ -17,8 +18,7 @@
 namespace wpce::watcher
 {
 
-// ── Diagnostic logging ──────────────────────────────────────────────────
-
+// Diagnostic logging
 enum class LogLevel
 {
   Debug,   // Fine-grained: per-field notification content, signature comparisons
@@ -28,7 +28,7 @@ enum class LogLevel
 };
 
 /// Callback for diagnostic log messages from the watcher pipeline.
-/// Receives: severity, short category tag ("init"/"notify"/"phase"/…), message.
+/// Receives: severity, short category tag ("init"/"notify"/"phase"/...), message.
 /// Thread-safe: only called from the watcher worker thread.
 using LogCallback = std::function<void(LogLevel level, std::string_view category, std::string message)>;
 
@@ -46,7 +46,7 @@ struct WatcherConfig
   /// Periodic full rescan interval.  Fires regardless of notification
   /// activity, serving as a safety net for printer drivers that drop
   /// or coalesce spooler change notifications.  Zero disables.
-  /// Default 5 s — fast enough for laser printer safety net, long
+  /// Default 5 s - fast enough for laser printer safety net, long
   /// enough to avoid excessive spooler load.
   std::chrono::seconds rescan_interval{5};
 
@@ -66,8 +66,7 @@ struct JobSnapshotWithMetadata
   core::MetadataSnapshot metadata;
 };
 
-// ── Public helpers ─────────────────────────────────────────────────────
-
+// Public helpers
 std::string describe_job_status(std::uint32_t status_flags);
 
 /// Map raw JOB_STATUS flags to a high-level lifecycle phase.
@@ -82,8 +81,7 @@ bool should_preserve_transient_unknown_status(core::JobLifecyclePhase current_ph
 /// Enumerate current print jobs with both job-level and metadata snapshots.
 std::vector<JobSnapshotWithMetadata> enumerate_printer_jobs(const std::wstring& printer_name);
 
-// ── PrintWatcher ────────────────────────────────────────────────────────
-
+// PrintWatcher
 class PrintWatcher
 {
  public:
@@ -106,6 +104,13 @@ class PrintWatcher
 
   /// Thread-safe copy of the current per-job lifecycle summaries.
   [[nodiscard]] std::vector<core::JobLifecycleSummary> lifecycle_summaries() const;
+
+  /// Thread-safe paginated copy of current per-job lifecycle summaries.
+  /// @param offset  Number of summaries to skip (sorted by job_id).
+  /// @param limit   Maximum summaries to return (0 = unlimited).
+  /// @param total   [out] Total number of summaries available.
+  [[nodiscard]] std::vector<core::JobLifecycleSummary> lifecycle_summaries(
+      std::size_t offset, std::size_t limit, std::size_t& total) const;
 
   /// Access the performance monitor for sampling.
   [[nodiscard]] const core::PerfMonitor& perf_monitor() const noexcept { return perf_monitor_; }
@@ -141,6 +146,12 @@ class PrintWatcher
 
     core::JobLifecycleSummary summary;
   };
+
+  /// Build a lifecycle summary from an InternalJobState entry.
+  /// Shared by both lifecycle_summaries() overloads to avoid duplication.
+  [[nodiscard]] core::JobLifecycleSummary build_summary_from_state(
+      const InternalJobState& state) const;
+
   mutable std::mutex summaries_mutex_;
   std::unordered_map<std::uint32_t, InternalJobState> job_states_;
 
@@ -149,6 +160,15 @@ class PrintWatcher
   mutable std::mutex lifecycle_mutex_;
   mutable std::mutex error_mutex_;
   std::string last_error_;
+
+  /// Counter for consecutive WaitForSingleObject failures.
+  /// Reset to 0 on any successful wait.  When the threshold is reached
+  /// the watcher assumes the spooler has restarted and exits the loop
+  /// so the bridge can reconnect.
+  int consecutive_wait_failures_{0};
+
+  /// Per-instance cleanup timestamp (avoids data race from static local).
+  std::chrono::steady_clock::time_point last_cleanup_{};
 };
 
 }  // namespace wpce::watcher

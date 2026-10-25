@@ -1,3 +1,31 @@
+# 2026-06-27 当前有效对接基线
+
+> 本节按本次用户确认的业务设计更新，优先级高于本文后续历史记录。
+
+## 价格配置
+
+- 价格矩阵维度为：打印机、纸张、单双面、颜色、文件类型、单价。
+- 颜色维度不可再作为“全部/通配”。保存与加载时只允许 `monochrome` 或 `color`；历史空值、非法值统一迁移为 `monochrome`。
+- 无颜色值、驱动上报 `-`、未选择彩色打印机、或黑白打印机上的任务，都按黑白计价。
+- 彩色打印机上的显式彩色任务，如果 `color_pages <= 0`，必须进入待定价：`price_pending=true`，`pending_reason="awaiting_color_pages"`，价格为 0，等待操作员填写彩页数。
+- `color_price_pending` 不再覆盖上述规则，不能把缺少彩页数的彩色任务自动按黑白结算。
+
+## 存储与加载
+
+- 最新快照按打印机分桶：`latest/<printer>/job.json`、`latest/<printer>/metadata.json`。
+- 全局 `latest/manifest.json` 仅指向当前最新打印机桶，避免多打印机写入互相覆盖。
+- 归档快照按打印机分桶：`jobs/<printer>/job-<id>.json` 与 `job-<id>-metadata.json`。
+- 结算当前状态采用分桶：`_state/today_active.json` 只保存批次摘要，`_state/batches/<batch-id>/jobs.json` 保存作业明细。界面启动应先加载摘要，再按需加载批次明细。
+- 不设置硬边界限制；通过分桶记录与按需加载避免大数据卡顿。
+
+## 日期、配置与清理
+
+- 业务日期、每日目录、批次号、结算单号均使用系统本地日期；`*_utc` 字段仅保留为审计时间戳。
+- 跨天启动清空 active/suspended/unsettled 当前态；已结算历史不清空。
+- 配置读取失败时不得覆盖用户配置。程序使用默认配置运行，并保留 `.invalid-yyyymmdd-HHMMSS.bak` 备份。
+- 保留策略只清理过期日期捕获桶/临时桶，不清理配置、当前状态或结算历史。
+
+---
 # 打印捕获引擎 — 前端对接工作交接文档
 
 > **文档目的**：向后端改动完成后，前端工程师能一次性获得全部接口信息和业务需求，无需翻阅代码。
@@ -45,7 +73,7 @@ struct PricingRule {
   std::string rule_id;         // 唯一标识，如 "rule-001"
   std::string paper_size;      // 纸张尺寸，空字符串 = 匹配全部
   std::string duplex_mode;     // "simplex" | "duplex" | "" = 全部
-  std::string color_mode;      // "color" | "monochrome" | "" = 全部
+  std::string color_mode;      // "color" | "monochrome"；空/非法历史值=黑白，不再表示全部
   std::string file_extension;  // 文件扩展名，空 = 匹配全部
   double price_per_sheet;      // 每张物理纸的单价（单面=1页/张，双面=2页/张）
   int priority;                // 特异性评分，越大越优先（加载时自动计算）
@@ -196,9 +224,9 @@ core::JobPricingEntry compute_job_pricing(
       {"rule_id":"1","paper_size":"A4","duplex_mode":"simplex",
        "color_mode":"monochrome","file_extension":"","price_per_sheet":0.15},
       {"rule_id":"2","paper_size":"A4","duplex_mode":"simplex",
-       "color_mode":"","file_extension":"dwg","price_per_sheet":0.50},
+       "color_mode":"monochrome","file_extension":"dwg","price_per_sheet":0.50},
       {"rule_id":"3","paper_size":"A2","duplex_mode":"simplex",
-       "color_mode":"","file_extension":"","price_per_sheet":2.00}
+       "color_mode":"monochrome","file_extension":"","price_per_sheet":2.00}
     ]
   }
 }
@@ -228,12 +256,12 @@ core::JobPricingEntry compute_job_pricing(
 
 **期望**：
 - 支持 `{纸张, 单|双面, 颜色, 文件类型, 单价}` 五维定价矩阵
-- 每个维度留空 = 通配（匹配该维度的所有情况）
+- 纸张、打印机、单双面、文件类型可按配置使用通配；颜色不可通配，空/非法颜色统一为黑白。
 - 特异性更高的规则覆盖更通用的规则
 - 设置界面应提供规则表格编辑器：
   - 列：纸张尺寸 | 单/双面 | 颜色 | 文件类型 | 单价(元/张)
   - 支持添加/删除/编辑行
-  - 空单元格以灰字显示"全部"
+  - 颜色列不得显示“全部”；空/非法颜色按“黑白”展示与保存。
 - 旧设置界面的 5 个 DoubleSpinBox 可保留作为"无规则时的回退价格"
 
 **后端支撑**：`PricingRule` 结构 + `PricingConfig.rules` 向量 + JSON 序列化已就绪。

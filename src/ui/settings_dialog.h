@@ -34,6 +34,7 @@ class SettingsDialog : public QDialog
   void buildPricingTab();
   void buildPrinterTab();
   void buildStorageTab();
+  void buildStartupTab();
   void loadFromConfig();
   void storeToConfig();
   void reloadPrinterList();
@@ -58,10 +59,14 @@ class SettingsDialog : public QDialog
   // ── Storage tab ──
   QLineEdit* outputRoot_ = nullptr;
   QPushButton* browseOutputBtn_ = nullptr;
-  QSpinBox* queueCapacity_ = nullptr;
   QSpinBox* retentionDays_ = nullptr;
   QSpinBox* stallTimeout_ = nullptr;
   QCheckBox* perfLogEnabled_ = nullptr;
+
+  // Startup tab
+  QCheckBox* launchAtLogin_ = nullptr;
+  QCheckBox* openQuickSettleAtStart_ = nullptr;
+  QCheckBox* silentStartup_ = nullptr;
 };
 
 }  // namespace wpce::ui

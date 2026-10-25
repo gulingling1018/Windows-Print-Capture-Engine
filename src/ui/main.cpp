@@ -3,6 +3,8 @@
 
 #include "ui/main_window.h"
 
+#include <wpce/common/build_config.h>
+
 #include <QApplication>
 #include <QFile>
 #include <QIcon>
@@ -44,7 +46,7 @@ int main(int argc, char* argv[])
 #endif
   QApplication::setStyle(QStringLiteral("Fusion"));
   app.setApplicationName(QStringLiteral("WPCE Monitor"));
-  app.setApplicationVersion(QStringLiteral("0.1.0"));
+  app.setApplicationVersion(QString::fromUtf8(WPCE_PRODUCT_VERSION));
   app.setOrganizationName(QStringLiteral("WPCE"));
 
   // Application icon (embedded via .rc for Windows Explorer; also set for window chrome).
@@ -59,7 +61,10 @@ int main(int argc, char* argv[])
   }
 
   wpce::ui::MainWindow window;
-  window.show();
+  if (!window.isSilentStartup())
+  {
+    window.show();
+  }
 
   return app.exec();
 }

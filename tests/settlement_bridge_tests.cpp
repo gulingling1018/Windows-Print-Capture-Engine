@@ -33,7 +33,7 @@ common::PricingConfig make_test_pricing_config()
 
   core::PricingRule r2;
   r2.rule_id = "r2"; r2.paper_size = ""; r2.duplex_mode = "duplex";
-  r2.printer_name = ""; r2.color_mode = ""; r2.file_extension = "";
+  r2.printer_name = ""; r2.color_mode = "monochrome"; r2.file_extension = "";
   r2.price_per_sheet = 0.25;
   r2.priority = common::rule_specificity(r2);
 
@@ -53,14 +53,15 @@ std::filesystem::path test_output_dir()
 
 TEST(SettlementBridge, GenerateOrderId)
 {
+  // 6-digit zero-padded format (consistent with CounterStore).
   std::string id = bridge::SettlementBridge::generateOrderId("20260622", 1);
-  EXPECT_EQ(id, "SETTLE-20260622-001");
+  EXPECT_EQ(id, "SETTLE-20260622-000001");
 
   id = bridge::SettlementBridge::generateOrderId("20260622", 42);
-  EXPECT_EQ(id, "SETTLE-20260622-042");
+  EXPECT_EQ(id, "SETTLE-20260622-000042");
 
   id = bridge::SettlementBridge::generateOrderId("20260622", 999);
-  EXPECT_EQ(id, "SETTLE-20260622-999");
+  EXPECT_EQ(id, "SETTLE-20260622-000999");
 }
 
 // ── snapshotPricingConfig ──────────────────────────────────────────────────
@@ -158,6 +159,8 @@ TEST(SettlementBridge, JsonRoundTrip)
       {301}, {entry}, config,
       "2026-06-22T08:00:00Z", "2026-06-22T08:15:00Z",
       "op");
+  original.first_document_name = "plan-a.pdf";
+  original.last_document_name = "plan-z.pdf";
 
   std::string json = bridge::SettlementBridge::toJson(original);
   EXPECT_FALSE(json.empty());
@@ -172,6 +175,8 @@ TEST(SettlementBridge, JsonRoundTrip)
   EXPECT_EQ(restored->settled_at_utc, original.settled_at_utc);
   EXPECT_EQ(restored->period_start_utc, original.period_start_utc);
   EXPECT_EQ(restored->period_end_utc, original.period_end_utc);
+  EXPECT_EQ(restored->first_document_name, original.first_document_name);
+  EXPECT_EQ(restored->last_document_name, original.last_document_name);
   EXPECT_EQ(restored->currency, original.currency);
   EXPECT_DOUBLE_EQ(restored->total_price, original.total_price);
   ASSERT_EQ(restored->job_ids.size(), original.job_ids.size());
@@ -221,6 +226,26 @@ TEST(SettlementBridge, SaveAndLoadFile)
   EXPECT_EQ(loaded->user_id, order.user_id);
 
   // Clean up.
+  std::filesystem::remove_all(out_dir);
+}
+
+TEST(SettlementBridge, RejectsEmptyOrderIdOnSave)
+{
+  auto config = make_test_pricing_config();
+  auto order = bridge::SettlementBridge::createSettlementOrder(
+      "", "20260622-011", "testuser",
+      {402}, {}, config,
+      "2026-06-22T09:00:00Z", "2026-06-22T09:10:00Z");
+
+  auto out_dir = test_output_dir();
+  std::filesystem::remove_all(out_dir);
+
+  EXPECT_FALSE(bridge::SettlementBridge::saveToFile(order, out_dir));
+  EXPECT_FALSE(bridge::SettlementBridge::saveToDateDir(
+      order, out_dir / "history", "2026-06-22", "a.pdf", "z.pdf"));
+  EXPECT_FALSE(std::filesystem::exists(out_dir / "settlement_orders" / ".json"));
+  EXPECT_FALSE(std::filesystem::exists(out_dir / "history" / "2026-06-22" / ".json"));
+
   std::filesystem::remove_all(out_dir);
 }
 

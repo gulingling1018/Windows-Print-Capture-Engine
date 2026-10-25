@@ -1,5 +1,7 @@
 #include "ui/history_explorer_dialog.h"
 #include "bridge/settlement_bridge.h"
+#include "common/business_clock.h"
+#include "domain/billing_batch_repository.h"
 
 #include <QDateTime>
 #include <QDir>
@@ -15,9 +17,21 @@
 namespace wpce::ui
 {
 
+namespace
+{
+
+QDate businessToday()
+{
+  return QDate::fromString(
+      QString::fromStdString(common::current_business_date().yyyy_mm_dd),
+      QStringLiteral("yyyy-MM-dd"));
+}
+
+}  // namespace
+
 HistoryExplorerDialog::HistoryExplorerDialog(const QString& historyRoot,
                                              QWidget* parent)
-  : QDialog(parent), historyRoot_(historyRoot), currentDate_(QDate::currentDate())
+  : QDialog(parent), historyRoot_(historyRoot), currentDate_(businessToday())
 {
   setWindowTitle(QStringLiteral("结算历史"));
   setMinimumSize(900, 560);
@@ -155,13 +169,18 @@ void HistoryExplorerDialog::loadOrders()
 {
   std::filesystem::path historyRoot(historyRoot_.toStdWString());
   availableDates_ = bridge::SettlementBridge::listDateDirs(historyRoot);
+  const auto legacyDates = bridge::SettlementBridge::listDateDirs(historyRoot / "history");
+  availableDates_.insert(availableDates_.end(), legacyDates.begin(), legacyDates.end());
+  std::sort(availableDates_.begin(), availableDates_.end());
+  availableDates_.erase(std::unique(availableDates_.begin(), availableDates_.end()),
+                        availableDates_.end());
   loadOrdersForCurrentDate();
 }
 
 void HistoryExplorerDialog::navigateDate(int delta)
 {
   QDate newDate = currentDate_.addDays(delta);
-  if (newDate > QDate::currentDate()) return;
+  if (newDate > businessToday()) return;
   currentDate_ = newDate;
   updateDateDisplay();
   loadOrdersForCurrentDate();
@@ -169,7 +188,7 @@ void HistoryExplorerDialog::navigateDate(int delta)
 
 void HistoryExplorerDialog::goToToday()
 {
-  currentDate_ = QDate::currentDate();
+  currentDate_ = businessToday();
   updateDateDisplay();
   loadOrdersForCurrentDate();
 }
@@ -177,8 +196,8 @@ void HistoryExplorerDialog::goToToday()
 void HistoryExplorerDialog::updateDateDisplay()
 {
   dateLabel_->setText(currentDate_.toString(QStringLiteral("yyyy-MM-dd")));
-  nextDateBtn_->setEnabled(currentDate_ < QDate::currentDate());
-  todayBtn_->setEnabled(currentDate_ != QDate::currentDate());
+  nextDateBtn_->setEnabled(currentDate_ < businessToday());
+  todayBtn_->setEnabled(currentDate_ != businessToday());
 }
 
 void HistoryExplorerDialog::loadOrdersForCurrentDate()
@@ -190,7 +209,17 @@ void HistoryExplorerDialog::loadOrdersForCurrentDate()
   std::filesystem::path historyRoot(historyRoot_.toStdWString());
   std::string dateStr = currentDate_.toString(QStringLiteral("yyyy-MM-dd")).toStdString();
 
-  auto settlementOrders = bridge::SettlementBridge::loadOrdersForDate(historyRoot, dateStr);
+  domain::BillingBatchRepository repository;
+  repository.setFilePath(historyRoot / dateStr / "orders.json");
+  std::vector<core::SettlementOrder> settlementOrders;
+  (void)repository.loadOrders(settlementOrders);
+  if (settlementOrders.empty())
+  {
+    // Read-only fallback for pre-v4 installations. New settlements are never
+    // written here.
+    settlementOrders = bridge::SettlementBridge::loadOrdersForDate(
+        historyRoot / "history", dateStr);
+  }
 
   for (auto& order : settlementOrders)
   {
@@ -202,13 +231,8 @@ void HistoryExplorerDialog::loadOrdersForCurrentDate()
     row.totalPrice = order.total_price;
     row.jobCount = static_cast<int>(order.job_ids.size());
 
-    // Extract first/last doc from pricing entries or order fields.
-    if (!order.pricing_entries.empty())
-    {
-      row.firstDoc = QStringLiteral("作业#%1").arg(order.pricing_entries.front().job_id);
-      row.lastDoc = QStringLiteral("作业#%1").arg(order.pricing_entries.back().job_id);
-    }
-
+    row.firstDoc = QString::fromStdString(order.first_document_name);
+    row.lastDoc = QString::fromStdString(order.last_document_name);
     row.order = std::move(order);
     orders_.push_back(std::move(row));
   }
@@ -235,7 +259,6 @@ void HistoryExplorerDialog::onFilterChanged()
     {
       bool match = row.orderId.toLower().contains(filter) ||
                    row.userId.toLower().contains(filter) ||
-                   row.batchId.toLower().contains(filter) ||
                    row.firstDoc.toLower().contains(filter) ||
                    row.lastDoc.toLower().contains(filter);
       if (!match) continue;
@@ -245,8 +268,8 @@ void HistoryExplorerDialog::onFilterChanged()
     orderTable_->insertRow(r);
     orderTable_->setItem(r, 0, new QTableWidgetItem(row.orderId));
     orderTable_->setItem(r, 1, new QTableWidgetItem(row.userId));
-    orderTable_->setItem(r, 2, new QTableWidgetItem(row.firstDoc));
-    orderTable_->setItem(r, 3, new QTableWidgetItem(row.lastDoc));
+    orderTable_->setItem(r, 2, new QTableWidgetItem(row.firstDoc.isEmpty() ? QStringLiteral("-") : row.firstDoc));
+    orderTable_->setItem(r, 3, new QTableWidgetItem(row.lastDoc.isEmpty() ? QStringLiteral("-") : row.lastDoc));
 
     QDateTime dt = QDateTime::fromString(row.settledAt, Qt::ISODate);
     QString timeStr = dt.isValid() ? dt.toString(QStringLiteral("HH:mm:ss")) : row.settledAt;

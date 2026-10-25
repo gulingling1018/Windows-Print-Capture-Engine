@@ -36,6 +36,8 @@ class MainWindow : public QMainWindow
   explicit MainWindow(QWidget* parent = nullptr);
   ~MainWindow() override;
 
+  [[nodiscard]] bool isSilentStartup() const;
+
  protected:
   void resizeEvent(QResizeEvent* event) override;
   void closeEvent(QCloseEvent* event) override;
@@ -61,6 +63,8 @@ class MainWindow : public QMainWindow
   void refreshSelectedDetail();
   void refreshGroupRowSpans();
   void selectNextRelevantBatch();
+  void selectLastBatch();
+  void showQuickSettleDialog();
   void refreshReceiptPanel();
   void applySearchFilter();
   void scheduleWorkspaceRebalance();
@@ -69,11 +73,15 @@ class MainWindow : public QMainWindow
   void applyConfig();
   void detectPrintersIfNeeded();
   void detectPrintersAsync();
+  QString resolveStorageRoot() const;
   QString resolveOutputRoot() const;
   QString resolveStateDir() const;
+  QString resolveOrderBucketPath() const;
   QString resolveHistoryRoot() const;
   QString resolveUserDir(const QString& displayName) const;
   void ensureUserDirectories(const QString& displayName);
+  void migrateLegacyDailyStateIfNeeded();
+  void cleanupExpiredCapturedData();
 
   common::AppConfig config_;
 
@@ -116,6 +124,7 @@ class MainWindow : public QMainWindow
   QTimer* batchUpdateDebounce_ = nullptr;
 
   QString lastOutputDir_;
+  bool closing_{false};
 };
 
 }  // namespace wpce::ui

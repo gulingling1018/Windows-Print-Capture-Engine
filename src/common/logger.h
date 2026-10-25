@@ -27,12 +27,11 @@ enum class LogSeverity
   Info,
   Warn,
   Error,
-  Fatal,
 };
 
 struct LogEntry
 {
-  /// Nanoseconds since steady_clock epoch — monotonic, suitable for
+  /// Nanoseconds since steady_clock epoch - monotonic, suitable for
   /// ordering and delta calculation.  Not convertible to wall-clock
   /// directly; use the timestamp recorded at process start for that.
   std::chrono::nanoseconds timestamp;
@@ -82,8 +81,7 @@ class RingBufferLogger
   std::size_t capacity_{2000};
 };
 
-// ── Convenience free functions ──────────────────────────────────────────
-
+// Convenience free functions
 inline void log_debug(std::string_view category, std::string message)
 {
   RingBufferLogger::instance().log(LogSeverity::Debug, category, std::move(message));
@@ -102,11 +100,6 @@ inline void log_warn(std::string_view category, std::string message)
 inline void log_error(std::string_view category, std::string message)
 {
   RingBufferLogger::instance().log(LogSeverity::Error, category, std::move(message));
-}
-
-inline void log_fatal(std::string_view category, std::string message)
-{
-  RingBufferLogger::instance().log(LogSeverity::Fatal, category, std::move(message));
 }
 
 }  // namespace wpce::common

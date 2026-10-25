@@ -4,7 +4,7 @@
 #pragma once
 
 #include "core/data_contracts.h"
-#include "ui/user_group_model.h"
+#include "ui/billing_view_data.h"
 
 #include <QLabel>
 #include <QScrollArea>

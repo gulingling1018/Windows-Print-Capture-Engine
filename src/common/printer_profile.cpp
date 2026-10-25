@@ -4,6 +4,12 @@
 #include "common/printer_profile.h"
 #include "common/paper_size_map.h"
 
+#include <cctype>
+#include <set>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
 #ifdef _WIN32
 #include <windows.h>
 #include <winspool.h>
@@ -77,7 +83,7 @@ std::vector<std::wstring> enumerate_local_printer_names()
 /// Returns true if the printer reports it supports color output.
 bool query_color_device(const std::wstring& printerName)
 {
-  // DC_COLORDEVICE returns the count of color-capable "devices" —
+  // DC_COLORDEVICE returns the count of color-capable "devices" -
   // for a single printer this is 1 (color) or 0 (monochrome).
   const int result = DeviceCapabilitiesW(
       printerName.c_str(), nullptr, DC_COLORDEVICE, nullptr, nullptr);
@@ -161,7 +167,7 @@ PrinterProfileConfig detect_printer_capabilities()
   for (const auto& name : enumerate_local_printer_names())
   {
     PrinterProfile profile;
-    // Narrow UTF-16 → UTF-8 for storage.
+    // Narrow UTF-16 -> UTF-8 for storage.
     int len = WideCharToMultiByte(CP_UTF8, 0, name.c_str(),
                                   static_cast<int>(name.size()),
                                   nullptr, 0, nullptr, nullptr);
@@ -216,16 +222,29 @@ std::vector<std::string> get_all_paper_sizes(
     const PrinterProfileConfig& config)
 {
   // Case-insensitive dedup using a set with lowercase keys.
-  std::set<std::string> seen;  // sorted for consistent UI order
+  // We store the original-cased name for display but use lowercase for dedup.
+  std::unordered_map<std::string, std::string> lower_to_original;
+  std::set<std::string> sorted_keys;  // sorted lowercased for consistent UI order
   for (const auto& p : config.profiles)
   {
     for (const auto& size : p.supported_paper_sizes)
     {
-      if (!size.empty())
-        seen.insert(size);
+      if (size.empty()) continue;
+      std::string lower;
+      lower.reserve(size.size());
+      for (char c : size) lower += static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+      if (lower_to_original.find(lower) == lower_to_original.end())
+      {
+        lower_to_original[lower] = size;  // preserve first-seen casing
+        sorted_keys.insert(lower);
+      }
     }
   }
-  return std::vector<std::string>(seen.begin(), seen.end());
+  std::vector<std::string> result;
+  result.reserve(sorted_keys.size());
+  for (const auto& key : sorted_keys)
+    result.push_back(lower_to_original[key]);
+  return result;
 }
 
 }  // namespace wpce::common

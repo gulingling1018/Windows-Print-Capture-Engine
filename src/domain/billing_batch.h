@@ -4,7 +4,7 @@
 ///
 /// A BillingBatch represents "all print jobs received during a time
 /// window that belong to one customer".  The boundary is determined by
-/// the operator clicking "结算" (settle): all jobs in the current
+/// the operator clicking settle(): all jobs in the current
 /// Active batch are frozen into a SettlementOrder, the batch is
 /// sealed, and the next print job automatically opens a new Active
 /// batch for the next customer.
@@ -12,18 +12,18 @@
 /// State machine:
 ///
 ///     [new job, no Active]
-///            │
-///            ▼
-///     ┌── Active ◄── resume() ──┐
-///     │     │                    │
-///     │  suspend()  settle()     │
-///     │     │     │              │
-///     │     ▼     ▼              │
-///     │  Suspended  Settled      │
-///     │     │                    │
-///     │  (operator resume)       │
-///     │     │                    │
-///     └─────┘                    │
+///            |
+///            v
+///     +-- Active <-- resume() --+
+///     |     |                    |
+///     |  suspend()  settle()     |
+///     |     |     |              |
+///     |     v     v              |
+///     |  Suspended  Settled      |
+///     |     |                    |
+///     |  (operator resume)       |
+///     |     |                    |
+///     +-----+                    |
 ///        (continues receiving)
 ///
 /// Hang-up (suspend) is for temporarily switching to print a new
@@ -69,7 +69,7 @@ struct BatchDocAnchor
 struct BillingBatch
 {
   std::string batch_id;            // "B-YYYYMMDD-NNNNNN"
-  std::string display_name;        // operator-editable, default "用户#NN"
+  std::string display_name;        // operator-editable; default name comes from the user counter
   std::string source_user;         // Windows pUserName (metadata only)
   BatchState state{BatchState::Active};
   std::string period_start_utc;    // first job submit time
@@ -91,6 +91,40 @@ struct BillingBatch
   [[nodiscard]] bool is_active() const noexcept { return state == BatchState::Active; }
   [[nodiscard]] bool is_suspended() const noexcept { return state == BatchState::Suspended; }
   [[nodiscard]] bool is_settled() const noexcept { return state == BatchState::Settled; }
+  [[nodiscard]] bool is_voided() const noexcept { return state == BatchState::Voided; }
+
+  /// Transition to Suspended.  Only valid from Active.
+  /// Returns false if the transition is not allowed.
+  bool suspend() noexcept
+  {
+    if (state != BatchState::Active) return false;
+    state = BatchState::Suspended;
+    return true;
+  }
+
+  /// Transition back to Active.  Only valid from Suspended.
+  bool resume() noexcept
+  {
+    if (state != BatchState::Suspended) return false;
+    state = BatchState::Active;
+    return true;
+  }
+
+  /// Transition to Settled.  Valid from Active or Suspended.
+  bool settle() noexcept
+  {
+    if (state != BatchState::Active && state != BatchState::Suspended) return false;
+    state = BatchState::Settled;
+    return true;
+  }
+
+  /// Transition to Voided.  Valid from Active or Suspended.
+  bool void_batch() noexcept
+  {
+    if (state != BatchState::Active && state != BatchState::Suspended) return false;
+    state = BatchState::Voided;
+    return true;
+  }
 };
 
 /// Aggregated info about a single print job tracked by the BillingService.

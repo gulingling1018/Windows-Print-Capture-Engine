@@ -1,7 +1,7 @@
 /// @file pricing_engine.h
 /// Rule-based print-job pricing engine.
 ///
-/// Each PricingRule specifies {paper, duplex, printer, color, filetype} → price,
+/// Each PricingRule specifies {paper, duplex, printer, color, filetype} -> price,
 /// and the engine finds the best-matching rule for each job.  Paper
 /// size, printer name, and file extension dimensions support multi-value
 /// matching (e.g. "A4|B5", "HP|Canon", or "pdf|dwg") via the
@@ -37,21 +37,19 @@
 namespace wpce::common
 {
 
-// ── File type detection ──────────────────────────────────────────────────
-
+// File type detection
 /// Extract the file extension from a document name.
 /// Returns the lowercased extension without the leading dot, e.g.
-///   "report.PDF"    → "pdf"
-///   "drawing.DWG"   → "dwg"
-///   "noext"         → ""
-///   ""              → ""
+///   "report.PDF"    -> "pdf"
+///   "drawing.DWG"   -> "dwg"
+///   "noext"         -> ""
+///   ""              -> ""
 std::string extract_file_extension(std::string_view document_name);
 
-// ── Rule matching ────────────────────────────────────────────────────────
-
+// Rule matching
 /// Compute the specificity (priority) of a pricing rule.
-/// Returns the count of non-empty dimension fields:
-///   0 = catch-all, 5 = fully specific (paper+duplex+printer+color+filetype).
+/// Returns the count of active dimension fields:
+///   1 = color-only default, 5 = fully specific (paper+duplex+printer+color+filetype).
 /// Multi-value set fields count as 1 dimension (not N).
 int rule_specificity(const core::PricingRule& rule);
 
@@ -59,8 +57,10 @@ int rule_specificity(const core::PricingRule& rule);
 /// Matches metadata.printer_name against rule.printer_name /
 /// rule.printer_name_set (case-insensitive).  Empty printer_name on a
 /// rule means "match any printer" (wildcard).
-/// The effective_color parameter is matched against rule.color_mode
-/// ("color", "monochrome", or "" for wildcard).
+/// The effective_color parameter is matched against rule.color_mode;
+/// an empty effective_color is treated as "monochrome".
+/// Empty legacy rule colors are treated as "monochrome"; color rules
+/// are never wildcard rules in the current business design.
 ///
 /// Returns a pointer to the rule with the highest specificity among all
 /// matching rules, or nullptr if no rule matches.
@@ -75,31 +75,23 @@ const core::PricingRule* find_best_rule(
 /// Call this after loading rules from config to ensure correct ordering.
 void sort_rules_by_priority(std::vector<core::PricingRule>& rules);
 
-// ── Sheet breakdown (duplex odd-page tail) ──────────────────────────────
-
+// Sheet breakdown (duplex odd-page tail)
 /// Compute the physical sheet breakdown for a print job.
 ///
 /// Correctly handles the duplex odd-page tail scenario:
-///   rendered_pages=3, duplex → 1 full duplex sheet + 1 simplex tail page
-///   rendered_pages=4, duplex → 2 full duplex sheets
-///   rendered_pages=5, simplex → 5 simplex tail pages
+///   rendered_pages=3, duplex -> 1 full duplex sheet + 1 simplex tail page
+///   rendered_pages=4, duplex -> 2 full duplex sheets
+///   rendered_pages=5, simplex -> 5 simplex tail pages
 core::SheetBreakdown compute_sheet_breakdown(
     int rendered_pages, bool is_duplex);
 
-// ── Job attribute queries ────────────────────────────────────────────────
-
+// Job attribute queries
 /// Determine whether a metadata snapshot indicates double-sided printing.
 bool is_duplex_job(const core::MetadataSnapshot& metadata);
 
 /// Determine whether printing is in colour (explicitly "color", not
 /// "monochrome" or "grayscale").
 bool is_color_job(const core::MetadataSnapshot& metadata);
-
-/// Determine whether the paper size is "large" (A3, Tabloid, Ledger, Legal).
-bool is_large_paper(const core::MetadataSnapshot& metadata);
-
-/// Determine whether the print quality setting indicates high quality.
-bool is_high_quality(const core::MetadataSnapshot& metadata);
 
 /// Parse the copies count from metadata, defaulting to 1.
 int parse_copies(const core::MetadataSnapshot& metadata);
@@ -108,14 +100,14 @@ int parse_copies(const core::MetadataSnapshot& metadata);
 int parse_total_pages(const core::MetadataSnapshot& metadata);
 
 /// Normalize a color value for rule matching.
-///   "color" → "color"
-///   "monochrome" / "grayscale" → "monochrome"
-///   other / empty → as-is (empty means unknown)
+///   "color" -> "color"
+///   "monochrome" / "grayscale" -> "monochrome"
+///   other / empty -> as-is (empty means unknown)
 std::string normalize_color_for_matching(std::string_view color_value);
 
 /// Normalize a duplex value for rule matching.
-///   "simplex" / empty → "simplex"
-///   any duplex variant → "duplex"
+///   "simplex" / empty -> "simplex"
+///   any duplex variant -> "duplex"
 std::string normalize_duplex_for_matching(std::string_view duplex_value);
 
 /// Compute the effective color mode for a job, taking printer capability
@@ -128,8 +120,7 @@ std::string effective_color_mode(
     const PrinterProfileConfig& printers,
     bool& downgraded);
 
-// ── Full pricing calculation ─────────────────────────────────────────────
-
+// Full pricing calculation
 /// Compute the complete pricing breakdown for a single print job.
 ///
 /// Uses matrix-based matching with dimensions {paper, duplex, printer, color, filetype}:
@@ -137,12 +128,12 @@ std::string effective_color_mode(
 ///   2. Compute sheet breakdown (with duplex tail correction).
 ///   3. Find best-matching PricingRule by all 5 dimensions.
 ///   4. For duplex odd-page tail: find best-matching simplex rule and
-///      price the tail separately.  No simplex rule → price_pending
+///      price the tail separately.  No simplex rule -> price_pending
 ///      with reason "no_simplex_rule_for_tail".
 ///   5. For color jobs on color-capable printers:
-///      a. If color_pages == 0 → total_price = 0, price_pending with
+///      a. If color_pages == 0 -> total_price = 0, price_pending with
 ///         reason "awaiting_color_pages" (operator must fill color page count).
-///      b. If color_pages > 0 → split pricing:
+///      b. If color_pages > 0 -> split pricing:
 ///         - Color pages priced by the best color_mode="color" rule
 ///         - Remaining mono pages priced by the best color_mode="monochrome" rule
 ///   6. Flag unmatched jobs as price_pending.

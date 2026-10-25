@@ -1,7 +1,6 @@
 set(UI_HEADERS
   job_table_model.h
-  user_group_model.h
-  user_group_delegate.h
+  billing_view_data.h
   completion_dialog.h
   document_link_delegate.h
   grip_splitter.h
@@ -15,23 +14,36 @@ set(UI_HEADERS
 set(UI_SOURCES
   main.cpp
   main_window.cpp
-  user_group_model.cpp
+  filter_install_dialog.cpp
+  filter_install_dialog.h
   completion_dialog.cpp
   job_table_model.cpp
   job_detail_panel.cpp
   watcher_bridge.cpp
-  user_task_model.cpp
+  watcher_bridge_inbox.cpp
   receipt_preview_panel.cpp
   settings_dialog.cpp
   quick_settle_dialog.cpp
   billing_batch_model.cpp
   history_explorer_dialog.cpp
   ../billing/billing_service.cpp
+  ../billing/billing_service_shutdown.cpp
   ${UI_HEADERS}
 )
 
+# ── Version propagation: inject CMake project version into the .rc resource ──
+string(REPLACE "." "," RC_FILEVERSION_COMMA "${PROJECT_VERSION}")
+set(RC_FILEVERSION_COMMA "${RC_FILEVERSION_COMMA},0")
+set(WPCE_UI_SOURCE_DIR "${CMAKE_CURRENT_SOURCE_DIR}")
+
+configure_file(
+  "${CMAKE_CURRENT_SOURCE_DIR}/wpce_ui.rc.in"
+  "${CMAKE_CURRENT_BINARY_DIR}/wpce_ui.rc"
+  @ONLY
+)
+
 set(UI_RESOURCES
-  wpce_ui.rc
+  "${CMAKE_CURRENT_BINARY_DIR}/wpce_ui.rc"
 )
 
 set(UI_QRC
@@ -47,6 +59,7 @@ target_include_directories(wpce_ui PRIVATE
 
 target_link_libraries(wpce_ui PRIVATE
   wpce_core
+  wpce_management
   Qt6::Core
   Qt6::Widgets
 )
@@ -64,6 +77,15 @@ else()
 endif()
 
 if(WIN32)
+  # Run on incremental builds too: script-only fixes must reach the GUI tree.
+  add_custom_target(wpce_install_assets
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "$<TARGET_FILE:wpce_xps_filter>" "$<TARGET_FILE_DIR:wpce_ui>/wpce_xps_filter.dll"
+    COMMAND ${CMAKE_COMMAND} -E make_directory "$<TARGET_FILE_DIR:wpce_ui>/scripts"
+    COMMAND ${CMAKE_COMMAND} -E copy_if_different "${PROJECT_SOURCE_DIR}/scripts/install-xps-filter.ps1" "$<TARGET_FILE_DIR:wpce_ui>/scripts/install-xps-filter.ps1"
+    COMMAND ${CMAKE_COMMAND} -E copy_directory "${PROJECT_SOURCE_DIR}/scripts/lib" "$<TARGET_FILE_DIR:wpce_ui>/scripts/lib"
+    VERBATIM)
+  add_dependencies(wpce_install_assets wpce_xps_filter)
+  add_dependencies(wpce_ui wpce_install_assets)
   get_target_property(_wpce_qmake_executable Qt6::qmake IMPORTED_LOCATION)
   get_filename_component(_wpce_qt_bin_dir "${_wpce_qmake_executable}" DIRECTORY)
 

@@ -1,5 +1,93 @@
 # WPCE Development Archive
 
+## 2026-06-27: Code Audit Fixes — Storage Robustness, COM Safety, Watcher Stability
+
+### Context
+
+A comprehensive code audit identified 10 non-billing issues across the
+storage, watcher, filter, and bridge layers.
+
+### Changes
+
+**Storage layer (5 fixes):**
+- `src/storage/file_utils.cpp`: Added cross-device copy+delete fallback when
+  `MoveFileExW` fails with `ERROR_NOT_SAME_DEVICE` (e.g., junction/symlink
+  to a different volume). Added POSIX `fsync()` call via `fopen`/`fileno`/
+  `fsync`/`fclose` for non-Windows platforms. Expanded retry error codes to
+  include `ERROR_FILE_NOT_FOUND` for transient file system delays.
+- `src/storage/job_snapshot_writer.cpp`: `stop()` now drains remaining queue
+  items synchronously after the worker thread exits. High-water warning
+  threshold now derived from `queue_capacity * 4` instead of hardcoded 1024.
+- `src/storage/page_artifact_writer.cpp`: Same drain-on-stop and high-water
+  fixes as job_snapshot_writer.
+- `src/storage/page_artifact_writer.h`: Added class-level documentation of
+  the single-writer-per-directory constraint. Added `sync()` method for
+  blocking until queue is empty.
+
+**Bridge layer (1 fix):**
+- `src/bridge/metadata_merger.cpp`: Replaced fragile `json.find('}', fpos)`
+  brace matching in `load_field_value()` with proper brace-depth counting.
+  Added negative number support in `extract_json_int()`.
+
+**Watcher layer (1 fix):**
+- `src/watcher/print_watcher.cpp`: `tick_stall_detection()` now collects
+  lifecycle events into a local `std::vector` under `summaries_mutex_` and
+  emits callbacks outside the lock to prevent deadlock from callback
+  re-entrancy.
+
+**UI bridge (1 fix):**
+- `src/ui/watcher_bridge.cpp`: Increased QThread `wait()` timeout from 5 s
+  to 10 s. Added warning log on timeout and `terminate()` as last resort
+  to prevent OS thread leak.
+
+**Filter layer (1 fix):**
+- `src/filter/filter_pipeline.cpp`: Wrapped all raw COM interface pointers
+  (`IFixedDocumentSequence*`, `IFixedDocument*`, `IFixedPage*`,
+  `IPartPrintTicket*`) in `com_ptr<>` RAII wrappers from
+  `src/common/com_ptr.h` to prevent leaks when exceptions are thrown
+  between `QueryInterface` and `Release()`.
+
+### Verification
+
+- `cmake --build build\vs2026-x64-qt --config Debug`: pending.
+- `ctest --preset vs2026-debug`: pending.
+- `cppcheck`: pending.
+
+### Files Modified
+
+| File | Change |
+|---|---|
+| `src/storage/file_utils.cpp` | Cross-device fallback, POSIX fsync, error code retry |
+| `src/storage/job_snapshot_writer.cpp` | Drain-on-stop, high-water from queue_capacity |
+| `src/storage/page_artifact_writer.h` | Single-writer doc, sync() declaration |
+| `src/storage/page_artifact_writer.cpp` | Drain-on-stop, high-water, sync() impl |
+| `src/bridge/metadata_merger.cpp` | Brace-depth counting, negative number support |
+| `src/watcher/print_watcher.cpp` | Callback outside lock in tick_stall_detection |
+| `src/ui/watcher_bridge.cpp` | QThread timeout increase, terminate fallback |
+| `src/filter/filter_pipeline.cpp` | COM pointer RAII via com_ptr<> |
+
+
+
+### Context
+
+- Live monitoring could still stop discovering new jobs after a large queue because the full rescan path retained a legacy `EnumJobsW(..., NoJobs=1024, ...)` limit.
+- After operators cleared the data directory/state, the UI could still show previous print information through legacy daily-state migration or by displaying an unresolved relative output path.
+
+### Changes
+
+**Watcher (`src/watcher/print_watcher.cpp`):**
+- Replaced the legacy 1024-job `EnumJobsW` request with a paged rescan loop (256 jobs per page) so periodic full rescans continue past the first 1024 queue entries.
+
+**Main window (`src/ui/main_window.cpp`):**
+- Output directory labels now show the resolved storage root instead of the raw `./data` setting.
+- Legacy daily-state migration now requires an existing modern `_state/today_active.json`; clearing/removing current state no longer resurrects old task lists from legacy daily folders.
+
+### Verification
+
+- `cmake --build build\vs2026-x64-qt --config Debug --target wpce_ui`: passed; Qt deploy still emits the existing `VCINSTALLDIR is not set` warning.
+- `cmake --build build\vs2026-x64-qt --config Debug --target wpce_contract_tests`: passed.
+- `build\vs2026-x64-qt\tests\Debug\wpce_contract_tests.exe`: 16/16 tests passed.
+
 ## 2026-06-25: Billing Matrix Color Fallback, Single-Page Duplex Pricing, Quick Settle Idle Recenter
 
 ### Context
@@ -874,7 +962,7 @@ Test breakdown:
 - Keep lifecycle tracking internal to PrintWatcher, not the CLI — the watcher owns the state machine.
 - Use three parallel callbacks (job, metadata, lifecycle) with sequential emission order: job first, then metadata, then lifecycle. The CLI pairs them via a temporary holder.
 - `classify_phase()` prioritizes terminal states over active states so a job that is both "printing" and "error" is classified as Failed.
-- Stalled is a synthetic terminal phase — once emitted, no further events are emitted for that job.
+- Stalled is a non-terminal phase — it can recover when real progress arrives from the spooler.
 - The watcher suppress duplicate consecutive phases (e.g., multiple "printing" events for the same job).
 - Once a job reaches a terminal phase (Completed/Failed/Cancelled/Stalled), no further events are emitted for it.
 - Lifecycle summaries are persisted atomically on shutdown, not during hot-path observation — this keeps the hot path lightweight.
@@ -1216,3 +1304,62 @@ src/ui/
 - The `Winspool.lib` dependency in `wpce_core` means `wpce_ui` implicitly links Winspool — no issue but worth noting.
 - `qtbase[gui,widgets]` does not include `qtbase[network]` or `qtbase[sql]` — not needed for this UI.
 - Cross-thread signal for `JobSnapshot` and `MetadataSnapshot` passes by value (deep copy) — acceptable for these small structs but could be optimized with shared_ptr in future.
+
+---
+
+## 2026-06-27: User-Approved Design Implementation - Config Safety, Pricing Semantics, Bucketed Storage
+
+### Decision Source
+
+The user approved the audit recommendations and clarified that the confirmed business design overrides stale document records. The implemented baseline is:
+
+- Empty/invalid color values and jobs not explicitly on a selected color-capable printer are monochrome.
+- Explicit color jobs on color-capable printers with `color_pages <= 0` are always pending.
+- Business dates use system local date; UTC remains only for audit timestamp fields.
+- Cross-day startup clears active/suspended/unsettled current state; settled history remains.
+- No hard queue/storage boundary; use bucketed recording and loading to avoid large-data stalls.
+- Retention cleanup must not delete config, current state, or settlement history.
+
+### Implementation
+
+- Hardened `AppConfig` JSON loading:
+  - unknown/legacy values are skipped by type instead of being forced through string parsing;
+  - formatted JSON with whitespace after commas now parses correctly;
+  - old empty `color_mode` values normalize to `monochrome`;
+  - unreadable config is backed up as `.invalid-yyyymmdd-HHMMSS.bak` and is not overwritten.
+- Updated pricing engine:
+  - color dimension is mandatory and never wildcarded;
+  - empty job color and `-` normalize to `monochrome`;
+  - explicit color jobs without operator-filled color pages return `awaiting_color_pages` pending before any auto-pricing path.
+- Updated storage layout:
+  - latest snapshots are written to `latest/<printer>/job.json` and `latest/<printer>/metadata.json`;
+  - `latest/manifest.json` points to the global latest printer bucket;
+  - archives are written under `jobs/<printer>/`;
+  - removed old public `job_snapshot_path(config)` / `metadata_snapshot_path(config)` global-path overloads.
+- Updated billing persistence:
+  - `_state/today_active.json` stores batch summaries and `jobs_bucket` references;
+  - `_state/batches/<batch-id>/jobs.json` stores per-batch job records;
+  - older inline `jobs` arrays remain readable as fallback.
+- Updated runtime date/cleanup behavior:
+  - `CounterStore` uses system local `YYYYMMDD` for batch/order ids;
+  - cross-day `BillingService::load()` starts with empty current state;
+  - retention cleanup only removes dated capture buckets older than the configured local-date cutoff.
+- Updated UI settings behavior so color rules cannot be saved as an empty/all color value; empty legacy display is treated as black/white.
+
+### Verification
+
+- `cmake --build build\vs2026-x64-qt --config Debug --target wpce_pricing_engine_tests`
+- `build\vs2026-x64-qt\tests\Debug\wpce_pricing_engine_tests.exe` -> 49 passed
+- `cmake --build build\vs2026-x64-qt --config Debug --target wpce_contract_tests`
+- `build\vs2026-x64-qt\tests\Debug\wpce_contract_tests.exe` -> 17 passed
+- `cmake --build build\vs2026-x64-qt --config Debug --target wpce_settlement_tests`
+- `build\vs2026-x64-qt\tests\Debug\wpce_settlement_tests.exe` -> 8 passed
+- `cmake --build build\vs2026-x64-qt --config Debug --target wpce_counter_store_tests`
+- `build\vs2026-x64-qt\tests\Debug\wpce_counter_store_tests.exe` -> 1 passed
+
+### Documentation Updated
+
+- `docs/ARCHITECTURE.md`
+- `docs/frontend_handover.md`
+- `docs/optimization-log.md`
+- `docs/DEV_ARCHIVE.md`

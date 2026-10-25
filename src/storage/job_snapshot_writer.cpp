@@ -2,6 +2,7 @@
 
 #include "storage/file_utils.h"
 #include "storage/json_serializer.h"
+#include "common/business_clock.h"
 
 #include <sstream>
 #include <stdexcept>
@@ -12,38 +13,79 @@ namespace wpce::storage
 namespace
 {
 
-void write_snapshot_files(const JobSnapshotWriterConfig& config, const SnapshotPair& pair)
+std::filesystem::path latest_printer_dir(const JobSnapshotWriterConfig& config,
+                                         const std::string& printer_name)
 {
-  write_job_snapshot_json_atomic(pair.job, job_snapshot_path(config));
-  write_job_snapshot_json_atomic(pair.job, job_snapshot_archive_path(config, pair.job));
-  write_metadata_json_atomic(pair.metadata, metadata_snapshot_path(config));
-  write_metadata_json_atomic(pair.metadata, metadata_archive_path(config, pair.metadata));
+  return config.output_directory / "latest" / printer_storage_token(printer_name);
+}
+
+std::filesystem::path archive_printer_dir(const JobSnapshotWriterConfig& config,
+                                          const std::string& printer_name)
+{
+  return config.output_directory / "jobs" / printer_storage_token(printer_name);
+}
+
+std::string relative_generic(const std::filesystem::path& base,
+                             const std::filesystem::path& path)
+{
+  std::error_code ec;
+  const auto rel = std::filesystem::relative(path, base, ec);
+  return (ec ? path : rel).generic_string();
+}
+
+std::string latest_manifest_content(const JobSnapshotWriterConfig& config,
+                           const SnapshotPair& pair)
+{
+  const auto job_path = job_snapshot_path(config, pair.job);
+  const auto metadata_path = metadata_snapshot_path(config, pair.metadata);
+
+  std::ostringstream manifest;
+  manifest << "{\n"
+           << "  \"schema_version\": 1,\n"
+           << "  \"job_id\": " << pair.job.job_id << ",\n"
+           << "  \"printer_name\": " << json_escape(pair.job.printer_name) << ",\n"
+           << "  \"job\": " << json_escape(relative_generic(config.output_directory, job_path)) << ",\n"
+           << "  \"metadata\": " << json_escape(relative_generic(config.output_directory, metadata_path)) << ",\n"
+           << "  \"submit_time_utc\": " << json_escape(pair.job.submit_time_utc) << "\n"
+           << "}\n";
+  return manifest.str();
 }
 
 }  // namespace
 
-std::filesystem::path job_snapshot_path(const JobSnapshotWriterConfig& config)
+std::filesystem::path job_snapshot_path(
+  const JobSnapshotWriterConfig& config,
+  const core::JobSnapshot& snapshot)
 {
-  return config.output_directory / "job.json";
+  return latest_printer_dir(config, snapshot.printer_name) / "job.json";
 }
 
 std::filesystem::path job_snapshot_archive_path(
   const JobSnapshotWriterConfig& config,
   const core::JobSnapshot& snapshot)
 {
-  return config.output_directory / "jobs" / ("job-" + std::to_string(snapshot.job_id) + ".json");
+  return archive_printer_dir(config, snapshot.printer_name) /
+         ("job-" + std::to_string(snapshot.job_id) + ".json");
 }
 
-std::filesystem::path metadata_snapshot_path(const JobSnapshotWriterConfig& config)
+std::filesystem::path metadata_snapshot_path(
+  const JobSnapshotWriterConfig& config,
+  const core::MetadataSnapshot& snapshot)
 {
-  return config.output_directory / "metadata.json";
+  return latest_printer_dir(config, snapshot.printer_name) / "metadata.json";
 }
 
 std::filesystem::path metadata_archive_path(
   const JobSnapshotWriterConfig& config,
   const core::MetadataSnapshot& snapshot)
 {
-  return config.output_directory / "jobs" / ("job-" + std::to_string(snapshot.job_id) + "-metadata.json");
+  return archive_printer_dir(config, snapshot.printer_name) /
+         ("job-" + std::to_string(snapshot.job_id) + "-metadata.json");
+}
+
+std::filesystem::path latest_manifest_path(const JobSnapshotWriterConfig& config)
+{
+  return config.output_directory / "latest" / "manifest.json";
 }
 
 std::filesystem::path lifecycle_summary_path(const JobSnapshotWriterConfig& config)
@@ -55,7 +97,8 @@ std::filesystem::path lifecycle_summary_archive_path(
   const JobSnapshotWriterConfig& config,
   const core::JobLifecycleSummary& summary)
 {
-  return config.output_directory / "jobs" / ("job-" + std::to_string(summary.job_id) + "-lifecycle.json");
+  return archive_printer_dir(config, summary.printer_name) /
+         ("job-" + std::to_string(summary.job_id) + "-lifecycle.json");
 }
 
 void write_lifecycle_summaries_atomic(
@@ -75,10 +118,13 @@ void write_lifecycle_summaries_atomic(
   manifest << "{\n  \"session_jobs\": [\n";
   for (std::size_t i = 0; i < summaries.size(); ++i)
   {
+    const auto archive_path = lifecycle_summary_archive_path(config, summaries[i]);
     manifest << "    {\n      \"job_id\": " << summaries[i].job_id
              << ",\n      \"final_phase\": \"" << core::to_string(summaries[i].final_phase)
              << "\",\n      \"event_count\": " << summaries[i].events.size()
-             << ",\n      \"file\": \"jobs/job-" << summaries[i].job_id << "-lifecycle.json\"\n    }";
+             << ",\n      \"file\": "
+             << json_escape(relative_generic(config.output_directory, archive_path))
+             << "\n    }";
     if (i + 1 < summaries.size())
     {
       manifest << ',';
@@ -102,151 +148,37 @@ void write_job_snapshot_json_atomic(const core::JobSnapshot& snapshot, const std
 
 AsyncJobSnapshotWriter::AsyncJobSnapshotWriter(JobSnapshotWriterConfig config) : config_(std::move(config))
 {
-  if (config_.output_directory.empty())
-  {
-    throw std::invalid_argument("output_directory is required");
-  }
-  if (config_.queue_capacity == 0)
-  {
-    throw std::invalid_argument("queue_capacity must be greater than zero");
-  }
+  if (config_.output_directory.empty()) throw std::invalid_argument("output directory required");
+  config_.output_directory = std::filesystem::absolute(config_.output_directory).lexically_normal();
+  writer_ = std::make_unique<ReliableFileWriter>(ReliableWriterConfig{
+      .root = config_.rotate_daily ? config_.output_directory.parent_path() : config_.output_directory,
+      .queue_name = "snapshots", .worker_hook = config_.worker_hook});
 }
-
-AsyncJobSnapshotWriter::~AsyncJobSnapshotWriter()
+AsyncJobSnapshotWriter::~AsyncJobSnapshotWriter() { stop(); }
+void AsyncJobSnapshotWriter::start() { writer_->start(); }
+void AsyncJobSnapshotWriter::stop() noexcept { writer_->stop(); }
+void AsyncJobSnapshotWriter::request_stop() noexcept { writer_->request_stop(); }
+bool AsyncJobSnapshotWriter::running() const noexcept { return writer_->running(); }
+std::string AsyncJobSnapshotWriter::last_error() const { return writer_->last_error(); }
+std::size_t AsyncJobSnapshotWriter::queue_depth() const noexcept { return writer_->pending_count(); }
+std::uintmax_t AsyncJobSnapshotWriter::pending_bytes() const noexcept { return writer_->pending_bytes(); }
+bool AsyncJobSnapshotWriter::drained() const noexcept { return writer_->drained(); }
+bool AsyncJobSnapshotWriter::enqueue(core::JobSnapshot job, core::MetadataSnapshot metadata, const std::string& capture_date)
 {
-  stop();
-}
-
-void AsyncJobSnapshotWriter::start()
-{
-  std::scoped_lock lock(lifecycle_mutex_);
-  if (running_)
+  auto config = config_;
+  const auto root = config_.rotate_daily ? config_.output_directory.parent_path() : config_.output_directory;
+  if (config_.rotate_daily)
   {
-    return;
+    const auto date = !capture_date.empty() ? capture_date : (config_.date_provider ? config_.date_provider() : common::current_business_date().yyyy_mm_dd);
+    if (!common::parse_business_date(date)) { writer_->reject("invalid capture date"); return false; }
+    config.output_directory = root / date;
   }
-
-  stop_requested_ = false;
-  set_last_error({});
-  running_ = true;
-  worker_ = std::thread(&AsyncJobSnapshotWriter::run, this);
+  const SnapshotPair pair{std::move(job), std::move(metadata), {}};
+  auto operation = [&](const auto& path, const auto& content) { return FileWrite{path.lexically_relative(root), content}; };
+  return writer_->enqueue({operation(job_snapshot_path(config, pair.job), to_json(pair.job)),
+      operation(job_snapshot_archive_path(config, pair.job), to_json(pair.job)),
+      operation(metadata_snapshot_path(config, pair.metadata), to_json(pair.metadata)),
+      operation(metadata_archive_path(config, pair.metadata), to_json(pair.metadata)),
+      operation(latest_manifest_path(config), latest_manifest_content(config, pair))});
 }
-
-void AsyncJobSnapshotWriter::stop() noexcept
-{
-  {
-    std::scoped_lock lock(queue_mutex_);
-    stop_requested_ = true;
-  }
-  queue_cv_.notify_all();
-
-  std::thread worker;
-  {
-    std::scoped_lock lock(lifecycle_mutex_);
-    if (worker_.joinable())
-    {
-      worker = std::move(worker_);
-    }
-  }
-
-  if (worker.joinable())
-  {
-    worker.join();
-  }
-}
-
-bool AsyncJobSnapshotWriter::enqueue(core::JobSnapshot job, core::MetadataSnapshot metadata)
-{
-  {
-    std::scoped_lock lock(queue_mutex_);
-    if (!running_ || stop_requested_)
-    {
-      return false;
-    }
-    if (queue_.size() >= config_.queue_capacity)
-    {
-      (void)fprintf(stderr,
-                    "[WPCE] JobSnapshotWriter queue FULL (%zu/%zu), dropping snapshot\n",
-                    queue_.size(), config_.queue_capacity);
-      return false;
-    }
-    if (queue_.size() >= config_.queue_capacity * 8 / 10)
-    {
-      (void)fprintf(stderr,
-                    "[WPCE] JobSnapshotWriter queue high-water (%zu/%zu)\n",
-                    queue_.size(), config_.queue_capacity);
-    }
-
-    queue_.push_back(SnapshotPair{std::move(job), std::move(metadata)});
-  }
-
-  queue_cv_.notify_one();
-  return true;
-}
-
-bool AsyncJobSnapshotWriter::running() const noexcept
-{
-  return running_;
-}
-
-std::string AsyncJobSnapshotWriter::last_error() const
-{
-  std::scoped_lock lock(error_mutex_);
-  return last_error_;
-}
-
-std::size_t AsyncJobSnapshotWriter::queue_depth() const noexcept
-{
-  std::scoped_lock lock(queue_mutex_);
-  return queue_.size();
-}
-
-void AsyncJobSnapshotWriter::run()
-{
-  try
-  {
-    ensure_output_directory(config_.output_directory);
-
-    while (true)
-    {
-      SnapshotPair pair;
-      {
-        std::unique_lock lock(queue_mutex_);
-        queue_cv_.wait(lock, [&]() {
-          return stop_requested_ || !queue_.empty();
-        });
-
-        if (queue_.empty())
-        {
-          if (stop_requested_)
-          {
-            break;
-          }
-          continue;
-        }
-
-        pair = std::move(queue_.front());
-        queue_.pop_front();
-      }
-
-      write_snapshot_files(config_, pair);
-    }
-  }
-  catch (const std::exception& error)
-  {
-    set_last_error(error.what());
-  }
-  catch (...)
-  {
-    set_last_error("unknown job snapshot writer error");
-  }
-
-  running_ = false;
-}
-
-void AsyncJobSnapshotWriter::set_last_error(std::string error)
-{
-  std::scoped_lock lock(error_mutex_);
-  last_error_ = std::move(error);
-}
-
 }  // namespace wpce::storage

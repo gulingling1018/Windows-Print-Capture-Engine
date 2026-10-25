@@ -82,8 +82,14 @@ void append_json_property(std::ostream& output, const std::string_view name, con
 {
   append_json_string(output, name);
   char buf[64];
-  std::snprintf(buf, sizeof(buf), "%.2f", value);
+  std::snprintf(buf, sizeof(buf), "%.4f", value);
   output << ": " << buf;
+}
+
+void append_json_property(std::ostream& output, const std::string_view name, bool value)
+{
+  append_json_string(output, name);
+  output << ": " << (value ? "true" : "false");
 }
 
 void append_field_value(std::ostream& output, const std::string_view name, const core::FieldValue& field)
@@ -113,6 +119,10 @@ std::string to_json(const core::JobSnapshot& snapshot)
   output << ",\n  ";
   append_json_property(output, "job_id", snapshot.job_id);
   output << ",\n  ";
+  append_json_property(output, "external_job_id", snapshot.external_job_id);
+  output << ",\n  ";
+  append_json_property(output, "idempotency_key", snapshot.idempotency_key);
+  output << ",\n  ";
   append_json_property(output, "user", snapshot.user);
   output << ",\n  ";
   append_json_property(output, "document_name", snapshot.document_name);
@@ -122,6 +132,8 @@ std::string to_json(const core::JobSnapshot& snapshot)
   append_json_property(output, "submit_time_utc", snapshot.submit_time_utc);
   output << ",\n  ";
   append_json_property(output, "status", snapshot.status);
+  output << ",\n  ";
+  append_json_property(output, "raw_status_flags", snapshot.raw_status_flags);
   output << ",\n  ";
   append_json_property(output, "source", snapshot.source);
   output << "\n}\n";
@@ -163,6 +175,10 @@ std::string to_json(const core::MetadataSnapshot& snapshot)
   append_field_value(output, "page_range", snapshot.page_range);
   output << ",\n  ";
   append_field_value(output, "file_extension", snapshot.file_extension);
+  output << ",\n  ";
+  append_json_property(output, "file_extension_source", snapshot.file_extension_source);
+  output << ",\n  ";
+  append_json_property(output, "file_extension_confidence", snapshot.file_extension_confidence);
   output << ",\n  ";
   append_json_property(output, "dm_fields_hex", snapshot.dm_fields_hex);
   output << "\n}\n";
@@ -243,6 +259,8 @@ std::string to_json(const core::JobLifecycleSummary& summary)
   output << ",\n  ";
   append_json_property(output, "final_phase", core::to_string(summary.final_phase));
   output << ",\n  ";
+  append_json_property(output, "last_status", summary.last_status);
+  output << ",\n  ";
   append_json_property(output, "progress_percent", summary.progress_percent);
   output << ",\n  ";
   append_json_property(output, "source", summary.source);
@@ -303,12 +321,15 @@ std::string to_json(const core::PageArtifactIndex& index)
   append_json_property(output, "fixed_page", index.fixed_page);
   output << ",\n  ";
   append_json_property(output, "source", index.source);
+  output << ",\n  ";
+  append_json_property(output, "capture_id", index.capture_id);
+  output << ",\n  ";
+  append_json_property(output, "fixed_page_state", index.fixed_page_state);
   output << "\n}\n";
   return output.str();
 }
 
-// ── New pricing & settlement structs ────────────────────────────────────
-
+// New pricing & settlement structs
 std::string to_json(const core::PricingRule& rule)
 {
   std::ostringstream output;
@@ -350,7 +371,13 @@ std::string to_json(const core::JobPricingEntry& entry)
   output << ",\n  ";
   append_json_property(output, "matched_rule_id", entry.matched_rule_id);
   output << ",\n  ";
+  append_json_property(output, "tail_rule_id", entry.tail_rule_id);
+  output << ",\n  ";
+  append_json_property(output, "matched_printer_name", entry.matched_printer_name);
+  output << ",\n  ";
   append_json_property(output, "base_price", entry.base_price);
+  output << ",\n  ";
+  append_json_property(output, "tail_price", entry.tail_price);
   output << ",\n  ";
   append_json_property(output, "color_pages", entry.color_pages);
   output << ",\n  ";
@@ -362,9 +389,20 @@ std::string to_json(const core::JobPricingEntry& entry)
   output << ",\n  ";
   append_json_property(output, "total_price", entry.total_price);
   output << ",\n  ";
-  output << "\"price_pending\": " << (entry.price_pending ? "true" : "false");
+  append_json_property(output, "price_pending", entry.price_pending);
   output << ",\n  ";
   append_json_property(output, "pending_reason", entry.pending_reason);
+  output << ",\n  ";
+  append_json_property(output, "color_downgraded", entry.color_downgraded);
+  output << ",\n  ";
+  append_json_property(output, "manual_price_override", entry.manual_price_override);
+  output << ",\n  ";
+  append_json_property(output, "manual_total_price", entry.manual_total_price);
+  if (!entry.note.empty())
+  {
+    output << ",\n  ";
+    append_json_property(output, "note", entry.note);
+  }
   output << "\n}\n";
   return output.str();
 }
@@ -389,7 +427,13 @@ void append_json_pricing_entry(std::ostream& output, const core::JobPricingEntry
   output << ",\n      ";
   append_json_property(output, "matched_rule_id", entry.matched_rule_id);
   output << ",\n      ";
+  append_json_property(output, "tail_rule_id", entry.tail_rule_id);
+  output << ",\n      ";
+  append_json_property(output, "matched_printer_name", entry.matched_printer_name);
+  output << ",\n      ";
   append_json_property(output, "base_price", entry.base_price);
+  output << ",\n      ";
+  append_json_property(output, "tail_price", entry.tail_price);
   output << ",\n      ";
   append_json_property(output, "color_pages", entry.color_pages);
   output << ",\n      ";
@@ -401,9 +445,20 @@ void append_json_pricing_entry(std::ostream& output, const core::JobPricingEntry
   output << ",\n      ";
   append_json_property(output, "total_price", entry.total_price);
   output << ",\n      ";
-  output << "\"price_pending\": " << (entry.price_pending ? "true" : "false");
+  append_json_property(output, "price_pending", entry.price_pending);
   output << ",\n      ";
   append_json_property(output, "pending_reason", entry.pending_reason);
+  output << ",\n      ";
+  append_json_property(output, "color_downgraded", entry.color_downgraded);
+  output << ",\n      ";
+  append_json_property(output, "manual_price_override", entry.manual_price_override);
+  output << ",\n      ";
+  append_json_property(output, "manual_total_price", entry.manual_total_price);
+  if (!entry.note.empty())
+  {
+    output << ",\n      ";
+    append_json_property(output, "note", entry.note);
+  }
   output << "\n    }";
 }
 
@@ -417,6 +472,8 @@ std::string to_json(const core::SettlementOrder& order)
   output << ",\n  ";
   append_json_property(output, "order_id", order.order_id);
   output << ",\n  ";
+  append_json_property(output, "batch_id", order.batch_id);
+  output << ",\n  ";
   append_json_property(output, "task_id", order.task_id);
   output << ",\n  ";
   append_json_property(output, "user_id", order.user_id);
@@ -429,9 +486,15 @@ std::string to_json(const core::SettlementOrder& order)
   output << ",\n  ";
   append_json_property(output, "period_end_utc", order.period_end_utc);
   output << ",\n  ";
+  append_json_property(output, "first_document_name", order.first_document_name);
+  output << ",\n  ";
+  append_json_property(output, "last_document_name", order.last_document_name);
+  output << ",\n  ";
   append_json_property(output, "currency", order.currency);
   output << ",\n  ";
   append_json_property(output, "total_price", order.total_price);
+  output << ",\n  ";
+  append_json_property(output, "color_merged_total", order.color_merged_total);
   output << ",\n  ";
   output << "\"job_ids\": [";
   for (std::size_t i = 0; i < order.job_ids.size(); ++i)

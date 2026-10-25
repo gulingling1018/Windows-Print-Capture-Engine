@@ -16,7 +16,7 @@ struct PerfSample
   /// Wall-clock timestamp of this sample.
   std::string timestamp_utc;
 
-  /// CPU usage as percentage of one logical processor (0.0–100.0 * cores).
+  /// CPU usage as percentage of one logical processor (0.0-100.0 * cores).
   double cpu_percent{0.0};
 
   /// Working set (physical memory) in bytes.
@@ -28,8 +28,7 @@ struct PerfSample
   /// Number of threads in the process.
   std::uint32_t thread_count{0};
 
-  // ── WPCE-specific metrics ──────────────────────────────────────────
-
+  // WPCE-specific metrics
   /// Depth of the job snapshot writer queue at sample time.
   std::size_t snapshot_writer_queue_depth{0};
 
@@ -60,8 +59,7 @@ class PerfMonitor
   /// Take a sample of current process resource usage.
   [[nodiscard]] PerfSample sample() const;
 
-  // ── Setters for WPCE-specific metrics (lock-free) ──────────────────
-
+  // Setters for WPCE-specific metrics (lock-free)
   void set_snapshot_writer_queue_depth(std::size_t depth) noexcept;
   void set_page_writer_queue_depth(std::size_t depth) noexcept;
   void set_last_notification_time(std::chrono::steady_clock::time_point t) noexcept;

@@ -14,8 +14,7 @@
 namespace wpce::collector
 {
 
-// ── DEVMODE field extraction ───────────────────────────────────────────
-
+// DEVMODE field extraction
 /// Map dmPaperSize (DMPAPER_*) integer to a human-readable name.
 std::string_view paper_size_name(std::int16_t dm_paper_size) noexcept;
 
@@ -37,8 +36,7 @@ std::string_view collate_name(std::int16_t dm_collate) noexcept;
 /// Map dmPrintQuality value to a human-readable name.
 std::string_view print_quality_name(std::int16_t dm_print_quality) noexcept;
 
-// ── Metadata extraction ────────────────────────────────────────────────
-
+// Metadata extraction
 #ifdef _WIN32
 /// Build a MetadataSnapshot from JOB_INFO_2W.
 ///

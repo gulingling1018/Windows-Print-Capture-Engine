@@ -1,5 +1,5 @@
 /// @file paper_size_map.cpp
-/// Shared DMPAPER_* → human-readable name mapping table implementation.
+/// Shared DMPAPER_* -> human-readable name mapping table implementation.
 
 #include "common/paper_size_map.h"
 

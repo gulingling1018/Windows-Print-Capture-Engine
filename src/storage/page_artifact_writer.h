@@ -1,6 +1,8 @@
 #pragma once
 
 #include "core/data_contracts.h"
+#include "storage/reliable_file_writer.h"
+#include <memory>
 
 #include <atomic>
 #include <condition_variable>
@@ -16,16 +18,16 @@
 namespace wpce::storage
 {
 
-// ── PageArtifactWriterConfig ──────────────────────────────────────────
-
+// PageArtifactWriterConfig
 struct PageArtifactWriterConfig
 {
   std::filesystem::path output_directory{"wpce-output"};
+  // Legacy sizing hint; pending transactions are durable files.
   std::size_t queue_capacity{512};
+  AtomicWriteHook worker_hook;
 };
 
-// ── PageArtifactPayload ───────────────────────────────────────────────
-
+// PageArtifactPayload
 /// A single page-level capture payload.
 struct PageArtifactPayload
 {
@@ -40,15 +42,16 @@ struct PageArtifactPayload
   std::string fixed_page_xml;
 };
 
-// ── Path helpers ──────────────────────────────────────────────────────
-
+// Path helpers
 std::filesystem::path page_artifact_path(const PageArtifactWriterConfig& config);
 std::filesystem::path page_artifact_archive_path(
   const PageArtifactWriterConfig& config,
   const core::PageArtifactIndex& index);
 
-// ── AsyncPageArtifactWriter ───────────────────────────────────────────
-
+// AsyncPageArtifactWriter
+/// Async writer for page artifact payloads.
+///
+/// Concurrent writers share a durable queue and an exclusive processing lease.
 class AsyncPageArtifactWriter
 {
  public:
@@ -69,21 +72,17 @@ class AsyncPageArtifactWriter
 
   /// Current depth of the internal work queue.
   [[nodiscard]] std::size_t queue_depth() const noexcept;
+  [[nodiscard]] bool drained() const noexcept;
+  [[nodiscard]] std::uintmax_t pending_bytes() const noexcept;
+
+  /// Block until all queued items have been persisted to disk.
+  /// Useful before reading page-artifacts.json to ensure the latest
+  /// data is on disk.  For best results, call after stop().
+  void sync();
 
  private:
-  void run();
-  void set_last_error(std::string error);
-
   PageArtifactWriterConfig config_;
-  std::deque<PageArtifactPayload> queue_;
-  std::atomic_bool stop_requested_{false};
-  std::atomic_bool running_{false};
-  std::thread worker_;
-  mutable std::mutex lifecycle_mutex_;
-  mutable std::mutex queue_mutex_;
-  mutable std::mutex error_mutex_;
-  std::condition_variable queue_cv_;
-  std::string last_error_;
+  std::unique_ptr<ReliableFileWriter> writer_;
 };
 
 }  // namespace wpce::storage

@@ -12,30 +12,238 @@
 namespace wpce::common
 {
 
-// ── File type detection ──────────────────────────────────────────────────
+// File type detection
+namespace
+{
+
+struct AppPattern { std::string_view prefix; std::string_view extension; };
+
+// CAD and design apps that set pDocument to a title without a file extension.
+constexpr AppPattern kAppPatterns[] = {
+  {"AutoCAD",     "dwg"},
+  {"BricsCAD",    "dwg"},
+  {"DraftSight",  "dwg"},
+  {"SolidWorks",  "sldprt"},
+  {"Inventor",    "ipt"},
+  {"Revit",       "rvt"},
+  {"CATIA",       "catpart"},
+  {"Creo",        "prt"},
+  {"SketchUp",    "skp"},
+  {"Rhino",       "3dm"},
+  {"CorelDRAW",   "cdr"},
+  {"Illustrator", "ai"},
+  {"Photoshop",   "psd"},
+  {"InDesign",    "indd"},
+};
+
+bool icase_contains(std::string_view haystack, std::string_view needle)
+{
+  if (needle.size() > haystack.size()) return false;
+  auto it = std::search(haystack.begin(), haystack.end(),
+                        needle.begin(), needle.end(),
+                        [](char a, char b) {
+                          return std::tolower(static_cast<unsigned char>(a)) ==
+                                 std::tolower(static_cast<unsigned char>(b));
+                        });
+  return it != haystack.end();
+}
+
+bool is_extension_char(char ch) noexcept
+{
+  return std::isalnum(static_cast<unsigned char>(ch)) != 0;
+}
+
+bool is_marker_word_char(char ch) noexcept
+{
+  const auto uch = static_cast<unsigned char>(ch);
+  return is_extension_char(ch) || ch == '_' || uch >= 0x80;
+}
+
+bool icase_token_contains(std::string_view haystack, std::string_view token)
+{
+  if (token.empty() || token.size() > haystack.size()) return false;
+
+  for (std::size_t pos = 0; pos + token.size() <= haystack.size(); ++pos)
+  {
+    if (pos > 0 && is_marker_word_char(haystack[pos - 1]))
+      continue;
+    if (pos + token.size() < haystack.size() &&
+        is_marker_word_char(haystack[pos + token.size()]))
+      continue;
+
+    bool matched = true;
+    for (std::size_t i = 0; i < token.size(); ++i)
+    {
+      if (std::tolower(static_cast<unsigned char>(haystack[pos + i])) !=
+          std::tolower(static_cast<unsigned char>(token[i])))
+      {
+        matched = false;
+        break;
+      }
+    }
+    if (matched) return true;
+  }
+  return false;
+}
+
+bool icase_ends_with(std::string_view value, std::string_view suffix)
+{
+  if (suffix.size() > value.size()) return false;
+  value.remove_prefix(value.size() - suffix.size());
+  return std::equal(value.begin(), value.end(), suffix.begin(),
+                    [](char a, char b) {
+                      return std::tolower(static_cast<unsigned char>(a)) ==
+                             std::tolower(static_cast<unsigned char>(b));
+                    });
+}
+
+std::string_view trim_ascii_space(std::string_view value)
+{
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string_view::npos) return {};
+  const auto last = value.find_last_not_of(" \t\r\n");
+  return value.substr(first, last - first + 1);
+}
+
+bool has_path_separator(std::string_view value)
+{
+  return value.find_first_of("/\\") != std::string_view::npos;
+}
+
+std::string_view filename_part(std::string_view value)
+{
+  const auto slash = value.find_last_of("/\\");
+  if (slash == std::string_view::npos) return value;
+  return value.substr(slash + 1);
+}
+
+bool has_final_numbered_suffix(std::string_view value)
+{
+  value = trim_ascii_space(value);
+  if (value.size() < 4 || value.back() != ')') return false;
+
+  const auto open = value.find_last_of('(');
+  if (open == std::string_view::npos || open + 1 >= value.size() - 1)
+    return false;
+  if (open == 0 || value[open - 1] != ' ') return false;
+
+  for (std::size_t i = open + 1; i < value.size() - 1; ++i)
+  {
+    if (!std::isdigit(static_cast<unsigned char>(value[i])))
+      return false;
+  }
+  return true;
+}
+
+bool looks_like_cad_identifier(std::string_view value)
+{
+  value = trim_ascii_space(value);
+  bool has_upper = false;
+  for (const char ch : value)
+  {
+    const auto uch = static_cast<unsigned char>(ch);
+    if (std::islower(uch) != 0)
+      return false;
+    if (std::isupper(uch) != 0)
+      has_upper = true;
+  }
+  return has_upper;
+}
+
+bool looks_like_cad_model_title(std::string_view document_name)
+{
+  if (!has_path_separator(document_name)) return false;
+
+  const std::string_view leaf = trim_ascii_space(filename_part(document_name));
+  if (!has_final_numbered_suffix(leaf)) return false;
+
+  const auto open = leaf.find_last_of('(');
+  std::string_view base = trim_ascii_space(leaf.substr(0, open));
+  if (!icase_ends_with(base, " model")) return false;
+
+  base = trim_ascii_space(base.substr(0, base.size() - std::string_view(" model").size()));
+  return looks_like_cad_identifier(base);
+}
+
+std::string normalize_extension_value(std::string_view value)
+{
+  const auto first = value.find_first_not_of(" \t\r\n");
+  if (first == std::string_view::npos) return {};
+  const auto last = value.find_last_not_of(" \t\r\n");
+  value = value.substr(first, last - first + 1);
+
+  while (!value.empty() && value.front() == '.')
+    value.remove_prefix(1);
+
+  std::string normalized;
+  normalized.reserve(value.size());
+  for (char ch : value)
+    normalized += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  return normalized;
+}
+
+std::string detect_extension_from_app_pattern(std::string_view document_name)
+{
+  for (const auto& [prefix, ext] : kAppPatterns)
+  {
+    if (icase_contains(document_name, prefix))
+      return std::string(ext);
+  }
+  return {};
+}
+
+std::string detect_extension_from_name_pattern(std::string_view document_name)
+{
+  // Preserve an explicit DWT marker before the more common DWG fallback.
+  // AutoCAD-family applications can print templates after stripping the real
+  // suffix, and treating every CAD title as DWG breaks file-specific pricing.
+  if (icase_token_contains(document_name, "dwt"))
+    return "dwt";
+
+  if (looks_like_cad_model_title(document_name))
+    return "dwg";
+
+  // CAD tools and print processors often strip the real suffix from the job
+  // title but leave a standalone DWG marker in the path/title.
+  if (icase_token_contains(document_name, "dwg"))
+    return "dwg";
+  return {};
+}
+
+}  // namespace
 
 std::string extract_file_extension(std::string_view document_name)
 {
   if (document_name.empty()) return {};
 
+  // Priority 1: dot-based extraction (e.g. "report.docx" -> "docx").
+  const auto slash_pos = document_name.find_last_of("/\\");
   auto dot_pos = document_name.rfind('.');
-  if (dot_pos == std::string_view::npos || dot_pos + 1 >= document_name.size())
-    return {};
-
-  std::string ext;
-  ext.reserve(document_name.size() - dot_pos - 1);
-  for (std::size_t i = dot_pos + 1; i < document_name.size(); ++i)
+  if (dot_pos != std::string_view::npos &&
+      (slash_pos == std::string_view::npos || dot_pos > slash_pos) &&
+      dot_pos + 1 < document_name.size())
   {
-    char ch = document_name[i];
-    if (ch == '/' || ch == '\\' || ch == ' ' || ch == '\t')
-      break;
-    ext += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    std::string ext;
+    ext.reserve(document_name.size() - dot_pos - 1);
+    for (std::size_t i = dot_pos + 1; i < document_name.size(); ++i)
+    {
+      char ch = document_name[i];
+      if (!is_extension_char(ch))
+        break;
+      ext += static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+    }
+    if (!ext.empty()) return ext;
   }
-  return ext;
+
+  // Priority 2: infer from filename/path markers such as a standalone "DWG".
+  if (std::string inferred = detect_extension_from_name_pattern(document_name); !inferred.empty())
+    return inferred;
+
+  // Priority 3: infer from application name in document title.
+  return detect_extension_from_app_pattern(document_name);
 }
 
-// ── Rule matching ────────────────────────────────────────────────────────
-
+// Rule matching
 int rule_specificity(const core::PricingRule& rule)
 {
   int score = 0;
@@ -45,7 +253,9 @@ int rule_specificity(const core::PricingRule& rule)
   if (!rule.paper_size_set.empty() || !rule.paper_size.empty()) ++score;
   if (!rule.duplex_mode.empty()) ++score;
   if (!rule.printer_name_set.empty() || !rule.printer_name.empty()) ++score;
-  if (!rule.color_mode.empty()) ++score;
+  // Color is mandatory in the current pricing matrix.  Empty legacy
+  // values are normalized to monochrome, so the dimension still counts.
+  ++score;
   if (!rule.file_extension_set.empty() || !rule.file_extension.empty()) ++score;
   return score;
 }
@@ -61,6 +271,16 @@ bool icase_equals(std::string_view a, std::string_view b)
                       return std::tolower(static_cast<unsigned char>(ca)) ==
                              std::tolower(static_cast<unsigned char>(cb));
                     });
+}
+
+std::string normalized_rule_color_mode(std::string_view rule_value)
+{
+  const auto first = rule_value.find_first_not_of(" \t\r\n");
+  if (first == std::string_view::npos) return "monochrome";
+  const auto last = rule_value.find_last_not_of(" \t\r\n");
+  rule_value = rule_value.substr(first, last - first + 1);
+  if (icase_equals(rule_value, "color")) return "color";
+  return "monochrome";
 }
 
 /// Match a job value against a rule dimension that may be either a
@@ -94,6 +314,35 @@ bool dimension_matches(std::string_view rule_value,
   return icase_equals(rule_value, job_value);
 }
 
+bool color_dimension_matches(std::string_view rule_value,
+                             std::string_view job_value)
+{
+  return normalized_rule_color_mode(rule_value) == normalize_color_for_matching(job_value);
+}
+
+bool extension_matches_set(
+    const std::vector<std::string>& rule_set,
+    const std::string& rule_string,
+    std::string_view job_value)
+{
+  const std::string job_ext = normalize_extension_value(job_value);
+
+  if (!rule_set.empty())
+  {
+    if (job_ext.empty()) return false;
+    for (const auto& rv : rule_set)
+    {
+      if (normalize_extension_value(rv) == job_ext) return true;
+    }
+    return false;
+  }
+
+  const std::string rule_ext = normalize_extension_value(rule_string);
+  if (rule_ext.empty()) return true;
+  if (job_ext.empty()) return false;
+  return rule_ext == job_ext;
+}
+
 }  // namespace
 
 std::string normalize_duplex_for_matching(std::string_view duplex_value)
@@ -106,11 +355,14 @@ std::string normalize_duplex_for_matching(std::string_view duplex_value)
 std::string normalize_color_for_matching(std::string_view color_value)
 {
   const auto first = color_value.find_first_not_of(" \t\r\n");
-  if (first == std::string_view::npos) return {};
+  if (first == std::string_view::npos) return "monochrome";
   const auto last = color_value.find_last_not_of(" \t\r\n");
   const std::string_view value = color_value.substr(first, last - first + 1);
 
-  if (value.empty() || value == "-") return {};
+  if (value.empty() || value == "-") return "monochrome";
+  // Handle known driver misspellings of "color" and "monochrome".
+  // Certain printer drivers (e.g. Konica Minolta, Ricoh models) emit
+  // corrupted tokens in their DEVMODE dmColor field.
   if (icase_equals(value, "color") ||
       icase_equals(value, "colour") ||
       icase_equals(value, "clolor"))
@@ -150,8 +402,8 @@ const core::PricingRule* find_best_rule(
     if (!dimension_matches(rule.duplex_mode, job_duplex)) continue;
     if (!dimension_matches_set(rule.printer_name_set, rule.printer_name, job_printer))
       continue;
-    if (!dimension_matches(rule.color_mode, effective_color)) continue;
-    if (!dimension_matches_set(rule.file_extension_set, rule.file_extension, job_ext))
+    if (!color_dimension_matches(rule.color_mode, effective_color)) continue;
+    if (!extension_matches_set(rule.file_extension_set, rule.file_extension, job_ext))
       continue;
 
     const int spec = rule.priority > 0 ? rule.priority : rule_specificity(rule);
@@ -171,14 +423,13 @@ void sort_rules_by_priority(std::vector<core::PricingRule>& rules)
 {
   for (auto& r : rules)
     r.priority = rule_specificity(r);
-  std::sort(rules.begin(), rules.end(),
+  std::stable_sort(rules.begin(), rules.end(),
             [](const core::PricingRule& a, const core::PricingRule& b) {
               return a.priority > b.priority;
             });
 }
 
-// ── Sheet breakdown (duplex odd-page tail) ──────────────────────────────
-
+// Sheet breakdown (duplex odd-page tail)
 core::SheetBreakdown compute_sheet_breakdown(
     int rendered_pages, bool is_duplex)
 {
@@ -201,8 +452,7 @@ core::SheetBreakdown compute_sheet_breakdown(
   return breakdown;
 }
 
-// ── Job attribute queries ────────────────────────────────────────────────
-
+// Job attribute queries
 bool is_duplex_job(const core::MetadataSnapshot& metadata)
 {
   const std::string& duplex = metadata.duplex.value;
@@ -213,32 +463,28 @@ bool is_duplex_job(const core::MetadataSnapshot& metadata)
           duplex == "long-edge (book)" ||
           duplex == "short-edge (calendar)" ||
           duplex == "TwoSidedLongEdge" ||
-          duplex == "TwoSidedShortEdge");
+          duplex == "TwoSidedShortEdge" ||
+          duplex == "flip on long edge" ||
+          duplex == "flip on short edge" ||
+          duplex == "book" ||
+          duplex == "calendar" ||
+          duplex == "duplex (book)" ||
+          duplex == "duplex (calendar)" ||
+          duplex == "long edge" ||
+          duplex == "short edge" ||
+          duplex == "two-sided long edge" ||
+          duplex == "two-sided short edge" ||
+          duplex == "dmdo_dup" ||
+          duplex == "dmdo_vertical" ||
+          duplex == "dmdo_horizontal" ||
+          duplex == "dmd_up" ||
+          duplex == "dmdout_horizontal" ||
+          duplex == "dmdout_vertical");
 }
 
 bool is_color_job(const core::MetadataSnapshot& metadata)
 {
   return normalize_color_for_matching(metadata.color.value) == "color";
-}
-
-bool is_large_paper(const core::MetadataSnapshot& metadata)
-{
-  const std::string& paper = metadata.paper_size.value;
-  if (paper.empty()) return false;
-  return icase_equals(paper, "A3") ||
-         icase_equals(paper, "Tabloid") ||
-         icase_equals(paper, "Ledger") ||
-         icase_equals(paper, "Legal");
-}
-
-bool is_high_quality(const core::MetadataSnapshot& metadata)
-{
-  const std::string& quality = metadata.print_quality.value;
-  if (quality.empty()) return false;
-  return quality == "high" ||
-         quality == "1200 dpi" ||
-         quality == "2400 dpi" ||
-         quality == "4800 dpi";
 }
 
 int parse_copies(const core::MetadataSnapshot& metadata)
@@ -289,8 +535,7 @@ std::string effective_color_mode(
   return "monochrome";
 }
 
-// ── Full pricing calculation ─────────────────────────────────────────────
-
+// Full pricing calculation
 namespace
 {
 
@@ -364,8 +609,19 @@ core::JobPricingEntry compute_job_pricing(
   // Determine matching color for rule lookup.  The effective colour
   // already accounts for printer capability and unknown driver values.
   const std::string match_color = eff_color;
+  const bool is_color = is_color_job(metadata);
 
-  // ── Match the main rule ───────────────────────────────────────────
+  if (is_color && !color_downgraded && entry.color_pages <= 0)
+  {
+    entry.total_price = 0.0;
+    entry.base_price = 0.0;
+    entry.tail_price = 0.0;
+    entry.price_pending = true;
+    entry.pending_reason = "awaiting_color_pages";
+    return entry;
+  }
+
+  // Match the main rule
   const core::PricingRule* matched = find_best_rule(pricing_metadata, rules, match_color);
 
   if (matched == nullptr)
@@ -390,28 +646,13 @@ core::JobPricingEntry compute_job_pricing(
     entry.matched_printer_name = matched->printer_name;
   }
 
-  // ── Color job split pricing ───────────────────────────────────────
-  const bool is_color = is_color_job(metadata);
+  // Color job split pricing
   if (is_color && !color_downgraded)
   {
-    if (entry.color_pages <= 0)
-    {
-      // Operator hasn't filled color pages → price=0, pending.
-      entry.total_price = 0.0;
-      entry.base_price = 0.0;
-      entry.tail_price = 0.0;
-      entry.price_pending = true;
-      entry.pending_reason = "awaiting_color_pages";
-      return entry;
-    }
-
     // Split: color and mono portions calculated independently through
     // duplex sheet breakdown, each finding their own matching rules.
     const core::PricingRule* color_rule = find_best_rule(pricing_metadata, rules, "color");
     const core::PricingRule* mono_rule  = find_best_rule(pricing_metadata, rules, "monochrome");
-
-    if (!color_rule) color_rule = find_best_rule(pricing_metadata, rules, "");
-    if (!mono_rule)  mono_rule  = find_best_rule(pricing_metadata, rules, "");
 
     if (!color_rule)
     {
@@ -429,9 +670,9 @@ core::JobPricingEntry compute_job_pricing(
     // Helper: find a simplex rule for a given color mode (for tail pricing).
     auto find_simplex_rule = [&](const std::string& color_for_tail) -> const core::PricingRule*
     {
-      const std::string& job_paper = metadata.paper_size.value;
-      const std::string& job_ext = metadata.file_extension.value;
-      const std::string& job_printer = metadata.printer_name;
+      const std::string& job_paper = pricing_metadata.paper_size.value;
+      const std::string& job_ext = pricing_metadata.file_extension.value;
+      const std::string& job_printer = pricing_metadata.printer_name;
 
       const core::PricingRule* best = nullptr;
       int best_spec = -1;
@@ -441,10 +682,10 @@ core::JobPricingEntry compute_job_pricing(
       {
         const auto& rule = rules[i];
         if (rule.duplex_mode != "simplex") continue;
-        if (!dimension_matches(rule.color_mode, color_for_tail)) continue;
+        if (!color_dimension_matches(rule.color_mode, color_for_tail)) continue;
         if (!dimension_matches_set(rule.paper_size_set, rule.paper_size, job_paper)) continue;
         if (!dimension_matches_set(rule.printer_name_set, rule.printer_name, job_printer)) continue;
-        if (!dimension_matches_set(rule.file_extension_set, rule.file_extension, job_ext)) continue;
+        if (!extension_matches_set(rule.file_extension_set, rule.file_extension, job_ext)) continue;
 
         const int spec = rule.priority > 0 ? rule.priority : rule_specificity(rule);
         if (spec > best_spec || (spec == best_spec && i < best_idx))
@@ -457,7 +698,7 @@ core::JobPricingEntry compute_job_pricing(
       return best;
     };
 
-    // ── Color portion: independent duplex sheet breakdown ──────────
+    // Color portion: independent duplex sheet breakdown
     const bool color_duplex = duplex && entry.color_pages > 1;
     const core::SheetBreakdown color_bd = compute_sheet_breakdown(entry.color_pages, color_duplex);
     double color_price = 0.0;
@@ -469,7 +710,6 @@ core::JobPricingEntry compute_job_pricing(
       if (color_bd.simplex_tail_pages > 0)
       {
         const core::PricingRule* color_tail = find_simplex_rule("color");
-        if (!color_tail) color_tail = find_simplex_rule("");
         if (color_tail)
           color_price += static_cast<double>(color_bd.simplex_tail_pages) *
                          color_tail->price_per_sheet;
@@ -480,20 +720,19 @@ core::JobPricingEntry compute_job_pricing(
     }
     else
     {
-      // ≤1 color page in a duplex job → physically simplex.
+      // <=1 color page in a duplex job -> physically simplex.
       // Use the simplex color rule, not the duplex-matched color_rule.
       const core::PricingRule* eff_color_rule = color_rule;
       if (duplex)
       {
         const core::PricingRule* csr = find_simplex_rule("color");
-        if (!csr) csr = find_simplex_rule("");
         if (csr) eff_color_rule = csr;
       }
       color_price = static_cast<double>(color_bd.simplex_tail_pages) *
                     eff_color_rule->price_per_sheet;
     }
 
-    // ── Mono portion: independent duplex sheet breakdown ──────────
+    // Mono portion: independent duplex sheet breakdown
     const bool mono_duplex = duplex && entry.mono_pages > 1;
     const core::SheetBreakdown mono_bd = compute_sheet_breakdown(entry.mono_pages, mono_duplex);
     double mono_price = 0.0;
@@ -505,7 +744,6 @@ core::JobPricingEntry compute_job_pricing(
       if (mono_bd.simplex_tail_pages > 0)
       {
         const core::PricingRule* mono_tail = find_simplex_rule("monochrome");
-        if (!mono_tail) mono_tail = find_simplex_rule("");
         if (mono_tail)
           mono_price += static_cast<double>(mono_bd.simplex_tail_pages) *
                         mono_tail->price_per_sheet;
@@ -516,12 +754,11 @@ core::JobPricingEntry compute_job_pricing(
     }
     else
     {
-      // ≤1 mono page in a duplex job → physically simplex.
+      // <=1 mono page in a duplex job -> physically simplex.
       const core::PricingRule* eff_mono_rule = mono_rule;
       if (duplex)
       {
         const core::PricingRule* msr = find_simplex_rule("monochrome");
-        if (!msr) msr = find_simplex_rule("");
         if (msr) eff_mono_rule = msr;
       }
       mono_price = static_cast<double>(mono_bd.simplex_tail_pages) *
@@ -537,7 +774,7 @@ core::JobPricingEntry compute_job_pricing(
     return entry;
   }
 
-  // ── Standard (monochrome or downgraded) pricing ───────────────────
+  // Standard (monochrome or downgraded) pricing
   if (duplex)
   {
     entry.base_price = static_cast<double>(sheets.full_duplex_sheets) *
@@ -549,7 +786,7 @@ core::JobPricingEntry compute_job_pricing(
                        matched->price_per_sheet;
   }
 
-  // ── Duplex odd-page tail: separately priced as simplex ────────────
+  // Duplex odd-page tail: separately priced as simplex
   if (duplex && sheets.simplex_tail_pages > 0)
   {
     const std::string job_paper = metadata.paper_size.value;
@@ -564,13 +801,13 @@ core::JobPricingEntry compute_job_pricing(
     {
       const auto& rule = rules[i];
       if (rule.duplex_mode != "simplex") continue;
-      if (!dimension_matches(rule.color_mode, eff_color)) continue;
+      if (!color_dimension_matches(rule.color_mode, eff_color)) continue;
 
       if (!dimension_matches_set(rule.paper_size_set, rule.paper_size, job_paper))
         continue;
       if (!dimension_matches_set(rule.printer_name_set, rule.printer_name, job_printer))
         continue;
-      if (!dimension_matches_set(rule.file_extension_set, rule.file_extension, job_ext))
+      if (!extension_matches_set(rule.file_extension_set, rule.file_extension, job_ext))
         continue;
 
       const int spec = rule.priority > 0 ? rule.priority : rule_specificity(rule);

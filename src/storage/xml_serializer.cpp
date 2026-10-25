@@ -80,6 +80,7 @@ std::string to_xml(const core::JobSnapshot& snapshot)
   append_xml_element(output, "printer_name", snapshot.printer_name);
   append_xml_element(output, "submit_time_utc", snapshot.submit_time_utc);
   append_xml_element(output, "status", snapshot.status);
+  append_xml_element(output, "raw_status_flags", snapshot.raw_status_flags);
   append_xml_element(output, "source", snapshot.source);
   output << "</job_snapshot>\n";
   return output.str();
@@ -104,6 +105,7 @@ std::string to_xml(const core::MetadataSnapshot& snapshot)
   append_field_value(output, "print_quality", snapshot.print_quality);
   append_field_value(output, "media_type", snapshot.media_type);
   append_field_value(output, "page_range", snapshot.page_range);
+  append_field_value(output, "file_extension", snapshot.file_extension);
   append_xml_element(output, "dm_fields_hex", snapshot.dm_fields_hex);
   output << "</metadata_snapshot>\n";
   return output.str();
@@ -123,6 +125,8 @@ std::string to_xml(const core::PageArtifactIndex& index)
   append_xml_element(output, "page_print_ticket", index.page_print_ticket);
   append_xml_element(output, "fixed_page", index.fixed_page);
   append_xml_element(output, "source", index.source);
+  append_xml_element(output, "capture_id", index.capture_id);
+  append_xml_element(output, "fixed_page_state", index.fixed_page_state);
   output << "</page_artifact_index>\n";
   return output.str();
 }

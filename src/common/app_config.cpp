@@ -1,5 +1,6 @@
 #include "common/app_config.h"
 #include "common/pricing_engine.h"
+#include "storage/file_utils.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -17,8 +18,7 @@
 namespace wpce::common
 {
 
-// ── helpers ─────────────────────────────────────────────────────────────────
-
+// helpers
 namespace
 {
 
@@ -78,7 +78,7 @@ std::filesystem::path get_appdata_directory()
 #endif
 
 /// Split a pipe-separated string like "A4|B5" into a lowercased vector.
-/// Empty input → empty vector.  Used to backfill the set fields of
+/// Empty input -> empty vector.  Used to backfill the set fields of
 /// PricingRule from older config files that only stored the pipe string.
 std::vector<std::string> split_pipe_lower(const std::string& s)
 {
@@ -99,8 +99,17 @@ std::vector<std::string> split_pipe_lower(const std::string& s)
   return out;
 }
 
-// ── Minimal JSON writer ─────────────────────────────────────────────────────
+std::string normalized_rule_color_mode(std::string value)
+{
+  for (char& ch : value)
+  {
+    ch = static_cast<char>(std::tolower(static_cast<unsigned char>(ch)));
+  }
+  if (value == "color") return "color";
+  return "monochrome";
+}
 
+// Minimal JSON writer
 class JsonWriter
 {
  public:
@@ -229,8 +238,7 @@ class JsonWriter
   std::vector<Context> stack_;
 };
 
-// ── Minimal JSON reader ─────────────────────────────────────────────────────
-
+// Minimal JSON reader
 /// Ultra-minimal recursive-descent JSON parser.  Only supports the subset we
 /// actually emit in the config file (objects, arrays, strings, numbers, bool,
 /// null).  No unicode escapes, no exponential notation, no tolerance for
@@ -267,6 +275,7 @@ class JsonReader
     }
 
     expect(',');
+    skip_ws();
     return true; // more entries
   }
 
@@ -293,6 +302,7 @@ class JsonReader
     }
 
     expect(',');
+    skip_ws();
     return true; // more elements
   }
 
@@ -356,14 +366,40 @@ class JsonReader
   {
     if (peek() == 't')
     {
-      for (int i = 0; i < 4; ++i) get();
+      // Verify the next 4 chars are "true"
+      for (int i = 0; i < 4; ++i)
+      {
+        int c = get();
+        const char expected = "true"[i];
+        if (c != expected)
+        {
+          char msg[64];
+          std::snprintf(msg, sizeof(msg), "expected 'true' but got invalid token");
+          throw std::runtime_error(msg);
+        }
+      }
       skip_ws();
       return true;
     }
-    // "false"
-    for (int i = 0; i < 5; ++i) get();
-    skip_ws();
-    return false;
+    if (peek() == 'f')
+    {
+      // Verify the next 5 chars are "false"
+      for (int i = 0; i < 5; ++i)
+      {
+        int c = get();
+        const char expected = "false"[i];
+        if (c != expected)
+        {
+          char msg[64];
+          std::snprintf(msg, sizeof(msg), "expected 'false' but got invalid token");
+          throw std::runtime_error(msg);
+        }
+      }
+      skip_ws();
+      return false;
+    }
+    // Not a boolean token
+    throw std::runtime_error("expected 'true' or 'false'");
   }
 
   void read_null()
@@ -374,6 +410,49 @@ class JsonReader
 
   // Peek at current value type.
   int value_type() const { return peek(); }
+
+  void skip_value()
+  {
+    skip_ws();
+    const int ch = peek();
+    if (ch == '"')
+    {
+      (void)read_string();
+      return;
+    }
+    if (ch == '{')
+    {
+      begin_object();
+      while (end_object_or_next())
+      {
+        (void)read_key();
+        skip_value();
+      }
+      skip_ws();
+      return;
+    }
+    if (ch == '[')
+    {
+      begin_array();
+      while (end_array_or_next())
+      {
+        skip_value();
+      }
+      skip_ws();
+      return;
+    }
+    if (ch == 't' || ch == 'f')
+    {
+      (void)read_bool();
+      return;
+    }
+    if (ch == 'n')
+    {
+      read_null();
+      return;
+    }
+    (void)read_number();
+  }
 
  private:
   struct Context
@@ -414,18 +493,16 @@ class JsonReader
 
 }  // namespace
 
-// ── AppConfig ───────────────────────────────────────────────────────────────
-
+// AppConfig
 AppConfig AppConfig::defaults()
 {
   AppConfig config;
 
   // Storage defaults
   config.storage.output_root = "./data";
-  config.storage.queue_capacity = 256;
   config.storage.retention_days = 90;
 
-  // Pricing defaults — matrix rules (factory preset of 6 default rules).
+  // Pricing defaults - matrix rules (factory preset of 6 default rules).
   // Legacy additive fields have been removed; rules are the single
   // source of pricing truth.
   config.pricing.currency = "CNY";
@@ -496,7 +573,7 @@ AppConfig AppConfig::defaults()
 
   sort_rules_by_priority(config.pricing.rules);
 
-  // Printer capability defaults — empty; first-launch detection populates.
+  // Printer capability defaults - empty; first-launch detection populates.
   config.printers.profiles.clear();
   config.printers.default_color_capable = false;
 
@@ -520,6 +597,11 @@ AppConfig AppConfig::defaults()
 
   config.window.quick_settle_width = 560;
   config.window.quick_settle_height = 360;
+
+  // Startup defaults
+  config.startup.launch_at_login = false;
+  config.startup.open_quick_settle_at_start = false;
+  config.startup.silent_startup = false;
 
   return config;
 }
@@ -565,19 +647,13 @@ bool AppConfig::ensure_config_file(const std::filesystem::path& path)
   }
 }
 
-// ── Serialisation ───────────────────────────────────────────────────────────
-
+// Serialisation
 bool AppConfig::save_to_json(const std::filesystem::path& path) const
 {
   try
   {
-    std::filesystem::create_directories(path.parent_path());
-
-    // Write to temp file then rename atomically.
-    const auto temp_path = path.string() + ".tmp";
+    std::ostringstream out;
     {
-      std::ofstream out(temp_path, std::ios::binary | std::ios::trunc);
-      if (!out) return false;
 
       JsonWriter w(out);
 
@@ -590,8 +666,6 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
       w.begin_object();
       w.key("output_root");
       w.write_string(storage.output_root);
-      w.key("queue_capacity");
-      w.write_uint(storage.queue_capacity);
       w.key("retention_days");
       w.write_int(storage.retention_days);
       w.end_object();
@@ -618,7 +692,7 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
         w.key("printer_name");
         w.write_string(rule.printer_name);
         w.key("color_mode");
-        w.write_string(rule.color_mode);
+        w.write_string(normalized_rule_color_mode(rule.color_mode));
         w.key("file_extension");
         w.write_string(rule.file_extension);
         w.key("price_per_sheet");
@@ -713,21 +787,23 @@ bool AppConfig::save_to_json(const std::filesystem::path& path) const
       w.write_bool(window.quick_settle_collapsed);
       w.end_object();
 
+      // startup
+      w.key("startup");
+      w.begin_object();
+      w.key("launch_at_login");
+      w.write_bool(startup.launch_at_login);
+      w.key("open_quick_settle_at_start");
+      w.write_bool(startup.open_quick_settle_at_start);
+      w.key("silent_startup");
+      w.write_bool(startup.silent_startup);
+      w.end_object();
+
       w.end_object();
       out << '\n';
     }
 
-    // Atomic rename.
-    std::error_code ec;
-    std::filesystem::rename(temp_path, path, ec);
-    if (ec)
-    {
-      // Fallback: copy + remove
-      std::filesystem::copy_file(temp_path, path,
-                                 std::filesystem::copy_options::overwrite_existing, ec);
-      if (ec) return false;
-      std::filesystem::remove(temp_path, ec);
-    }
+    if (!out) return false;
+    storage::write_text_file_atomic(out.str(), path);
     return true;
   }
   catch (...)
@@ -761,9 +837,9 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
         {
           const std::string sk = r.read_key();
           if (sk == "output_root")            storage.output_root = r.read_string();
-          else if (sk == "queue_capacity")    storage.queue_capacity = static_cast<std::size_t>(r.read_int());
+          else if (sk == "queue_capacity")    (void)r.read_int(); // legacy; queues are no longer capped
           else if (sk == "retention_days")    storage.retention_days = r.read_int();
-          else (void)r.read_string(); // skip unknown
+          else r.skip_value();
         }
       }
       else if (key == "pricing")
@@ -780,15 +856,7 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
           else if (pk == "color_surcharge")           (void)r.read_number();
           else if (pk == "large_paper_surcharge")     (void)r.read_number();
           else if (pk == "high_quality_surcharge")    (void)r.read_number();
-          else if (pk == "volume_discounts")
-          {
-            r.begin_array();
-            while (r.end_array_or_next())
-            {
-              r.begin_object();
-              while (r.end_object_or_next()) (void)r.read_string();
-            }
-          }
+          else if (pk == "volume_discounts") r.skip_value();
           else if (pk == "rules")
           {
             pricing.rules.clear();
@@ -823,7 +891,7 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
                   r.begin_array();
                   while (r.end_array_or_next()) rule.file_extension_set.push_back(r.read_string());
                 }
-                else (void)r.read_string();
+                else r.skip_value();
               }
               // Backfill set fields from the pipe-string form when the
               // set was missing (e.g. older config files).
@@ -833,16 +901,16 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
                 rule.printer_name_set = split_pipe_lower(rule.printer_name);
               if (rule.file_extension_set.empty() && !rule.file_extension.empty())
                 rule.file_extension_set = split_pipe_lower(rule.file_extension);
-              // Migrate: old configs stored empty color_mode as wildcard;
-              // non-color rules should explicitly match monochrome only.
-              if (rule.color_mode.empty())
-                rule.color_mode = "monochrome";
+              // Migrate: old configs stored empty color_mode values.
+              // Current business rule requires an explicit color value;
+              // empty or invalid values become monochrome.
+              rule.color_mode = normalized_rule_color_mode(rule.color_mode);
               rule.priority = rule_specificity(rule);
               pricing.rules.push_back(std::move(rule));
             }
             sort_rules_by_priority(pricing.rules);
           }
-          else (void)r.read_string(); // skip unknown
+          else r.skip_value();
         }
       }
       else if (key == "printers")
@@ -870,12 +938,12 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
                   r.begin_array();
                   while (r.end_array_or_next()) profile.supported_paper_sizes.push_back(r.read_string());
                 }
-                else (void)r.read_string();
+                else r.skip_value();
               }
               printers.profiles.push_back(std::move(profile));
             }
           }
-          else (void)r.read_string();
+          else r.skip_value();
         }
       }
       else if (key == "merchant")
@@ -887,7 +955,7 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
           if (mk == "name")       merchant.name = r.read_string();
           else if (mk == "phone") merchant.phone = r.read_string();
           else if (mk == "address") merchant.address = r.read_string();
-          else (void)r.read_string();
+          else r.skip_value();
         }
       }
       else if (key == "monitoring")
@@ -900,7 +968,7 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
           else if (mk == "rescan_interval_seconds") monitoring.rescan_interval_seconds = r.read_int();
           else if (mk == "poll_timeout_ms") monitoring.poll_timeout_ms = r.read_int();
           else if (mk == "perf_log_enabled") monitoring.perf_log_enabled = r.read_bool();
-          else (void)r.read_string();
+          else r.skip_value();
         }
       }
       else if (key == "window")
@@ -917,12 +985,24 @@ bool AppConfig::load_from_json(const std::filesystem::path& path)
           else if (wk == "quick_settle_height")           window.quick_settle_height = r.read_int();
           else if (wk == "quick_settle_collapsed_height") window.quick_settle_collapsed_height = r.read_int();
           else if (wk == "quick_settle_collapsed")        window.quick_settle_collapsed = r.read_bool();
-          else (void)r.read_string();
+          else r.skip_value();
+        }
+      }
+      else if (key == "startup")
+      {
+        r.begin_object();
+        while (r.end_object_or_next())
+        {
+          const std::string sk = r.read_key();
+          if (sk == "launch_at_login") startup.launch_at_login = r.read_bool();
+          else if (sk == "open_quick_settle_at_start") startup.open_quick_settle_at_start = r.read_bool();
+          else if (sk == "silent_startup") startup.silent_startup = r.read_bool();
+          else r.skip_value();
         }
       }
       else
       {
-        (void)r.read_string(); // skip unknown top-level key
+        r.skip_value();
       }
     }
     return true;

@@ -5,72 +5,12 @@
 
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 
 namespace wpce::storage
 {
-namespace
-{
-
-std::string safe_filename_token(std::string value)
-{
-  if (value.empty())
-  {
-    return "unknown-printer";
-  }
-
-  for (char& ch : value)
-  {
-    const bool keep =
-      (ch >= 'a' && ch <= 'z') ||
-      (ch >= 'A' && ch <= 'Z') ||
-      (ch >= '0' && ch <= '9') ||
-      ch == '-' || ch == '_';
-    if (!keep)
-    {
-      ch = '_';
-    }
-  }
-  return value;
-}
-
-void persist_payload_files(const PageArtifactWriterConfig& config, const PageArtifactPayload& payload)
-{
-  const std::filesystem::path pages_dir = config.output_directory / "pages";
-
-  // Write PrintTicket XML files.
-  if (!payload.job_print_ticket_xml.empty())
-  {
-    write_text_file_atomic(payload.job_print_ticket_xml,
-                           pages_dir / payload.index.job_print_ticket);
-  }
-  if (!payload.document_print_ticket_xml.empty())
-  {
-    write_text_file_atomic(payload.document_print_ticket_xml,
-                           pages_dir / payload.index.document_print_ticket);
-  }
-  if (!payload.page_print_ticket_xml.empty())
-  {
-    write_text_file_atomic(payload.page_print_ticket_xml,
-                           pages_dir / payload.index.page_print_ticket);
-  }
-  if (!payload.fixed_page_xml.empty())
-  {
-    write_text_file_atomic(payload.fixed_page_xml,
-                           pages_dir / payload.index.fixed_page);
-  }
-
-  // Write the PageArtifactIndex JSON.
-  write_text_file_atomic(to_json(payload.index), page_artifact_archive_path(config, payload.index));
-
-  // Update the latest page artifact index.
-  write_text_file_atomic(to_json(payload.index), page_artifact_path(config));
-}
-
-}  // namespace
-
-// ── Path helpers ──────────────────────────────────────────────────────
-
+// Path helpers
 std::filesystem::path page_artifact_path(const PageArtifactWriterConfig& config)
 {
   return config.output_directory / "page-artifacts.json";
@@ -80,167 +20,53 @@ std::filesystem::path page_artifact_archive_path(
   const PageArtifactWriterConfig& config,
   const core::PageArtifactIndex& index)
 {
-  const std::string printer = safe_filename_token(index.printer_name);
+  const std::string printer = printer_storage_token(index.printer_name);
   std::ostringstream name;
   name << "page-" << printer
        << "-j" << index.job_id
+       << "-" << (index.capture_id.empty() ? "legacy" : index.capture_id)
        << "-d" << index.document_sequence
        << "-p" << index.page_sequence << ".json";
   return config.output_directory / "pages" / name.str();
 }
 
-// ── AsyncPageArtifactWriter ───────────────────────────────────────────
-
-AsyncPageArtifactWriter::AsyncPageArtifactWriter(PageArtifactWriterConfig config)
-  : config_(std::move(config))
+// AsyncPageArtifactWriter
+AsyncPageArtifactWriter::AsyncPageArtifactWriter(PageArtifactWriterConfig config) : config_(std::move(config))
 {
-  if (config_.output_directory.empty())
-  {
-    throw std::invalid_argument("output_directory is required");
-  }
-  if (config_.queue_capacity == 0)
-  {
-    throw std::invalid_argument("queue_capacity must be greater than zero");
-  }
+  if (config_.output_directory.empty()) throw std::invalid_argument("output directory required");
+  config_.output_directory = std::filesystem::absolute(config_.output_directory).lexically_normal();
+  writer_ = std::make_unique<ReliableFileWriter>(ReliableWriterConfig{
+      .root=config_.output_directory, .queue_name="pages", .worker_hook=config_.worker_hook});
 }
-
-AsyncPageArtifactWriter::~AsyncPageArtifactWriter()
-{
-  stop();
-}
-
-void AsyncPageArtifactWriter::start()
-{
-  std::scoped_lock lock(lifecycle_mutex_);
-  if (running_)
-  {
-    return;
-  }
-
-  stop_requested_ = false;
-  set_last_error({});
-  running_ = true;
-  worker_ = std::thread(&AsyncPageArtifactWriter::run, this);
-}
-
-void AsyncPageArtifactWriter::stop() noexcept
-{
-  {
-    std::scoped_lock lock(queue_mutex_);
-    stop_requested_ = true;
-  }
-  queue_cv_.notify_all();
-
-  std::thread worker;
-  {
-    std::scoped_lock lock(lifecycle_mutex_);
-    if (worker_.joinable())
-    {
-      worker = std::move(worker_);
-    }
-  }
-
-  if (worker.joinable())
-  {
-    worker.join();
-  }
-}
-
+AsyncPageArtifactWriter::~AsyncPageArtifactWriter() { stop(); }
+void AsyncPageArtifactWriter::start() { writer_->start(); }
+void AsyncPageArtifactWriter::stop() noexcept { writer_->stop(); }
+bool AsyncPageArtifactWriter::running() const noexcept { return writer_->running(); }
+std::string AsyncPageArtifactWriter::last_error() const { return writer_->last_error(); }
+std::size_t AsyncPageArtifactWriter::queue_depth() const noexcept { return writer_->pending_count(); }
+std::uintmax_t AsyncPageArtifactWriter::pending_bytes() const noexcept { return writer_->pending_bytes(); }
+bool AsyncPageArtifactWriter::drained() const noexcept { return writer_->drained(); }
+void AsyncPageArtifactWriter::sync() { stop(); }
 bool AsyncPageArtifactWriter::enqueue(PageArtifactPayload payload)
 {
-  {
-    std::scoped_lock lock(queue_mutex_);
-    if (!running_ || stop_requested_)
-    {
-      return false;
-    }
-    if (queue_.size() >= config_.queue_capacity)
-    {
-      // Log drop so diagnostics can confirm queue backpressure under large-file load.
-      (void)fprintf(stderr,
-                    "[WPCE] PageArtifactWriter queue FULL (%zu/%zu), dropping payload\n",
-                    queue_.size(), config_.queue_capacity);
-      return false;
-    }
-    if (queue_.size() >= config_.queue_capacity * 8 / 10)
-    {
-      (void)fprintf(stderr,
-                    "[WPCE] PageArtifactWriter queue high-water (%zu/%zu)\n",
-                    queue_.size(), config_.queue_capacity);
-    }
-
-    queue_.push_back(std::move(payload));
-  }
-
-  queue_cv_.notify_one();
-  return true;
-}
-
-bool AsyncPageArtifactWriter::running() const noexcept
-{
-  return running_;
-}
-
-std::string AsyncPageArtifactWriter::last_error() const
-{
-  std::scoped_lock lock(error_mutex_);
-  return last_error_;
-}
-
-std::size_t AsyncPageArtifactWriter::queue_depth() const noexcept
-{
-  std::scoped_lock lock(queue_mutex_);
-  return queue_.size();
-}
-
-void AsyncPageArtifactWriter::run()
-{
+  std::vector<FileWrite> writes;
+  auto add = [&](const std::string& name, const std::string& content) {
+    if (content.empty()) { if (!name.empty()) throw std::runtime_error("index refers to missing payload"); return; }
+    if (!valid_artifact_filename(name)) throw std::runtime_error("unsafe artifact name");
+    writes.push_back({std::filesystem::path("pages") / name, content});
+  };
   try
   {
-    ensure_output_directory(config_.output_directory);
-    ensure_output_directory(config_.output_directory / "pages");
-
-    while (true)
-    {
-      PageArtifactPayload payload;
-      {
-        std::unique_lock lock(queue_mutex_);
-        queue_cv_.wait(lock, [&]() {
-          return stop_requested_ || !queue_.empty();
-        });
-
-        if (queue_.empty())
-        {
-          if (stop_requested_)
-          {
-            break;
-          }
-          continue;
-        }
-
-        payload = std::move(queue_.front());
-        queue_.pop_front();
-      }
-
-      persist_payload_files(config_, payload);
-    }
+    if (!payload.fixed_page_xml.empty()) payload.index.fixed_page_state = "reported";
+    add(payload.index.job_print_ticket, payload.job_print_ticket_xml);
+    add(payload.index.document_print_ticket, payload.document_print_ticket_xml);
+    add(payload.index.page_print_ticket, payload.page_print_ticket_xml);
+    add(payload.index.fixed_page, payload.fixed_page_xml);
+    if (!payload.index.capture_id.empty() && !valid_artifact_filename(payload.index.capture_id)) throw std::runtime_error("unsafe capture identity");
+    writes.push_back({page_artifact_archive_path(config_, payload.index).lexically_relative(config_.output_directory), to_json(payload.index)});
+    writes.push_back({"page-artifacts.json", to_json(payload.index)});
+    return writer_->enqueue(std::move(writes));
   }
-  catch (const std::exception& error)
-  {
-    set_last_error(error.what());
-  }
-  catch (...)
-  {
-    set_last_error("unknown page artifact writer error");
-  }
-
-  running_ = false;
+  catch (const std::exception& error) { writer_->reject(error.what()); return false; }
 }
-
-void AsyncPageArtifactWriter::set_last_error(std::string error)
-{
-  std::scoped_lock lock(error_mutex_);
-  last_error_ = std::move(error);
-}
-
 }  // namespace wpce::storage

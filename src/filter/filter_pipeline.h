@@ -7,6 +7,8 @@
 #endif
 
 #include <cstdint>
+#include <atomic>
+#include <mutex>
 #include <filesystem>
 #include <string>
 #include <vector>
@@ -18,7 +20,7 @@
 namespace wpce::filter
 {
 
-// ── CLSID for the XPS capture filter ────────────────────────────────────
+// CLSID for the XPS capture filter
 // {B1C8E3F0-2D4A-5B6C-7D8E-9F0A1B2C3D4E}
 extern const CLSID CLSID_XpsCaptureFilter;
 
@@ -30,14 +32,12 @@ class XpsCaptureFilter final : public IPrintPipelineFilter
   XpsCaptureFilter() noexcept;
   virtual ~XpsCaptureFilter() noexcept;
 
-  // ── IUnknown ──────────────────────────────────────────────────────────
-
+  // IUnknown
   HRESULT STDMETHODCALLTYPE QueryInterface(REFIID riid, void** ppvObject) override;
   ULONG STDMETHODCALLTYPE AddRef() override;
   ULONG STDMETHODCALLTYPE Release() override;
 
-  // ── IPrintPipelineFilter ──────────────────────────────────────────────
-
+  // IPrintPipelineFilter
   HRESULT STDMETHODCALLTYPE InitializeFilter(
     IInterFilterCommunicator* pINegotiation,
     IPrintPipelinePropertyBag* pIPropertyBag,
@@ -48,12 +48,11 @@ class XpsCaptureFilter final : public IPrintPipelineFilter
   HRESULT STDMETHODCALLTYPE ShutdownOperation() override;
 
   // Windows 10 SDK IPrintPipelineFilter only has the three methods above.
-  // PauseOperation/ResumeOperation are not part of the standard vtable —
+  // PauseOperation/ResumeOperation are not part of the standard vtable -
   // they were added in IPrintPipelineFilterV2 (WDK-only extended interface)
   // which the spooler does not call for a basic pass-through filter.
 
-  // ── Accessors (for test harness) ──────────────────────────────────────
-
+  // Accessors (for test harness)
   /// Collected PrintTicket XML strings, indexed by level.
   /// [0] = Job-level, [1+] = Document-level, then Page-level.
   [[nodiscard]] const std::vector<std::string>& captured_print_tickets() const noexcept
@@ -85,28 +84,32 @@ class XpsCaptureFilter final : public IPrintPipelineFilter
 
  private:
   void log_pt_capture(const char* level, const std::string& xml);
+  void capture_part(IUnknown* part, std::int32_t& document_sequence,
+      std::int32_t& page_sequence, std::string& job_pt, std::string& document_pt);
+  void finish_once(IPrintPipelineManagerControl* control) noexcept;
 
-  // ── COM state ─────────────────────────────────────────────────────────
-
+  // COM state
   LONG ref_count_{1};
+  std::mutex operation_mutex_;
+  bool operation_started_{false};
+  std::atomic_bool cancelled_{false};
+  std::atomic_bool finished_{false};
 
-  // ── Pipeline interfaces (valid during StartOperation) ─────────────────
-
+  // Pipeline interfaces (valid during StartOperation)
   common::com_ptr<IInterFilterCommunicator> negotiation_;
   common::com_ptr<IPrintPipelineManagerControl> pipeline_control_;
   common::com_ptr<IPrintPipelinePropertyBag> property_bag_;
 
-  // ── Capture state ─────────────────────────────────────────────────────
-
+  // Capture state
   std::string printer_name_;
   std::uint32_t job_id_{0};
+  std::string capture_id_, physical_identity_;
   std::vector<std::string> captured_print_tickets_;
   std::vector<core::PageArtifactIndex> page_artifact_indices_;
   std::uint32_t forwarded_part_count_{0};
   std::string last_error_;
 
-  // ── Persistence (optional) ────────────────────────────────────────────
-
+  // Persistence (optional)
   std::filesystem::path output_directory_;
   std::vector<storage::PageArtifactPayload> pending_payloads_;
 };

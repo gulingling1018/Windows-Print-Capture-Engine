@@ -4,7 +4,7 @@
 /// WPCE UI process (user session).
 ///
 /// Uses manual-reset events so that signals are not lost when the
-/// consumer is not actively waiting — the event stays set until the
+/// consumer is not actively waiting - the event stays set until the
 /// consumer explicitly resets it after scanning for new metadata.
 
 #pragma once
@@ -27,8 +27,8 @@ constexpr const wchar_t* kPTMetadataReadyEventName =
 
 enum class EventRole
 {
-  Creator,  // CreateEventW — the signalling side (filter DLL)
-  Opener,   // OpenEventW  — the waiting side (WatcherBridge)
+  Creator,  // CreateEventW - the signalling side (filter DLL)
+  Opener,   // OpenEventW  - the waiting side (WatcherBridge)
 };
 
 class NamedEvent

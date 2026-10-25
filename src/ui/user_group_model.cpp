@@ -730,7 +730,12 @@ static bool is_high_quality_meta(const GroupNode* group)
 {
   for (auto* child : group->children)
   {
-    if (is_high_quality(child->jobData.metadata))
+    const std::string& quality = child->jobData.metadata.print_quality.value;
+    if (!quality.empty() &&
+        (quality == "high" ||
+         quality == "1200 dpi" ||
+         quality == "2400 dpi" ||
+         quality == "4800 dpi"))
       return true;
   }
   return false;

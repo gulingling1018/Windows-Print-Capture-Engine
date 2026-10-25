@@ -1,12 +1,15 @@
 #pragma once
 
 #include "core/data_contracts.h"
+#include "storage/reliable_file_writer.h"
+#include <memory>
 
 #include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <deque>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <string>
 #include <thread>
@@ -18,7 +21,11 @@ namespace wpce::storage
 struct JobSnapshotWriterConfig
 {
   std::filesystem::path output_directory{"wpce-output"};
+  // Legacy sizing hint. Pending transactions live on disk, one is processed in RAM.
   std::size_t queue_capacity{256};
+  AtomicWriteHook worker_hook;
+  bool rotate_daily{false};
+  std::function<std::string()> date_provider;
 };
 
 /// A job snapshot paired with optional metadata for atomic persistence.
@@ -26,12 +33,14 @@ struct SnapshotPair
 {
   core::JobSnapshot job;
   core::MetadataSnapshot metadata;
+  std::filesystem::path output_directory;
 };
 
-std::filesystem::path job_snapshot_path(const JobSnapshotWriterConfig& config);
+std::filesystem::path job_snapshot_path(const JobSnapshotWriterConfig& config, const core::JobSnapshot& snapshot);
 std::filesystem::path job_snapshot_archive_path(const JobSnapshotWriterConfig& config, const core::JobSnapshot& snapshot);
-std::filesystem::path metadata_snapshot_path(const JobSnapshotWriterConfig& config);
+std::filesystem::path metadata_snapshot_path(const JobSnapshotWriterConfig& config, const core::MetadataSnapshot& snapshot);
 std::filesystem::path metadata_archive_path(const JobSnapshotWriterConfig& config, const core::MetadataSnapshot& snapshot);
+std::filesystem::path latest_manifest_path(const JobSnapshotWriterConfig& config);
 std::filesystem::path lifecycle_summary_path(const JobSnapshotWriterConfig& config);
 std::filesystem::path lifecycle_summary_archive_path(const JobSnapshotWriterConfig& config, const core::JobLifecycleSummary& summary);
 void write_job_snapshot_json_atomic(const core::JobSnapshot& snapshot, const std::filesystem::path& path);
@@ -51,28 +60,20 @@ class AsyncJobSnapshotWriter
 
   void start();
   void stop() noexcept;
+  void request_stop() noexcept;
 
-  [[nodiscard]] bool enqueue(core::JobSnapshot job, core::MetadataSnapshot metadata);
+  [[nodiscard]] bool enqueue(core::JobSnapshot job, core::MetadataSnapshot metadata, const std::string& capture_date = {});
   [[nodiscard]] bool running() const noexcept;
   [[nodiscard]] std::string last_error() const;
 
   /// Current depth of the internal work queue.
   [[nodiscard]] std::size_t queue_depth() const noexcept;
+  [[nodiscard]] bool drained() const noexcept;
+  [[nodiscard]] std::uintmax_t pending_bytes() const noexcept;
 
  private:
-  void run();
-  void set_last_error(std::string error);
-
   JobSnapshotWriterConfig config_;
-  std::deque<SnapshotPair> queue_;
-  std::atomic_bool stop_requested_{false};
-  std::atomic_bool running_{false};
-  std::thread worker_;
-  mutable std::mutex lifecycle_mutex_;
-  mutable std::mutex queue_mutex_;
-  mutable std::mutex error_mutex_;
-  std::condition_variable queue_cv_;
-  std::string last_error_;
+  std::unique_ptr<ReliableFileWriter> writer_;
 };
 
 }  // namespace wpce::storage

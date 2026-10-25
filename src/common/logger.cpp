@@ -31,9 +31,9 @@ void RingBufferLogger::log(LogSeverity severity,
   entry.message = std::move(message);
   buffer_.push_back(std::move(entry));
 
-  // Trim to capacity — erase oldest entries from the front.
-  // O(N) memmove of up to ~160 KB (2000 entries × ~80 B) which is
-  // < 50 µs on modern CPUs.  Acceptable for the logging hot path;
+  // Trim to capacity - erase oldest entries from the front.
+  // O(N) memmove of up to ~160 KB (2000 entries x ~80 B) which is
+  // < 50 us on modern CPUs.  Acceptable for the logging hot path;
   // switch to true ring indexing if profiling shows it matters.
   while (buffer_.size() > capacity_)
   {
@@ -99,7 +99,6 @@ std::string_view RingBufferLogger::to_string(LogSeverity sev)
     case LogSeverity::Info:  return "INFO";
     case LogSeverity::Warn:  return "WARN";
     case LogSeverity::Error: return "ERROR";
-    case LogSeverity::Fatal: return "FATAL";
   }
   return "?";
 }

@@ -3,13 +3,13 @@
 // ── Icon ─────────────────────────────────────────────────────────────────────
 
 #define IDI_ICON1 1
-IDI_ICON1 ICON "wpce_icon.ico"
+IDI_ICON1 ICON "@WPCE_UI_SOURCE_DIR@/wpce_icon.ico"
 
 // ── Version ─────────────────────────────────────────────────────────────────
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     0,1,0,0
-PRODUCTVERSION  0,1,0,0
+FILEVERSION     @RC_FILEVERSION_COMMA@
+PRODUCTVERSION  @RC_FILEVERSION_COMMA@
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0
 FILEOS          VOS_NT_WINDOWS32
@@ -18,17 +18,16 @@ FILESUBTYPE     VFT2_UNKNOWN
 BEGIN
   BLOCK "StringFileInfo"
   BEGIN
-    BLOCK "040904E4"  // US English + Unicode (UTF-16LE) — but CP 1252 Multilingual is 04E4
-    // Block "080404B0"  // Chinese (Simplified, PRC) + Unicode
+    BLOCK "040904E4"  // US English + Unicode (UTF-16LE)
     BEGIN
       VALUE "CompanyName",      "WPCE"
       VALUE "FileDescription",  "Windows Print Capture Engine Console"
-      VALUE "FileVersion",      "0.1.0.0"
+      VALUE "FileVersion",      "@PROJECT_VERSION@.0"
       VALUE "InternalName",     "wpce_ui"
       VALUE "LegalCopyright",   "Copyright \xA9 2026"
       VALUE "OriginalFilename", "wpce_ui.exe"
       VALUE "ProductName",      "WPCE Print Capture Engine"
-      VALUE "ProductVersion",   "0.1.0"
+      VALUE "ProductVersion",   "@PROJECT_VERSION@"
     END
   END
 
@@ -51,7 +50,7 @@ BEGIN
   "  <assemblyIdentity"
   "    type=""win32"""
   "    name=""WPCE.UI"""
-  "    version=""0.1.0.0"""
+  "    version=""@PROJECT_VERSION@.0"""
   "  />"
   "  <description>Windows Print Capture Engine</description>"
   "  <dependency>"

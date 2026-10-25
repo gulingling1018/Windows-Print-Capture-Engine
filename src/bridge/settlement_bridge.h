@@ -23,13 +23,14 @@
 #include "core/data_contracts.h"
 
 #include <filesystem>
+#include <optional>
 #include <string>
 #include <vector>
 
 namespace wpce::bridge
 {
 
-/// Settlement bridge — pure static methods, no state needed.
+/// Settlement bridge - pure static methods, no state needed.
 class SettlementBridge
 {
 public:
@@ -86,8 +87,7 @@ public:
   static std::optional<core::SettlementOrder> loadFromFile(
       const std::filesystem::path& file_path);
 
-  // ── Date-based storage (history/) ─────────────────────────────────
-
+  // Date-based storage (history/)
   /// Build a filesystem-safe filename for an order.
   /// Format: "<order_id>_<firstDoc>~<lastDoc>.json"
   /// Special chars are sanitised, names truncated to 20 chars.

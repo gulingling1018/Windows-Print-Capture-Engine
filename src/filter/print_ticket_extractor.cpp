@@ -18,19 +18,19 @@ std::string read_print_stream(IUnknown* pStream)
     return {};
   }
 
-  IPrintReadStream* read_stream = nullptr;
+  common::com_ptr<IPrintReadStream> read_stream;
   HRESULT hr = pStream->QueryInterface(
     __uuidof(IPrintReadStream),
     reinterpret_cast<void**>(&read_stream));
 
-  if (FAILED(hr) || read_stream == nullptr)
+  if (FAILED(hr) || !read_stream)
   {
     return {};
   }
 
   std::string result;
   constexpr std::size_t kChunkSize = 4096;
-  constexpr std::size_t kMaxReadSize = 100ULL * 1024 * 1024;  // 100 MB
+  constexpr std::size_t kMaxReadSize = 8ULL * 1024 * 1024;  // 8 MiB
   std::vector<BYTE> buffer(kChunkSize);
 
   while (true)
@@ -46,16 +46,15 @@ std::string read_print_stream(IUnknown* pStream)
 
     if (FAILED(hr))
     {
-      read_stream->Release();
       return {};
     }
 
+    if (bytes_read > buffer.size() || (!bytes_read && !eof)) return {};
     if (bytes_read > 0)
     {
       if (result.size() + bytes_read > kMaxReadSize)
       {
-        ::OutputDebugStringA("[WPCE] read_print_stream: stream exceeds 100 MB limit, aborting\n");
-        read_stream->Release();
+        ::OutputDebugStringA("[WPCE] read_print_stream: stream exceeds 8 MiB limit, aborting\n");
         return {};
       }
       result.append(reinterpret_cast<const char*>(buffer.data()), bytes_read);
@@ -67,7 +66,6 @@ std::string read_print_stream(IUnknown* pStream)
     }
   }
 
-  read_stream->Release();
   return result;
 }
 
@@ -117,14 +115,14 @@ std::string read_istream_to_string(IStream* pStream)
     ::OutputDebugStringA(dbg);
   }
 
-  constexpr std::uint64_t kMaxStreamSize = 100ULL * 1024 * 1024;  // 100 MB
+  constexpr std::uint64_t kMaxStreamSize = 8ULL * 1024 * 1024;  // 8 MiB
   if (end.QuadPart > kMaxStreamSize)
   {
     ::OutputDebugStringA("[WPCE] read_istream_to_string: OVERSIZED stream, aborting to prevent OOM\n");
     return {};
   }
 
-  // Safe: end.QuadPart <= 100 MB, fits in ULONG on all supported platforms.
+  // Safe: end.QuadPart <= 8 MiB, fits in ULONG on all supported platforms.
   const ULONG size = static_cast<ULONG>(end.QuadPart);
   std::string result;
   result.resize(size);

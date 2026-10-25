@@ -2,6 +2,7 @@
 /// Unit tests for the rule-based pricing engine.
 
 #include "common/pricing_engine.h"
+#include "common/file_type_detector.h"
 #include "core/data_contracts.h"
 
 #include <gtest/gtest.h>
@@ -97,14 +98,67 @@ TEST(PricingEngine, ExtractFileExtension_WithPath)
 {
   EXPECT_EQ(common::extract_file_extension("C:\\Users\\me\\doc.pdf"), "pdf");
   EXPECT_EQ(common::extract_file_extension("/home/user/file.txt"), "txt");
+  EXPECT_EQ(common::extract_file_extension(
+                R"(C:\Users\Administrator\xwechat_files\wxid_4aded946zz8b22_6d2e\msg\file\2026-06\312301030119牛鹏超图纸.dwg)"),
+            "dwg");
+}
+
+TEST(PricingEngine, ExtractFileExtension_IgnoresDotInDirectory)
+{
+  EXPECT_EQ(common::extract_file_extension("C:\\Users\\a.b\\monochrome"), "");
+}
+
+TEST(PricingEngine, ExtractFileExtension_DwgMarkerWithoutSuffix)
+{
+  EXPECT_EQ(common::extract_file_extension("C:\\Projects\\DWG\\monochrome Model (1)"), "dwg");
+  EXPECT_EQ(common::extract_file_extension("AutoCAD Model (1)"), "dwg");
+  EXPECT_EQ(common::extract_file_extension("C:\\Templates\\DWT\\title block"), "dwt");
+  EXPECT_EQ(common::extract_file_extension("company-template.DWT"), "dwt");
+}
+
+TEST(PricingEngine, ExtractFileExtension_CadModelTitleWithoutSuffix)
+{
+  EXPECT_EQ(common::extract_file_extension("D:\\qq\\AST Model (1)"), "dwg");
+  EXPECT_EQ(common::extract_file_extension("AST Model (1)"), "");
+}
+
+TEST(PricingEngine, ExtractFileExtension_StripsTrailingPunctuation)
+{
+  EXPECT_EQ(common::extract_file_extension("C:\\Projects\\floorplan.DWG)"), "dwg");
+  EXPECT_EQ(common::extract_file_extension("C:\\Projects\\floorplan.dwg,"), "dwg");
+  EXPECT_EQ(common::extract_file_extension("C:\\Projects\\floorplan.dwg]"), "dwg");
+}
+
+TEST(PricingEngine, ExtractFileExtension_DwgMarkerRequiresRealBoundary)
+{
+  EXPECT_EQ(common::extract_file_extension("C:\\Projects\\DWG_Archive\\monochrome Model (1)"), "");
+  EXPECT_EQ(common::extract_file_extension("DWG格式说明"), "");
+}
+
+TEST(FileTypeDetector, ExactDwtEvidenceBeatsAutoCadDwgHint)
+{
+  const auto result = common::resolve_file_type({
+    {"AutoCAD 2026 - Drawing Model (1)", "document_title", 10},
+    {"C:\\Spool\\company-template.DWT", "shd_path", 100}
+  });
+  EXPECT_EQ(result.extension, "dwt");
+  EXPECT_EQ(result.source, "shd_path");
+  EXPECT_EQ(result.confidence, 3);
+}
+
+TEST(FileTypeDetector, StandaloneDwtMarkerIsRecognized)
+{
+  const auto result = common::detect_file_type("C:\\Templates\\DWT\\title block", "document_title");
+  EXPECT_EQ(result.extension, "dwt");
+  EXPECT_EQ(result.confidence, 2);
 }
 
 // ── rule_specificity ──────────────────────────────────────────────────────
 
-TEST(PricingEngine, RuleSpecificity_AllEmpty)
+TEST(PricingEngine, RuleSpecificity_LegacyEmptyColorCountsAsMonochrome)
 {
   auto rule = make_rule("r1", "", "", "", "", "", 0.10);
-  EXPECT_EQ(common::rule_specificity(rule), 0);
+  EXPECT_EQ(common::rule_specificity(rule), 1);
 }
 
 TEST(PricingEngine, RuleSpecificity_AllFilled)
@@ -116,7 +170,7 @@ TEST(PricingEngine, RuleSpecificity_AllFilled)
 TEST(PricingEngine, RuleSpecificity_Partial)
 {
   auto rule = make_rule("r1", "A4", "simplex", "", "", "", 0.10);
-  EXPECT_EQ(common::rule_specificity(rule), 2);
+  EXPECT_EQ(common::rule_specificity(rule), 3);
 }
 
 // ── sort_rules_by_priority ────────────────────────────────────────────────
@@ -124,9 +178,9 @@ TEST(PricingEngine, RuleSpecificity_Partial)
 TEST(PricingEngine, SortRulesByPriority)
 {
   std::vector<core::PricingRule> rules = {
-    make_rule("r1", "", "", "", "", "", 0.10),                          // specificity 0
+    make_rule("r1", "", "", "", "", "", 0.10),                          // specificity 1
     make_rule("r2", "A4", "simplex", "PrinterA", "monochrome", "pdf", 0.50), // specificity 5
-    make_rule("r3", "A4", "simplex", "", "", "", 0.15),                 // specificity 2
+    make_rule("r3", "A4", "simplex", "", "", "", 0.15),                 // specificity 3
   };
   common::sort_rules_by_priority(rules);
   EXPECT_EQ(rules[0].rule_id, "r2");
@@ -260,6 +314,29 @@ TEST(PricingEngine, FindBestRule_SpecificityWins)
   EXPECT_EQ(matched->rule_id, "r_specific");
 }
 
+TEST(PricingEngine, FindBestRule_LeadingDotRuleExtensionMatches)
+{
+  std::vector<core::PricingRule> rules = {
+    make_rule("r_dwg", "A4", "simplex", "", "monochrome", ".dwg", 0.50),
+  };
+  auto md = make_metadata(1, "5", "1", "simplex", "monochrome", "A4", "dwg");
+  const auto* matched = common::find_best_rule(md, rules, "monochrome");
+  ASSERT_NE(matched, nullptr);
+  EXPECT_EQ(matched->rule_id, "r_dwg");
+}
+
+TEST(PricingEngine, FindBestRule_LeadingDotExtensionSetMatches)
+{
+  core::PricingRule rule = make_rule("r_set", "A4", "simplex", "", "monochrome", "", 0.50);
+  rule.file_extension_set = {".dwg", "pdf"};
+  std::vector<core::PricingRule> rules = {rule};
+
+  auto md = make_metadata(1, "5", "1", "simplex", "monochrome", "A4", "dwg");
+  const auto* matched = common::find_best_rule(md, rules, "monochrome");
+  ASSERT_NE(matched, nullptr);
+  EXPECT_EQ(matched->rule_id, "r_set");
+}
+
 TEST(PricingEngine, FindBestRule_NoMatch)
 {
   std::vector<core::PricingRule> rules = {
@@ -315,6 +392,39 @@ TEST(PricingEngine, ComputeJobPricing_BasicRuleMatch)
   EXPECT_DOUBLE_EQ(entry.base_price, 5.0 * 0.15);
   EXPECT_DOUBLE_EQ(entry.total_price, 5.0 * 0.15);
   EXPECT_FALSE(entry.price_pending);
+}
+
+TEST(PricingEngine, ComputeJobPricing_CadModelTitleUsesDwgRule)
+{
+  auto config = make_config_with_rules({
+    make_rule("dwg", "A4", "simplex", "", "monochrome", "dwg", 0.50),
+    make_rule("generic", "A4", "simplex", "", "monochrome", "", 0.15),
+  });
+  const std::string ext = common::extract_file_extension("D:\\qq\\AST Model (1)");
+  auto md = make_metadata(159, "1", "1", "simplex", "monochrome", "A4", ext);
+
+  common::PrinterProfileConfig printers;
+  auto entry = common::compute_job_pricing(md, config, printers);
+  EXPECT_EQ(ext, "dwg");
+  EXPECT_EQ(entry.matched_rule_id, "dwg");
+  EXPECT_DOUBLE_EQ(entry.total_price, 0.50);
+}
+
+TEST(PricingEngine, ComputeJobPricing_WechatDwgPathUsesCadRule)
+{
+  auto config = make_config_with_rules({
+    make_rule("dwg", "A4", "simplex", "", "monochrome", "dwg", 0.50),
+    make_rule("generic", "A4", "simplex", "", "monochrome", "", 0.15),
+  });
+  const std::string ext = common::extract_file_extension(
+      R"(C:\Users\Administrator\xwechat_files\wxid_4aded946zz8b22_6d2e\msg\file\2026-06\312301030119牛鹏超图纸.dwg)");
+  auto md = make_metadata(2147483649u, "2", "1", "simplex", "monochrome", "A4", ext);
+
+  common::PrinterProfileConfig printers;
+  auto entry = common::compute_job_pricing(md, config, printers);
+  EXPECT_EQ(ext, "dwg");
+  EXPECT_EQ(entry.matched_rule_id, "dwg");
+  EXPECT_DOUBLE_EQ(entry.total_price, 1.00);
 }
 
 TEST(PricingEngine, ComputeJobPricing_DuplexWithOddTail)
@@ -433,9 +543,10 @@ TEST(PricingEngine, ComputeJobPricing_ColorPagesZero_PriceIsZero)
   EXPECT_EQ(entry.mono_pages, 5);
 }
 
-TEST(PricingEngine, ComputeJobPricing_ColorNotPendingWhenDisabled)
+TEST(PricingEngine, ComputeJobPricing_ColorPagesPendingEvenWhenAutoPendingDisabled)
 {
-  // color_price_pending=false is irrelevant now; m=0 always means pending.
+  // D1: explicit color jobs on color-capable printers require operator-filled color_pages.
+  // The legacy color_price_pending switch no longer auto-prices missing color pages as mono.
   auto config = make_config_with_rules({
     make_rule("r1", "A4", "simplex", "", "", "", 0.15),
   }, /*color_price_pending=*/false);
@@ -446,6 +557,7 @@ TEST(PricingEngine, ComputeJobPricing_ColorNotPendingWhenDisabled)
   auto entry = common::compute_job_pricing(md, config, printers);
   EXPECT_TRUE(entry.price_pending);
   EXPECT_EQ(entry.pending_reason, "awaiting_color_pages");
+  EXPECT_DOUBLE_EQ(entry.total_price, 0.0);
 }
 
 TEST(PricingEngine, ComputeJobPricing_UnmatchedRule)

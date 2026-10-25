@@ -127,6 +127,9 @@ void CompletionDialog::buildUi(const QString& userId,
       spin->setSingleStep(0.10);
       spin->setValue(line.price);
       spin->setButtonSymbols(QAbstractSpinBox::NoButtons);
+      spin->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+      spin->setMinimumWidth(112);
+      spin->setContentsMargins(0, 0, 0, 0);
       spin->setStyleSheet(QStringLiteral(
         "QDoubleSpinBox { border: 1px solid #f59e0b; border-radius: 4px;"
         "  padding: 3px 6px; background: #fffbeb; color: #92400e; }"

@@ -1,5 +1,5 @@
 /// @file paper_size_map.h
-/// Shared DMPAPER_* → human-readable name mapping table.
+/// Shared DMPAPER_* -> human-readable name mapping table.
 ///
 /// Extracted from collector/metadata_collector.cpp so that both the
 /// collector and printer_profile can use it without a circular dependency.

@@ -2,13 +2,14 @@
 /// COM DLL entry points for the WPCE XPS capture filter.
 ///
 /// Exports:
-///   DllMain              — no-op
-///   DllGetClassObject    — returns IClassFactory for XpsCaptureFilter
-///   DllCanUnloadNow      — locked-server check
-///   DllRegisterServer    — register CLSID in the registry
-///   DllUnregisterServer  — remove CLSID from the registry
+///   DllMain              - no-op
+///   DllGetClassObject    - returns IClassFactory for XpsCaptureFilter
+///   DllCanUnloadNow      - locked-server check
+///   DllRegisterServer    - register CLSID in the registry
+///   DllUnregisterServer  - remove CLSID from the registry
 
 #include "filter/filter_pipeline.h"
+#include "filter/registration_status.h"
 
 #include <windows.h>
 #include <string>
@@ -31,7 +32,7 @@ LONG write_clsid_key(const CLSID& clsid, const wchar_t* description)
   {
     wchar_t buffer[39]{};
     ::StringFromGUID2(clsid, buffer, static_cast<int>(std::size(buffer)));
-    clsid_str << L"CLSID\\" << buffer;
+    clsid_str << wpce::filter::kClsidRegistryRoot << buffer;
   }
 
   HKEY key = nullptr;
@@ -46,9 +47,10 @@ LONG write_clsid_key(const CLSID& clsid, const wchar_t* description)
     return result;
   }
 
-  ::RegSetValueExW(key, nullptr, 0, REG_SZ,
+  result = ::RegSetValueExW(key, nullptr, 0, REG_SZ,
                    reinterpret_cast<const BYTE*>(description),
                    static_cast<DWORD>((::wcslen(description) + 1) * sizeof(wchar_t)));
+  if (result != ERROR_SUCCESS) { ::RegCloseKey(key); return result; }
 
   HKEY inproc_key = nullptr;
   result = ::RegCreateKeyExW(
@@ -58,15 +60,20 @@ LONG write_clsid_key(const CLSID& clsid, const wchar_t* description)
 
   if (result == ERROR_SUCCESS)
   {
-    wchar_t module_path[MAX_PATH]{};
-    ::GetModuleFileNameW(g_hinst, module_path, static_cast<DWORD>(std::size(module_path)));
+    wchar_t module_path[32768]{};
+    const DWORD length = ::GetModuleFileNameW(g_hinst, module_path, static_cast<DWORD>(std::size(module_path)));
+    if (!length || length >= std::size(module_path))
+    {
+      const LONG error = length ? ERROR_INSUFFICIENT_BUFFER : ::GetLastError();
+      ::RegCloseKey(inproc_key); ::RegCloseKey(key); return error;
+    }
 
-    ::RegSetValueExW(inproc_key, nullptr, 0, REG_SZ,
+    result = ::RegSetValueExW(inproc_key, nullptr, 0, REG_SZ,
                      reinterpret_cast<const BYTE*>(module_path),
                      static_cast<DWORD>((::wcslen(module_path) + 1) * sizeof(wchar_t)));
 
     const wchar_t threading_model[] = L"Both";
-    ::RegSetValueExW(inproc_key, L"ThreadingModel", 0, REG_SZ,
+    if (result == ERROR_SUCCESS) result = ::RegSetValueExW(inproc_key, L"ThreadingModel", 0, REG_SZ,
                      reinterpret_cast<const BYTE*>(threading_model),
                      static_cast<DWORD>((::wcslen(threading_model) + 1) * sizeof(wchar_t)));
 
@@ -83,7 +90,7 @@ LONG delete_clsid_key(const CLSID& clsid)
   {
     wchar_t buffer[39]{};
     ::StringFromGUID2(clsid, buffer, static_cast<int>(std::size(buffer)));
-    clsid_str << L"CLSID\\" << buffer;
+    clsid_str << wpce::filter::kClsidRegistryRoot << buffer;
   }
 
   return ::RegDeleteTreeW(HKEY_LOCAL_MACHINE, clsid_str.str().c_str());
@@ -91,8 +98,7 @@ LONG delete_clsid_key(const CLSID& clsid)
 
 }  // namespace
 
-// ── DLL entry point ────────────────────────────────────────────────────
-
+// DLL entry point
 BOOL WINAPI DllMain(HINSTANCE hinstDLL, DWORD fdwReason, LPVOID /*lpvReserved*/)
 {
   switch (fdwReason)
@@ -135,17 +141,16 @@ STDAPI DllRegisterServer()
 {
   const wchar_t description[] = L"WPCE XPS Capture Filter";
   LONG result = write_clsid_key(wpce::filter::CLSID_XpsCaptureFilter, description);
-  return SUCCEEDED(result) ? S_OK : HRESULT_FROM_WIN32(result);
+  return wpce::filter::registration_hresult(result);
 }
 
 STDAPI DllUnregisterServer()
 {
   LONG result = delete_clsid_key(wpce::filter::CLSID_XpsCaptureFilter);
-  return SUCCEEDED(result) ? S_OK : HRESULT_FROM_WIN32(result);
+  return wpce::filter::registration_hresult(result);
 }
 
-// ── IClassFactory implementation ────────────────────────────────────────
-
+// IClassFactory implementation
 namespace wpce::filter
 {
 
@@ -177,7 +182,7 @@ ULONG STDMETHODCALLTYPE XpsCaptureFilterClassFactory::Release()
   LONG count = ::InterlockedDecrement(&ref_count_);
   if (count == 0)
   {
-    // Static instance — do not delete.
+    // Static instance - do not delete.
   }
   return static_cast<ULONG>(count);
 }

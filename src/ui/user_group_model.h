@@ -14,6 +14,7 @@
 #include "common/app_config.h"
 #include "core/data_contracts.h"
 #include "ui/job_table_model.h"       // for JobRowData
+#include "ui/billing_view_data.h"
 
 #include <QAbstractItemModel>
 #include <QDateTime>
@@ -31,22 +32,6 @@
 
 namespace wpce::ui
 {
-
-// ── Group-level aggregation ──────────────────────────────────────────
-
-struct UserGroupSummary
-{
-  int simplexPages = 0;       // A4/B5 simplex pages
-  int duplexPages = 0;        // A4/B5 duplex pages (physical pages)
-  int duplexSheets = 0;       // duplex sheets = ceil(duplexPages/2)
-  int colorPages = 0;         // colour-flagged pages on default paper
-  int specialPaperPages = 0;  // non-A4/B5 pages total
-  int jobCount = 0;           // number of child jobs
-  int pendingCount = 0;       // jobs with price_pending == true
-  double totalPrice = 0.0;    // aggregated total_price from child jobs
-  QStringList specialItems;   // human-readable list, e.g. "彩色 3页", "A3 2页"
-  QDateTime earliestJobTime;  // for group sort ordering
-};
 
 // ── Tree node (internal) ─────────────────────────────────────────────
 

@@ -1,6 +1,7 @@
 #include "collector/metadata_collector.h"
 #include "common/paper_size_map.h"
 #include "common/pricing_engine.h"
+#include "common/file_type_detector.h"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -20,8 +21,7 @@ namespace wpce::collector
 namespace
 {
 
-// ── Field helpers ──────────────────────────────────────────────────────
-
+// Field helpers
 core::FieldValue make_reported(std::string value)
 {
   return core::FieldValue{std::move(value), core::FieldState::Reported};
@@ -60,8 +60,7 @@ bool has_dm_field(const DWORD dm_fields, const DWORD field_bit) noexcept
   return (dm_fields & field_bit) != 0;
 }
 
-// ── DEVMODE helpers ────────────────────────────────────────────────────
-
+// DEVMODE helpers
 const DEVMODEW* devmode_from_job(const JOB_INFO_2W& job) noexcept
 {
   return static_cast<const DEVMODEW*>(job.pDevMode);
@@ -205,8 +204,7 @@ core::FieldValue extract_print_quality(const DEVMODEW& dm)
   return make_reported(std::string(name));
 }
 
-// ── Media type (DM_MEDIATYPE) — HP PCL6 / Canon UFR II common field ──
-
+// Media type (DM_MEDIATYPE) - HP PCL6 / Canon UFR II common field
 std::string_view media_type_name(const DWORD dm_media_type) noexcept
 {
   // DMMEDIA_* constants from wingdi.h.  Only the most common ones
@@ -220,7 +218,7 @@ std::string_view media_type_name(const DWORD dm_media_type) noexcept
     {
       // Some drivers use custom media type IDs outside the standard enum.
       if (dm_media_type > static_cast<DWORD>(DMMEDIA_USER))
-        return {};  // custom — report as Unknown with raw value
+        return {};  // custom - report as Unknown with raw value
       return {};
     }
   }
@@ -243,8 +241,7 @@ core::FieldValue extract_media_type(const DEVMODEW& dm)
 
 }  // namespace
 
-// ── Public name mappers ──────────────────────────────────────────────────
-
+// Public name mappers
 std::string_view paper_size_name(const std::int16_t dm_paper_size) noexcept
 {
   return common::paper_size_name(dm_paper_size);
@@ -339,7 +336,7 @@ std::string_view print_quality_name(const std::int16_t dm_print_quality) noexcep
       return "draft";
     // Canon / Epson / Brother drivers often report positive DPI values
     // (300, 600, 1200, 2400) instead of the DMRES_* categories.
-    // Common DPI values used by printer drivers — map to readable names.
+    // Common DPI values used by printer drivers - map to readable names.
     case 300:
       return "300 dpi";
     case 600:
@@ -362,8 +359,7 @@ std::string_view print_quality_name(const std::int16_t dm_print_quality) noexcep
   }
 }
 
-// ── Main extraction ──────────────────────────────────────────────────────
-
+// Main extraction
 #ifdef _WIN32
 core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
 {
@@ -377,25 +373,63 @@ core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
   snapshot.pages_printed = extract_pages_printed(job);
 
   const DEVMODEW* dm = devmode_from_job(job);
+  // Fallback DEVMODE buffer - populated via DocumentPropertiesW when the
+  // driver does not attach a per-job DEVMODE (v4 / IPP Class Driver).
+  std::vector<std::byte> fallback_devmode_buf;
+  bool using_fallback_dm = false;
+
   if (dm == nullptr)
   {
-    // No DEVMODE available from this driver / job.
-    snapshot.copies = make_not_reported();
-    snapshot.duplex = make_not_reported();
-    snapshot.color = make_not_reported();
-    snapshot.paper_size = make_not_reported();
-    snapshot.orientation = make_not_reported();
-    snapshot.n_up = make_not_reported();
-    snapshot.collate = make_not_reported();
-    snapshot.print_quality = make_not_reported();
-    snapshot.media_type = make_not_reported();
-    snapshot.file_extension = make_not_reported();
-    return snapshot;
+    // Try to obtain the printer's current default DEVMODE via
+    // DocumentPropertiesW.  This provides at least the printer's
+    // default settings for colour, duplex, paper etc. - not per-job,
+    // but far better than showing "-" for everything on v4 drivers.
+    HANDLE hPrinter = nullptr;
+    if (OpenPrinterW(job.pPrinterName, &hPrinter, nullptr))
+    {
+      LONG dmSize = DocumentPropertiesW(
+          nullptr, hPrinter, job.pPrinterName,
+          nullptr, nullptr, 0);
+      if (dmSize > 0)
+      {
+        fallback_devmode_buf.resize(static_cast<std::size_t>(dmSize));
+        LONG result = DocumentPropertiesW(
+            nullptr, hPrinter, job.pPrinterName,
+            reinterpret_cast<PDEVMODEW>(fallback_devmode_buf.data()),
+            nullptr, DM_OUT_BUFFER);
+        if (result >= 0)
+        {
+          dm = reinterpret_cast<const DEVMODEW*>(fallback_devmode_buf.data());
+          using_fallback_dm = true;
+        }
+      }
+      ClosePrinter(hPrinter);
+    }
+
+    if (dm == nullptr)
+    {
+      // Truly nothing available - every device setting is NotReported.
+      snapshot.copies = make_not_reported();
+      snapshot.duplex = make_not_reported();
+      snapshot.color = make_not_reported();
+      snapshot.paper_size = make_not_reported();
+      snapshot.orientation = make_not_reported();
+      snapshot.n_up = make_not_reported();
+      snapshot.collate = make_not_reported();
+      snapshot.print_quality = make_not_reported();
+      snapshot.media_type = make_not_reported();
+      snapshot.file_extension = make_not_reported();
+      return snapshot;
+    }
   }
 
   // Store raw dmFields as hex for diagnostics.
+  // Prefix "DefaultDevMode:" when using the DocumentPropertiesW fallback
+  // so the merger can distinguish per-job spooler DEVMODE from printer
+  // default settings (the latter should never overwrite PrintTicket data).
   {
     std::ostringstream hex;
+    if (using_fallback_dm) hex << "DefaultDevMode:";
     hex << "0x" << std::hex << std::setfill('0') << std::setw(8) << dm->dmFields;
     snapshot.dm_fields_hex = hex.str();
   }
@@ -403,6 +437,18 @@ core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
   snapshot.copies = extract_copies(*dm);
   snapshot.duplex = extract_duplex(*dm);
   snapshot.color = extract_color(*dm);
+
+  // Fallback: when the driver does not report DM_COLOR, query the printer's
+  // hardware capability.  A B&W-only printer is always monochrome regardless
+  // of the per-job setting, so we can fill the value with confidence.
+  if (snapshot.color.state == core::FieldState::NotReported && job.pPrinterName)
+  {
+    int color_device = DeviceCapabilitiesW(
+        job.pPrinterName, nullptr, DC_COLORDEVICE, nullptr, nullptr);
+    if (color_device == 0)
+      snapshot.color = make_reported("monochrome");
+  }
+
   snapshot.paper_size = extract_paper_size(*dm);
   snapshot.orientation = extract_orientation(*dm);
   snapshot.n_up = extract_n_up(*dm);
@@ -415,9 +461,13 @@ core::MetadataSnapshot extract_metadata(const JOB_INFO_2W& job)
     std::string doc_name = to_utf8(job.pDocument);
     if (!doc_name.empty())
     {
-      std::string ext = common::extract_file_extension(doc_name);
-      if (!ext.empty())
-        snapshot.file_extension = core::FieldValue{std::move(ext), core::FieldState::Reported};
+      auto detected = common::detect_file_type(doc_name, "document_name");
+      if (!detected.extension.empty())
+      {
+        snapshot.file_extension = core::FieldValue{std::move(detected.extension), core::FieldState::Reported};
+        snapshot.file_extension_source = std::move(detected.source);
+        snapshot.file_extension_confidence = detected.confidence;
+      }
       else
         snapshot.file_extension = make_not_reported();
     }

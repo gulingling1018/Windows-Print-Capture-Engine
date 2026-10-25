@@ -605,44 +605,35 @@ windeployqt.exe --release --no-translations build/vs2026-x64-qt\src\ui\Release\w
 
 要获取真实的打印参数（颜色、双面等），必须在目标电脑上安装 XPS 过滤器：
 
-#### 方法 A：GUI 自动安装
+#### 方法 A：GUI 显式安装
 
 1. **以管理员身份**运行 `wpce_ui.exe`
-2. 程序会自动检测并安装 XPS 过滤器
-3. 安装完成后会重启打印服务（Print Spooler）
+2. 启动只做只读检测，打开“XPS 设置”查看状态并明确选择安装
+3. 默认安装不重启；需要中断打印服务时，在维护窗口明确选择“安装并重启打印服务”
 4. 之后**不需要管理员权限**即可正常使用
 
 #### 方法 B：脚本安装
 
 ```powershell
-# 以管理员身份运行 PowerShell
-.\scripts\install-xps-filter.ps1
+# 只读检查准确 Release 产物及计划
+.\scripts\install-xps-filter.ps1 -BuildDirectory build/fix-20261024-08 -OutputDir C:/WPCE-data -DryRun
+# 真实安装在隔离设备上使用 x64 管理员 PowerShell，去掉 -DryRun
 ```
 
-#### 方法 C：手动安装
+#### 恢复与异常处理
 
-```powershell
-# 1. 复制 DLL
-copy wpce_xps_filter.dll "C:\Program Files\WPCE\"
-
-# 2. 注册 COM 服务器
-regsvr32 "C:\Program Files\WPCE\wpce_xps_filter.dll"
-
-# 3. 设置环境变量
-[Environment]::SetEnvironmentVariable("WPCE_OUTPUT_DIR", "C:\data", "Machine")
-
-# 4. 重启打印服务
-net stop spooler && net start spooler
-```
+安装服务会先持久保存事务原件，再原子替换并逐项验证，失败恢复旧配置。`_install-transactions` 中未完成或回滚失败的事务须保留，按备份的路径和原始字节在维护窗口核对恢复，不能删除事务后盲目重装。注册 DLL 本身不足以完成管道安装；优先使用共享安装服务。细节见 TOOLCHAIN.md 与 [08]。
 
 #### 验证安装
 
 ```powershell
 # 检查 COM 注册
-reg query "HKLM\CLSID\{B1C8E3F0-2D4A-5B6C-7D8E-9F0A1B2C3D4E}"
+reg query "HKLM\SOFTWARE\Classes\CLSID\{B1C8E3F0-2D4A-5B6C-7D8E-9F0A1B2C3D4E}"
 
 # 检查环境变量
 [Environment]::GetEnvironmentVariable("WPCE_OUTPUT_DIR", "Machine")
+# 完整只读探测（键存在不能替代健康检查）
+.\scripts\install-xps-filter.ps1 -BuildDirectory build/fix-20261024-08 -OutputDir C:/WPCE-data -Probe -AsJson
 ```
 
 ### 8.4 目标电脑要求
@@ -801,7 +792,7 @@ Import-Csv perf.csv | Format-Table
 
 ```powershell
 # 运行 clang-tidy 和 cppcheck
-.\scripts\run-static-analysis.ps1
+.\scripts\run-static-analysis.ps1 -BuildDirectory build/ninja-msvc-qt -Configuration Debug
 ```
 
 ### 9.6 测试矩阵
@@ -937,3 +928,48 @@ Restart-Service -Name Spooler -Force
 
 > 本文档最后更新：2026-06-21
 > 版本：WPCE v0.1.0
+
+---
+
+## 2026-06-27 当前实现基线
+
+本节为当前有效实现说明，优先级高于前文历史路径示例。
+
+### 价格规则
+
+- 定价矩阵维度为：打印机、纸张、单双面、颜色、文件类型、单价。
+- `color_mode` 不再支持“全部/通配”。空值或非法值按历史配置迁移为 `monochrome`。
+- 无颜色值、驱动返回 `-`、未明确选择彩色打印机、黑白打印机任务，都按黑白处理。
+- 彩色打印机上的显式彩色任务如 `color_pages <= 0`，返回 `price_pending=true`、`pending_reason="awaiting_color_pages"`，价格为 0，等待人工填写彩页数。
+
+### 存储结构
+
+```text
+<date>/
+  latest/
+    manifest.json
+    <printer>/
+      job.json
+      metadata.json
+  jobs/
+    <printer>/
+      job-<id>.json
+      job-<id>-metadata.json
+      job-<id>-lifecycle.json
+  _state/
+    today_active.json
+    batches/
+      <batch-id>/
+        jobs.json
+```
+
+- `today_active.json` 只保存批次摘要和 `jobs_bucket` 引用。
+- 作业记录按批次桶加载，界面启动优先加载摘要，展开/查看批次时再加载明细。
+- 不设置硬边界限制；通过分桶写入和按需加载避免数据量大时卡顿。
+
+### 日期与保留策略
+
+- 批次号、结算号、每日目录使用系统本地日期。
+- `submit_time_utc`、`settled_at_utc`、`period_start_utc` 等字段仍作为审计 UTC 时间戳保存。
+- 跨天启动清空 active/suspended/unsettled 当前状态；已结算历史保留。
+- 保留策略只清理过期日期捕获桶，不清理配置、当前状态或结算历史。

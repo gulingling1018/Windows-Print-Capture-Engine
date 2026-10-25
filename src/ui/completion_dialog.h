@@ -19,6 +19,7 @@ namespace wpce::ui
 
 struct JobCostLine
 {
+  std::uint32_t jobId = 0;
   QString documentName;
   int pages = 0;
   QString colorMode;

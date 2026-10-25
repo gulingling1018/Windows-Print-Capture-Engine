@@ -2,6 +2,7 @@
 /// Regression tests for persistent billing counters.
 
 #include "common/counter_store.h"
+#include "common/business_clock.h"
 
 #include <gtest/gtest.h>
 
@@ -26,10 +27,19 @@ std::filesystem::path make_test_counter_path()
 
 }  // namespace
 
+TEST(BusinessClock, BeijingFallbackUsesUtcPlusEight)
+{
+  // 1999-12-31 17:00:00 UTC -> 2000-01-01 01:00:00 in China.
+  const auto date = common::business_date_from_time(946659600, true);
+  EXPECT_EQ(date.yyyy_mm_dd, "2000-01-01");
+  EXPECT_EQ(date.yyyymmdd, "20000101");
+  EXPECT_TRUE(date.used_beijing_fallback);
+}
+
 TEST(CounterStore, NextIdsPersistAndReturn)
 {
   const auto path = make_test_counter_path();
-  const std::string today = common::CounterStore::currentDateUtcYyyymmdd();
+  const std::string today = common::CounterStore::currentDateYyyymmdd();
 
   common::CounterStore store;
   store.setStatePath(path);
@@ -43,6 +53,21 @@ TEST(CounterStore, NextIdsPersistAndReturn)
 
   EXPECT_EQ(reloaded.nextBatchId(), "B-" + today + "-000002");
   EXPECT_EQ(reloaded.nextOrderId(), "SETTLE-" + today + "-000002");
+
+  std::error_code ignored;
+  std::filesystem::remove_all(path.parent_path(), ignored);
+}
+
+TEST(CounterStore, NextIdsFailClosedWhenStatePathCannotBeReplaced)
+{
+  const auto path = make_test_counter_path();
+  std::filesystem::create_directories(path);
+
+  common::CounterStore store;
+  store.setStatePath(path);
+
+  EXPECT_EQ(store.nextBatchId(), "");
+  EXPECT_EQ(store.nextOrderId(), "");
 
   std::error_code ignored;
   std::filesystem::remove_all(path.parent_path(), ignored);
